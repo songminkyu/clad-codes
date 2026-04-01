@@ -78,7 +78,22 @@ impl Tool for FileWriteTool {
             }
         }
 
-        let is_new = !path.exists();
+        let existed = path.exists();
+        let before_content = if existed {
+            match tokio::fs::read(&path).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return ToolResult::error(format!(
+                        "Failed to read existing file {}: {}",
+                        path.display(),
+                        e
+                    ))
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let is_new = !existed;
 
         // Write the file
         if let Err(e) = tokio::fs::write(&path, &params.content).await {
@@ -88,6 +103,13 @@ impl Tool for FileWriteTool {
                 e
             ));
         }
+
+        ctx.record_file_change(
+            path.clone(),
+            &before_content,
+            params.content.as_bytes(),
+            self.name(),
+        );
 
         let line_count = params.content.lines().count();
         let byte_count = params.content.len();

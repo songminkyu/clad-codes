@@ -1,0 +1,87 @@
+---
+title: "Three-layer access control system - functional visibility control architecture"
+description: "Detailed explanation of Claude Code's three-layer access control system: build-time feature(), runtime GrowthBook and identity layer USER_TYPE, how to control the visibility and grayscale release of functions."
+keywords: ["Access control system", "Function gating", "feature flag", "Grayscale publishing", "Visibility control"]
+---
+
+{/* The goal of this chapter: to establish an overall understanding of the three-layer access control system and lay the coordinate system for the following four in-depth articles */}
+
+## Tip of the iceberg
+
+The Claude Code you use every day is just the tip of the iceberg of the complete code base.
+
+Reverse engineering revealed the fact that a large number of functions were carefully "hidden" behind three independent layers of access control systems. Some are experimental features being A/B tested, some are internal tools available only to Anthropic employees, and some are next-generation capabilities that haven’t yet been released to the public.
+
+> We found 88+ build-time feature flags, 500+ runtime A/B test flags, and a whole host of identity gating mechanisms in `src/`.
+
+## Panoramic view of three-story access control
+
+| Dimensions | First layer: Build time `feature()` | Second layer: Runtime GrowthBook | Third layer: Identity `USER_TYPE` |
+|------|---------------------------|--------------------------|-------------------------|
+| **Control mode** | `bun:bundle` compile-time macro | GrowthBook SDK remote evaluation | Build-time `--define` constant |
+| **Decision Timing** | When packaging (the code is deleted directly) | At startup + regular refresh | When packaging (constant folding) |
+| **Granularity** | All or nothing | Target by user/device/organization | By build (ant/external) |
+| **Number of tags** | 88+ | 500+ (`tengu_*` prefix) | 1 (`ant` vs `external`) |
+| **Reverse Visibility** | The code remains, but always takes the `false` branch | The complete SDK code is readable | The conditional branch is clearly visible |
+
+## Decision-making process
+
+When a function request enters Claude Code, it will pass through three levels of access control checks:
+
+```
+feature request
+  │
+  ▼
+┌─────────────────────────┐
+│ First layer: feature('X') │ ──── Determined at compile time ──→ false → The code is removed by DCE
+│ (Feature Flag when building) │
+└─────────┬───────────────┘
+          │ true (internal build only)
+          ▼
+┌─────────────────────────┐
+│ Second layer: tengu_xxx │ ──── Run according to user attributes ──→ Not in the experimental group → Function is turned off
+│ (GrowthBook A/B Testing) │
+└─────────┬───────────────┘
+          │In the experimental group
+          ▼
+┌─────────────────────────┐
+│ Third layer: USER_TYPE │ ──── ant? external? ──→ external → Function not available
+│ (Identity Gating) │
+└─────────┬───────────────┘
+          │ ant
+          ▼
+      Function available ✓
+```
+
+The three levels of access control are independent of each other, and one function may be controlled by multiple levels at the same time. For example, KAIROS assistant mode requires both `feature('KAIROS')` to be turned on at build time and ** to have the `tengu_kairos` runtime experiment hit.
+
+## What Reverse Engineering Reveals
+
+In this decompiled version:
+
+- **First layer** completely transparent - `feature()` is hidden as `() => false`, all 88+ flag code paths can be read, but will never be executed
+- **Layer 2** remains intact - 1156 lines of code of GrowthBook SDK are completely readable, including user targeting attributes, caching strategies, and overlay mechanisms
+- **Level 3** is clearly visible - `process.env.USER_TYPE === 'ant'` appears in 60+ places, each marked with an "internal only" functional boundary
+
+<Note>
+These three levels of gate control are not security mechanisms—they are product launch strategies. The purpose is to allow Anthropic to incrementally test and release features across different user groups, rather than to prevent reverse engineering.
+</Note>
+
+## Next
+
+The following four articles will go into the details of each level of access control:
+
+<CardGroup cols={2}>
+  <Card title="88 Flags" icon="flag" href="/docs/internals/feature-flags">
+    Complete classification and interpretation of Feature Flags during build
+  </Card>
+  <Card title="Thousand Faces and Thousand People" icon="flask" href="/docs/internals/growthbook-ab-testing">
+    How the GrowthBook A/B testing system works
+  </Card>
+<Card title="Preview of Undisclosed Features" icon="eye" href="/docs/internals/hidden-features">
+    In-depth analysis of 8 hidden functions such as KAIROS and PROACTIVE
+  </Card>
+  <Card title="Ant's Privileged World" icon="shield" href="/docs/internals/ant-only-world">
+    Tools, commands, and APIs exclusive to Anthropic employees
+  </Card>
+</CardGroup>

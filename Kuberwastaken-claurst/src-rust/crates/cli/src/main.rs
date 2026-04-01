@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use cc_core::types::ToolDefinition;
 use cc_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
 use clap::{ArgAction, Parser, ValueEnum};
+use parking_lot::Mutex as ParkingMutex;
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -259,6 +260,7 @@ async fn main() -> anyhow::Result<()> {
                     working_dir: cwd,
                     session_id: "pre-session".to_string(),
                     session_title: None,
+                    remote_session_url: None,
                 };
                 // Collect remaining args after the command name
                 let rest: Vec<&str> = raw_args[2..].iter().map(|s| s.as_str()).collect();
@@ -424,19 +426,13 @@ async fn main() -> anyhow::Result<()> {
     };
     let cost_tracker = CostTracker::new();
     let session_id = uuid::Uuid::new_v4().to_string();
+    let file_history = Arc::new(ParkingMutex::new(
+        cc_core::file_history::FileHistory::new(),
+    ));
+    let current_turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // Initialize MCP servers first (needed for ToolContext.mcp_manager).
-    let mcp_manager_arc: Option<Arc<cc_mcp::McpManager>> = if !config.mcp_servers.is_empty() {
-        info!(count = config.mcp_servers.len(), "Connecting to MCP servers");
-        let mcp_manager = cc_mcp::McpManager::connect_all(&config.mcp_servers).await;
-        if mcp_manager.server_count() > 0 {
-            Some(Arc::new(mcp_manager))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let mcp_manager_arc = connect_mcp_manager_arc(&config).await;
 
     let tool_ctx = ToolContext {
         working_dir: cwd.clone(),
@@ -444,6 +440,8 @@ async fn main() -> anyhow::Result<()> {
         permission_handler: permission_handler.clone(),
         cost_tracker: cost_tracker.clone(),
         session_id: session_id.clone(),
+        file_history: file_history.clone(),
+        current_turn: current_turn.clone(),
         non_interactive: cli.print || cli.prompt.is_some(),
         mcp_manager: mcp_manager_arc.clone(),
         config: config.clone(),
@@ -452,25 +450,7 @@ async fn main() -> anyhow::Result<()> {
     // Build the full tool list: built-ins from cc-tools plus AgentTool from cc-query
     // (AgentTool lives in cc-query to avoid a circular cc-tools ↔ cc-query dependency).
     // Wrap in Arc so the list can be shared by the main loop AND the cron scheduler.
-    let tools: Arc<Vec<Box<dyn cc_tools::Tool>>> = {
-        let mut v: Vec<Box<dyn cc_tools::Tool>> = cc_tools::all_tools();
-        v.push(Box::new(cc_query::AgentTool));
-
-        // Register MCP server tools as wrappers.
-        if let Some(ref manager_arc) = mcp_manager_arc {
-            for (server_name, tool_def) in manager_arc.all_tool_definitions() {
-                let wrapper = McpToolWrapper {
-                    tool_def,
-                    server_name,
-                    manager: manager_arc.clone(),
-                };
-                v.push(Box::new(wrapper));
-            }
-            debug!(total_tools = v.len(), "MCP tools registered");
-        }
-
-        Arc::new(v)
-    };
+    let tools = build_tools_with_mcp(mcp_manager_arc.clone());
 
     // Load plugins and register any plugin-provided MCP servers into the
     // in-memory config (does not modify the settings file on disk).
@@ -504,18 +484,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Build query config
-    let query_config = cc_query::QueryConfig {
-        model: config.effective_model().to_string(),
-        max_tokens: config.effective_max_tokens(),
-        max_turns: cli.max_turns,
-        system_prompt: Some(system_prompt),
-        append_system_prompt: None,
-        output_style: config.effective_output_style(),
-        output_style_prompt: config.resolve_output_style_prompt(),
-        working_directory: Some(cwd.display().to_string()),
-        thinking_budget: None,
-        temperature: None,
-    };
+    let mut query_config = cc_query::QueryConfig::from_config(&config);
+    query_config.max_turns = cli.max_turns;
+    query_config.system_prompt = Some(system_prompt);
+    query_config.append_system_prompt = None;
+    query_config.working_directory = Some(cwd.display().to_string());
 
     // Spawn the background cron scheduler (fires cron tasks at scheduled times).
     // Cancelled automatically when the process exits since we use a shared token.
@@ -555,6 +528,39 @@ async fn main() -> anyhow::Result<()> {
 
     cron_cancel.cancel();
     result
+}
+
+async fn connect_mcp_manager_arc(
+    config: &Config,
+) -> Option<Arc<cc_mcp::McpManager>> {
+    if config.mcp_servers.is_empty() {
+        return None;
+    }
+
+    info!(count = config.mcp_servers.len(), "Connecting to MCP servers");
+    let mcp_manager = cc_mcp::McpManager::connect_all(&config.mcp_servers).await;
+    Some(Arc::new(mcp_manager))
+}
+
+fn build_tools_with_mcp(
+    mcp_manager: Option<Arc<cc_mcp::McpManager>>,
+) -> Arc<Vec<Box<dyn cc_tools::Tool>>> {
+    let mut v: Vec<Box<dyn cc_tools::Tool>> = cc_tools::all_tools();
+    v.push(Box::new(cc_query::AgentTool));
+
+    if let Some(ref manager_arc) = mcp_manager {
+        for (server_name, tool_def) in manager_arc.all_tool_definitions() {
+            let wrapper = McpToolWrapper {
+                tool_def,
+                server_name,
+                manager: manager_arc.clone(),
+            };
+            v.push(Box::new(wrapper));
+        }
+        debug!(total_tools = v.len(), "MCP tools registered");
+    }
+
+    Arc::new(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -615,6 +621,7 @@ async fn run_headless(
             tracker_clone,
             Some(event_tx_clone),
             cancel_clone,
+            None,
         )
         .await
     });
@@ -806,7 +813,12 @@ async fn run_interactive(
     // Set up terminal
     let mut terminal = setup_terminal()?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
-    app.messages = initial_messages.clone();
+    app.config.project_dir = Some(tool_ctx.working_dir.clone());
+    app.attach_turn_diff_state(tool_ctx.file_history.clone(), tool_ctx.current_turn.clone());
+    if let Some(manager) = tool_ctx.mcp_manager.clone() {
+        app.attach_mcp_manager(manager);
+    }
+    app.replace_messages(initial_messages.clone());
 
     // Bridge runtime channels — Some when bridge is configured and started.
     //
@@ -851,10 +863,11 @@ async fn run_interactive(
         working_dir: tool_ctx.working_dir.clone(),
         session_id: session.id.clone(),
         session_title: session.title.clone(),
+        remote_session_url: session.remote_session_url.clone(),
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
-    let tools_arc = tools;
+    let mut tools_arc = tools;
 
     // Current cancel token (replaced each turn)
     let mut cancel: Option<CancellationToken> = None;
@@ -863,6 +876,8 @@ async fn run_interactive(
     let mut current_query: Option<(tokio::task::JoinHandle<QueryOutcome>, MessagesArc)> = None;
 
     'main: loop {
+        app.frame_count = app.frame_count.wrapping_add(1);
+
         // Draw the UI
         terminal.draw(|f| render_app(f, &app))?;
 
@@ -871,6 +886,12 @@ async fn run_interactive(
             let evt = event::read()?;
             match evt {
                 Event::Key(key) => {
+                    // On Windows crossterm emits Press + Release for a single key.
+                    // Only process Press to avoid double-registering input.
+                    if key.kind != crossterm::event::KeyEventKind::Press {
+                        continue;
+                    }
+
                     // Ctrl+C while streaming => cancel
                     if key.code == KeyCode::Char('c')
                         && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
@@ -890,7 +911,7 @@ async fn run_interactive(
                     // Ctrl+D on empty input => quit
                     if key.code == KeyCode::Char('d')
                         && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                        && app.input.is_empty()
+                        && app.prompt_input.is_empty()
                     {
                         break 'main;
                     }
@@ -909,7 +930,7 @@ async fn run_interactive(
                                 Some(CommandResult::Exit) => break 'main,
                                 Some(CommandResult::ClearConversation) => {
                                     messages.clear();
-                                    app.messages.clear();
+                                    app.replace_messages(Vec::new());
                                     session.messages.clear();
                                     session.updated_at = chrono::Utc::now();
                                     app.status_message =
@@ -918,7 +939,7 @@ async fn run_interactive(
                                 Some(CommandResult::SetMessages(new_msgs)) => {
                                     let removed = messages.len().saturating_sub(new_msgs.len());
                                     messages = new_msgs.clone();
-                                    app.messages = new_msgs;
+                                    app.replace_messages(new_msgs);
                                     session.messages = messages.clone();
                                     session.updated_at = chrono::Utc::now();
                                     app.status_message = Some(format!(
@@ -927,13 +948,23 @@ async fn run_interactive(
                                         if removed == 1 { "" } else { "s" }
                                     ));
                                 }
+                                Some(CommandResult::OpenRewindOverlay) => {
+                                    app.replace_messages(messages.clone());
+                                    app.open_rewind_flow();
+                                    app.status_message =
+                                        Some("Select a message to rewind to.".to_string());
+                                }
                                 Some(CommandResult::ResumeSession(resumed_session)) => {
                                     session = resumed_session;
                                     messages = session.messages.clone();
-                                    app.messages = messages.clone();
+                                    app.replace_messages(messages.clone());
                                     cmd_ctx.config.model = Some(session.model.clone());
                                     app.config.model = Some(session.model.clone());
                                     tool_ctx.session_id = session.id.clone();
+                                    tool_ctx.file_history = Arc::new(ParkingMutex::new(
+                                        cc_core::file_history::FileHistory::new(),
+                                    ));
+                                    tool_ctx.current_turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                                     cmd_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_title = session.title.clone();
                                     if let Some(saved_dir) = session.working_dir.as_ref() {
@@ -943,6 +974,11 @@ async fn run_interactive(
                                             cmd_ctx.working_dir = saved_path;
                                         }
                                     }
+                                    app.config.project_dir = Some(tool_ctx.working_dir.clone());
+                                    app.attach_turn_diff_state(
+                                        tool_ctx.file_history.clone(),
+                                        tool_ctx.current_turn.clone(),
+                                    );
                                     app.status_message = Some(format!(
                                         "Resumed session {}.",
                                         &session.id[..8]
@@ -957,8 +993,7 @@ async fn run_interactive(
                                         Some(format!("Session renamed to \"{}\".", title));
                                 }
                                 Some(CommandResult::Message(msg)) => {
-                                    app.messages
-                                        .push(cc_core::types::Message::assistant(msg));
+                                    app.push_message(cc_core::types::Message::assistant(msg));
                                 }
                                 Some(CommandResult::ConfigChange(new_cfg)) => {
                                     cmd_ctx.config = new_cfg.clone();
@@ -974,8 +1009,7 @@ async fn run_interactive(
                                 Some(CommandResult::UserMessage(msg)) => {
                                     // Inject as user turn
                                     messages.push(cc_core::types::Message::user(msg.clone()));
-                                    app.messages
-                                        .push(cc_core::types::Message::user(msg));
+                                    app.push_message(cc_core::types::Message::user(msg));
                                     // Fall through to send to model
                                 }
                                 Some(CommandResult::StartOAuthFlow(with_claude_ai)) => {
@@ -1029,8 +1063,7 @@ async fn run_interactive(
 
                         // Regular user message
                         messages.push(cc_core::types::Message::user(input.clone()));
-                        app.messages
-                            .push(cc_core::types::Message::user(input.clone()));
+                        app.push_message(cc_core::types::Message::user(input.clone()));
                         session.messages = messages.clone();
                         session.updated_at = chrono::Utc::now();
 
@@ -1071,6 +1104,7 @@ async fn run_interactive(
                                 tracker,
                                 Some(tx),
                                 ct,
+                                None,
                             )
                             .await;
                             // Write updated messages (with tool calls + assistant response) back
@@ -1084,6 +1118,11 @@ async fn run_interactive(
                     }
 
                     app.handle_key_event(key);
+                    if !app.is_streaming && app.messages.len() < messages.len() {
+                        messages = app.messages.clone();
+                        session.messages = messages.clone();
+                        session.updated_at = chrono::Utc::now();
+                    }
                 }
                 Event::Resize(_, _) => {
                     // Terminal resize - will be handled on next draw
@@ -1119,7 +1158,7 @@ async fn run_interactive(
                             is_error: *is_error,
                         })
                     }
-                    QueryEvent::TurnComplete { stop_reason, turn } => {
+                    QueryEvent::TurnComplete { stop_reason, turn, .. } => {
                         Some(BridgeOutbound::TurnComplete {
                             message_id: format!("turn-{}", turn),
                             stop_reason: stop_reason.clone(),
@@ -1153,6 +1192,7 @@ async fn run_interactive(
                             peer_count: 0,
                         };
                         app.remote_session_url = Some(session_url.clone());
+                        cmd_ctx.remote_session_url = Some(session_url.clone());
                         app.notifications.push(
                             NotificationKind::Success,
                             format!("Remote control active: {}", short),
@@ -1166,6 +1206,7 @@ async fn run_interactive(
                     Ok(TuiBridgeEvent::Disconnected { reason }) => {
                         app.bridge_state = BridgeConnectionState::Disconnected;
                         app.remote_session_url = None;
+                        cmd_ctx.remote_session_url = None;
                         if let Some(r) = reason {
                             app.notifications.push(
                                 NotificationKind::Warning,
@@ -1182,11 +1223,10 @@ async fn run_interactive(
                     Ok(TuiBridgeEvent::InboundPrompt { content, .. }) => {
                         // Inject the remote prompt as if the user typed it, then
                         // trigger submission automatically.
-                        app.input = content.clone();
-                        app.cursor_pos = app.input.len();
+                        app.set_prompt_text(content.clone());
                         // Push as a user message and fire a query immediately.
                         messages.push(cc_core::types::Message::user(content.clone()));
-                        app.messages.push(cc_core::types::Message::user(content.clone()));
+                        app.push_message(cc_core::types::Message::user(content.clone()));
                         session.messages = messages.clone();
                         session.updated_at = chrono::Utc::now();
                         app.is_streaming = true;
@@ -1214,6 +1254,7 @@ async fn run_interactive(
                                 tracker,
                                 Some(tx),
                                 ct,
+                                None,
                             )
                             .await;
                             *msgs_arc_clone.lock().await = msgs;
@@ -1270,6 +1311,7 @@ async fn run_interactive(
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                         app.bridge_state = BridgeConnectionState::Disconnected;
                         app.remote_session_url = None;
+                        cmd_ctx.remote_session_url = None;
                         app.notifications.push(
                             NotificationKind::Warning,
                             "Remote control connection lost.".to_string(),
@@ -1307,6 +1349,30 @@ async fn run_interactive(
                 // Save session
                 let _ = cc_core::history::save_session(&session).await;
             }
+        }
+
+        if !app.is_streaming && current_query.is_none() && app.take_pending_mcp_reconnect() {
+            let new_mcp_manager = connect_mcp_manager_arc(&cmd_ctx.config).await;
+            tool_ctx.mcp_manager = new_mcp_manager.clone();
+            app.mcp_manager = new_mcp_manager.clone();
+            tools_arc = build_tools_with_mcp(new_mcp_manager.clone());
+            if app.mcp_view.open {
+                app.refresh_mcp_view();
+            }
+
+            let connected = new_mcp_manager
+                .as_ref()
+                .map(|manager| manager.server_count())
+                .unwrap_or(0);
+            app.status_message = Some(if cmd_ctx.config.mcp_servers.is_empty() {
+                "No MCP servers configured.".to_string()
+            } else {
+                format!(
+                    "Reconnected MCP runtime ({} connected server{}).",
+                    connected,
+                    if connected == 1 { "" } else { "s" }
+                )
+            });
         }
 
         if app.should_quit {
@@ -1397,6 +1463,55 @@ async fn auth_status(json_output: bool) {
     let settings = Settings::load().await.unwrap_or_default();
     let settings_api_key = settings.config.api_key.clone().filter(|k| !k.is_empty());
     let oauth_tokens = cc_core::oauth::OAuthTokens::load().await;
+    let api_provider = "Anthropic";
+    let api_key_source = if env_api_key.is_some() {
+        Some("ANTHROPIC_API_KEY".to_string())
+    } else if settings_api_key.is_some() {
+        Some("settings".to_string())
+    } else if oauth_tokens
+        .as_ref()
+        .is_some_and(|tokens| !tokens.uses_bearer_auth() && tokens.api_key.is_some())
+    {
+        Some("/login managed key".to_string())
+    } else {
+        None
+    };
+    let token_source = oauth_tokens.as_ref().map(|tokens| {
+        if tokens.uses_bearer_auth() {
+            "claude.ai".to_string()
+        } else {
+            "console_oauth".to_string()
+        }
+    });
+    let login_method = oauth_tokens
+        .as_ref()
+        .and_then(|tokens| subscription_label(tokens.subscription_type.as_deref()))
+        .or_else(|| {
+            oauth_tokens.as_ref().map(|tokens| {
+                if tokens.uses_bearer_auth() {
+                    "Claude.ai Account".to_string()
+                } else {
+                    "Console Account".to_string()
+                }
+            })
+        })
+        .or_else(|| api_key_source.as_ref().map(|_| "API Key".to_string()));
+    let billing_mode = oauth_tokens.as_ref().map_or_else(
+        || {
+            if api_key_source.is_some() {
+                "API".to_string()
+            } else {
+                "None".to_string()
+            }
+        },
+        |tokens| {
+            if tokens.uses_bearer_auth() {
+                "Subscription".to_string()
+            } else {
+                "API".to_string()
+            }
+        },
+    );
 
     // Determine auth method (mirrors TypeScript authStatus())
     let (auth_method, logged_in) = if let Some(ref tokens) = oauth_tokens {
@@ -1416,22 +1531,25 @@ async fn auth_status(json_output: bool) {
         let mut obj = serde_json::json!({
             "loggedIn": logged_in,
             "authMethod": auth_method,
+            "apiProvider": api_provider,
+            "billing": billing_mode,
         });
 
         // Include API key source if known
-        if env_api_key.is_some() {
-            obj["apiKeySource"] = serde_json::Value::String("ANTHROPIC_API_KEY".to_string());
-        } else if settings_api_key.is_some() {
-            obj["apiKeySource"] = serde_json::Value::String("settings".to_string());
+        if let Some(ref source) = api_key_source {
+            obj["apiKeySource"] = serde_json::Value::String(source.clone());
+        }
+        if let Some(ref source) = token_source {
+            obj["tokenSource"] = serde_json::Value::String(source.clone());
+        }
+        if let Some(ref method) = login_method {
+            obj["loginMethod"] = serde_json::Value::String(method.clone());
         }
 
-        // Include OAuth account details for claude.ai flow
-        if auth_method == "claude.ai" {
-            if let Some(ref tokens) = oauth_tokens {
-                obj["email"] = json_null_or_string(&tokens.email);
-                obj["orgId"] = json_null_or_string(&tokens.organization_uuid);
-                obj["subscriptionType"] = json_null_or_string(&tokens.subscription_type);
-            }
+        if let Some(ref tokens) = oauth_tokens {
+            obj["email"] = json_null_or_string(&tokens.email);
+            obj["orgId"] = json_null_or_string(&tokens.organization_uuid);
+            obj["subscriptionType"] = json_null_or_string(&tokens.subscription_type);
         }
 
         println!("{}", serde_json::to_string_pretty(&obj).unwrap_or_default());
@@ -1441,33 +1559,35 @@ async fn auth_status(json_output: bool) {
             println!("Not logged in. Run `claude auth login` to authenticate.");
         } else {
             println!("Logged in.");
+            println!("  API provider: {}", api_provider);
+            println!("  Billing: {}", billing_mode);
+            if let Some(ref method) = login_method {
+                println!("  Login method: {}", method);
+            }
+            if let Some(ref source) = token_source {
+                println!("  Auth token: {}", source);
+            }
+            if let Some(ref source) = api_key_source {
+                println!("  API key: {}", source);
+            }
             match auth_method.as_str() {
                 "claude.ai" | "oauth_token" => {
                     if let Some(ref tokens) = oauth_tokens {
                         if let Some(ref email) = tokens.email {
-                            println!("  Account: {}", email);
+                            println!("  Email: {}", email);
                         }
                         if let Some(ref org) = tokens.organization_uuid {
-                            println!("  Organization: {}", org);
+                            println!("  Organization ID: {}", org);
+                        } else {
+                            println!("  Organization ID: unavailable");
                         }
                         if let Some(ref sub) = tokens.subscription_type {
                             println!("  Subscription: {}", sub);
                         }
-                        let method_label = if tokens.uses_bearer_auth() {
-                            "claude.ai"
-                        } else {
-                            "Console (OAuth API key)"
-                        };
-                        println!("  Auth method: {}", method_label);
                     }
                 }
                 "api_key" => {
-                    let source = if env_api_key.is_some() {
-                        "ANTHROPIC_API_KEY (environment variable)"
-                    } else {
-                        "settings.json"
-                    };
-                    println!("  API key: {}", source);
+                    println!("  Organization ID: unavailable for direct API key auth");
                 }
                 _ => {}
             }
@@ -1513,9 +1633,22 @@ async fn auth_logout() {
 }
 
 /// Helper: convert `Option<String>` to a JSON string or null.
+fn subscription_label(subscription_type: Option<&str>) -> Option<String> {
+    match subscription_type? {
+        "enterprise" => Some("Claude Enterprise Account".to_string()),
+        "team" => Some("Claude Team Account".to_string()),
+        "max" => Some("Claude Max Account".to_string()),
+        "pro" => Some("Claude Pro Account".to_string()),
+        other if !other.is_empty() => Some(format!("{} Account", other)),
+        _ => None,
+    }
+}
+
+/// Helper: convert `Option<String>` to a JSON string or null.
 fn json_null_or_string(opt: &Option<String>) -> serde_json::Value {
     match opt {
         Some(s) => serde_json::Value::String(s.clone()),
         None => serde_json::Value::Null,
     }
 }
+

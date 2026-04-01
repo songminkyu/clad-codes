@@ -1,0 +1,22 @@
+#!/bin/sh
+# pre-commit hook: Run Biome check on staged files
+# Only check .ts/.tsx/.js/.jsx files under src/
+
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep -E '^src/.*\.(ts|tsx|js|jsx)$')
+
+if [ -z "$STAGED_FILES" ]; then
+  exit 0
+fi
+
+echo "Running Biome lint on staged files..."
+
+# Use biome lint to check temporary files (lint only, no formatting, no automatic repair)
+echo "$STAGED_FILES" | xargs bunx biome lint --no-errors-on-unmatched
+
+if [ $? -ne 0 ]; then
+  echo ""
+  echo "Biome lint failed. Fix errors or use --no-verify to bypass."
+  exit 1
+fi
+
+exit 0

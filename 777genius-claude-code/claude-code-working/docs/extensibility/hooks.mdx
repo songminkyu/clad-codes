@@ -1,0 +1,239 @@
+---
+title: "Hooks life cycle hook - execution engine and interception protocol"
+description: "Analysis of the Claude Code Hooks system from a source code perspective: 22 Hook events, 6 Hook types, synchronous/asynchronous execution protocols, JSON output schema, if condition matching, and how Hook injects context and intercepts tool calls."
+keywords: ["Hooks", "Life cycle hook", "Interceptor", "PreToolUse", "Hook protocol"]
+---
+
+{/* The goal of this chapter: reveal Hook’s execution engine, matching mechanism, return value protocol and life cycle management from the source code perspective */}
+
+## 22 types of Hook events
+
+Claude Code defines 22 types of Hook events (`coreTypes.ts:25-53`), covering the complete Agent life cycle:
+
+| Phase | Event | Trigger time | Matching field |
+|------|------|---------|---------|
+| **Session** | `SessionStart` | Session start | `source` |
+| | `SessionEnd` | End of session | `reason` |
+| | `Setup` | Initialization completed | `trigger` |
+| **User Interaction** | `UserPromptSubmit` | User submission message | — |
+| | `Stop` | Agent stopped responding | — |
+| | `StopFailure` | Agent failed to stop | `error` |
+| **Tool Execution** | `PreToolUse` | Before the tool is called | `tool_name` |
+| | `PostToolUse` | After tool invocation (successful) | `tool_name` |
+| | `PostToolUseFailure` | After tool invocation (failure) | `tool_name` |
+| **Permission** | `PermissionRequest` | Permission request | `tool_name` |
+| | `PermissionDenied` | Permission denied | `tool_name` |
+| **Sub Agent** | `SubagentStart` | Sub Agent startup | `agent_type` |
+| | `SubagentStop` | Subagent stops | `agent_type` |
+| **Compression** | `PreCompact` | Before context compression | `trigger` |
+| | `PostCompact` | After context compression | `trigger` |
+| **Collaboration** | `TeammateIdle` | Teammate Idle | — |
+| | `TaskCreated` | Task creation | — |
+| | `TaskCompleted` | Task completed | — |
+| **MCP** | `Elicitation` | MCP server requests user input | `mcp_server_name` |
+| | `ElicitationResult` | Elicitation result return | `mcp_server_name` |
+| **Environment** | `ConfigChange` | Configuration changes | `source` |
+| | `CwdChanged` | Working directory change | — |
+| | `FileChanged` | File changes | `file_path` |
+| | `InstructionsLoaded` | Instructions loaded | `load_reason` |
+| | `WorktreeCreate` / `WorktreeRemove` | Worktree operations | — |
+
+## 6 Hook types
+
+Hooks configuration supports 6 execution methods (`src/types/hooks.ts`):
+
+| Type | Execution method | Applicable scenarios |
+|------|---------|---------|
+| `command` | Shell command (bash/PowerShell) | Common script, CI check |
+| `prompt` | Inject into AI context | Code specification reminder |
+| `agent` | Starts agent execution | Complex analysis tasks |
+| `http` | HTTP request | Remote service, Webhook |
+| `callback` | Internal JS function | System built-in Hook |
+| `function` | Function Hook registered at runtime | Agent/Skill internal use |
+
+## Execution engine: execCommandHook
+
+`execCommandHook()` (`src/utils/hooks.ts:829-1417`) is the execution core of command-type Hook:
+
+```
+execCommandHook(hook, hookEvent, hookName, jsonInput, signal)
+  ├── Shell selection: hook.shell ?? DEFAULT_HOOK_SHELL
+  │   ├── bash: spawn(cmd, [], { shell: gitBashPath | true })
+  │   └── powershell: spawn(pwsh, ['-NoProfile', '-NonInteractive', '-Command', cmd])
+  ├── Variable substitution
+  │ ├── ${CLAUDE_PLUGIN_ROOT} → pluginRoot path
+  │ ├── ${CLAUDE_PLUGIN_DATA} → plugin data directory
+  │ └── ${user_config.X} → User configuration value
+  ├── Environment variable injection
+  │   ├── CLAUDE_PROJECT_DIR
+  │   ├── CLAUDE_ENV_FILE（SessionStart/Setup/CwdChanged/FileChanged）
+  │   └── CLAUDE_PLUGIN_OPTION_*（plugin options）
+  ├── stdin writing: jsonInput + '\n'
+  ├── Timeout: hook.timeout * 1000 ?? 600000ms (10 minutes)
+  └── Asynchronous detection: Check whether the first line of stdout is {"async":true}
+```
+
+### Asynchronous Hook detection protocol
+
+If the first line of stdout of the Hook process is `{"async":true}`, the system will convert it to a background task (`hooks.ts:1199-1246`):
+
+```typescript
+const firstLine = firstLineOf(stdout).trim()
+if (isAsyncHookJSONOutput(parsed)) {
+  executeInBackground({
+    processId: `async_hook_${child.pid}`,
+    asyncResponse: parsed,
+    ...
+  })
+}
+```
+
+The background Hook is registered to `AsyncHookRegistry` through `registerPendingAsyncHook()`, and upon completion, the main thread is notified through `enqueuePendingNotification()`.
+
+### asyncRewake: Hook wake-up model
+
+Hooks in `asyncRewake` mode bypass `AsyncHookRegistry`. When Hook exit code is 2, inject a message in `task-notification` mode via `enqueuePendingNotification()`, wake up an idle model (via `useQueueProcessor`) or inject a `queued_command` attachment when busy.
+
+## JSON Schema output by Hook
+
+The output of synchronous Hook follows strict Zod schema (`src/types/hooks.ts:49-567`):
+
+```json
+{
+  "continue": false, // Whether to continue execution
+  "suppressOutput": true, // hide stdout
+  "stopReason": "Security check failed", // Reason for continue=false
+  "decision": "approve" | "block", // Global decision
+  "reason": "reason explanation", // reason for decision
+  "systemMessage": "Warning content", // System message injected into the context
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "allow" | "deny" | "ask",
+    "permissionDecisionReason": "Matched security rules",
+    "updatedInput": { ... }, // Modified tool input
+    "additionalContext": "additional context" // injected into the conversation
+  }
+}
+```
+
+### hookSpecificOutput of each event
+
+| Events | Exclusive fields | Function |
+|------|---------|------|
+| `PreToolUse` | `permissionDecision`, `updatedInput`, `additionalContext` | Intercept/modify tool input |
+| `UserPromptSubmit` | `additionalContext` | Inject additional context |
+| `PostToolUse` | `additionalContext`, `updatedMCPToolOutput` | Modify MCP tool output |
+| `SessionStart` | `initialUserMessage`, `watchPaths` | Set up initial message and file monitoring |
+| `PermissionDenied` | `retry` | Indicates whether to retry |
+| `Elicitation` | `action`, `content` | Control user input dialog box |
+
+## Hook matching mechanism: getMatchingHooks
+
+`getMatchingHooks()` (`hooks.ts:1685-1956`) is responsible for finding matching Hooks from all sources:
+
+###Multiple sources merge
+
+```
+getHooksConfig()
+  ├── getHooksConfigFromSnapshot() ← Hook in settings.json (user/project/local)
+├── getRegisteredHooks() ← SDK registered callback Hook
+  ├── getSessionHooks() ← Agent/Skill pre-registered session Hook
+  └── getSessionFunctionHooks() ← Runtime function Hook
+```
+
+### Matching rules
+
+The `matcher` field supports three patterns (`matchesPattern()`, `hooks.ts:1428-1463`):
+
+```
+"Write" → exact match
+"Write|Edit" → pipe-delimited multi-value matching
+"^Bash(git.*)" → Regular match
+"*" or "" → wildcard (match all)
+```
+
+### if conditional filtering
+
+Hooks can specify `if` conditions to trigger only on specific inputs. `prepareIfConditionMatcher()` (`hooks.ts:1472-1503`) Precompiled matcher:
+
+```json
+{
+  "hooks": [{
+    "command": "check-git-branch.sh",
+    "if": "Bash(git push*)"
+  }]
+}
+```
+
+`if` conditions are parsed using `permissionRuleValueFromString`, supporting the same syntax as permission rules (tool name + parameter pattern). Bash tools also use tree-sitter for AST level command parsing.
+
+### Hook to remove duplicates
+
+The same Hook command may be repeated at different configuration levels (user/project/local). The system presses `pluginRoot\0command` to perform Map deduplication and retain the **last merged level**.
+
+## Workspace trust check
+
+**All Hooks require workspace trust** (`shouldSkipHookDueToTrust()`, `hooks.ts:286-296`). This is a defense-in-depth measure - preventing a malicious repository's `.claude/settings.json` from executing arbitrary commands without trust.
+
+```typescript
+// In interactive mode, all Hooks require trust
+const hasTrust = checkHasTrustDialogAccepted()
+return !hasTrust
+```
+
+Trust is implicit in SDK non-interactive mode (check is skipped when `getIsNonInteractiveSession()` is true).
+
+## Source code mapping of four Hook capabilities
+
+### 1. Interception operation (PreToolUse)
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny"
+  }
+}
+```
+
+`processHookJSONOutput()` maps `permissionDecision` to `result.permissionBehavior = 'deny'` and sets `blockingError` to prevent tool execution.
+
+### 2. Modify behavior (updatedInput / updatedMCPToolOutput)
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "updatedInput": { "command": "npm test -- --bail" }
+  }
+}
+```
+
+`updatedInput` replaces the original tool input; `updatedMCPToolOutput` (PostToolUse event) replaces the return value of the MCP tool - can be used to filter sensitive data.
+
+### 3. Inject context (additionalContext/systemMessage)
+
+- `additionalContext` → Inject as user message via `createAttachmentMessage({ type: 'hook_additional_context' })`
+- `systemMessage` → injected as a system warning and displayed directly to the user
+
+### 4. Control flow (continue/stopReason)
+
+```json
+{ "continue": false, "stopReason": "Build failed, stop execution" }
+```
+
+`continue: false` sets `preventContinuation = true` to prevent the Agent from continuing to perform subsequent operations.
+
+## Session Hook life cycle
+
+The front hooks of Agent and Skill are registered through `registerFrontmatterHooks()` (`runAgent.ts:567-575`) and bound to the agent's session ID. Clean up via `clearSessionHooks()` when the Agent ends.
+
+```typescript
+// runAgent.ts:567 — Pre-Hook for registering agent
+registerFrontmatterHooks(rootSetAppState, agentId, agentDefinition.hooks, ...)
+
+// runAgent.ts:820 — finally block cleanup
+clearSessionHooks(rootSetAppState, agentId)
+```
+
+This ensures that Agent A's Hooks do not leak into Agent B's execution.

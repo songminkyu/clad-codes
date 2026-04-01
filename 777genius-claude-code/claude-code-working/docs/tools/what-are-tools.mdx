@@ -1,0 +1,206 @@
+---
+title: "Tool System Design - How AI goes from talking to doing"
+description: "In-depth understanding of Claude Code's Tool abstract design: from type definition, registration mechanism, call link to rendering system, revealing how 50+ built-in tools work together through a unified Tool interface."
+keywords: ["Tool system", "Tool abstraction", "AI tool", "function calling", "buildTool", "getTools"]
+---
+
+{/* The goal of this chapter: reveal the complete architecture of the tool system based on src/Tool.ts and src/tools.ts */}
+
+## Why AI needs tools
+
+Large language models can essentially only do one thing: generate output text based on input text.
+
+It cannot read files, execute commands, or search code. To make AI truly "hands-on", a bridge is needed - this is **Tool** (tool).
+
+Tools are the hands of AI. AI says "I want to read this file", and the tool system actually reads it for it; AI says "I want to execute this command", and the tool system actually runs it for it.
+
+## Tool type: unified interface with 35 fields
+
+All tools implement the `Tool<Input, Output, Progress>` type of `src/Tool.ts:362`. This is not a class, but a structural typing containing 35+ fields. Any object that satisfies this interface is a tool:
+
+### Core Four Elements
+
+| Field | Type | Description |
+|------|------|------|
+| `name` | `string` | Unique identifier (such as `Read`, `Bash`, `Agent`) |
+| `description()` | `(input) => Promise<string>` | **Dynamic description** - returns different descriptions based on input parameters (such as `Execute skill: ${skill}`) |
+| `inputSchema` | `z.ZodType` | Zod schema, defines parameter types and validation rules |
+| `call()` | `(args, context, canUseTool, parentMessage, onProgress?) => Promise<ToolResult<Output>>` | Execute function |
+
+### Registration and Discovery
+
+| Field | Description |
+|------|------|
+| `aliases` | Array of aliases (backwards compatible with renaming) |
+| `searchHint` | 3-10 word phrase for ToolSearch keyword matching (such as `"jupyter"` for NotebookEdit) |
+| `shouldDefer` | Whether to delay loading (load on demand with ToolSearch) |
+| `alwaysLoad` | Never delay loading (e.g. SkillTool must be visible at turn 1) |
+| `isEnabled()` | Runtime switches (such as the PowerShellTool inspection platform) |
+
+### Security and Permissions
+
+| Field | Description |
+|------|------|
+| `validateInput()` | Input validation (before permission check), return `ValidationResult` |
+| `checkPermissions()` | Permission check (after verification), return `PermissionResult` |
+| `isReadOnly()` | Whether to read-only operation (affects permission mode) |
+| `isDestructive()` | Whether the operation is irreversible (delete, overwrite, send) |
+| `isConcurrencySafe()` | Whether the same input can be executed in parallel |
+| `preparePermissionMatcher()` | Prepare pattern matcher for Hook's `if` condition |
+| `interruptBehavior()` | Behavior when user interrupts: `'cancel'` or `'block'` |
+
+### Output and Rendering
+
+| Field | Description |
+|------|------|
+| `maxResultSizeChars` | The upper limit of result characters (if exceeded, it will be persisted to disk, such as `100_000`) |
+| `mapToolResultToToolResultBlockParam()` | Map Output to `ToolResultBlockParam` in API format |
+| `renderToolResultMessage()` | React component renders tool results to the terminal |
+| `renderToolUseMessage()` | React component rendering tool calling process |
+| `backfillObservableInput()` | Backfill observable fields without destroying prompt cache |
+
+### Context and Prompt
+
+| Field | Description |
+|------|------|
+| `prompt()` | Returns the detailed usage instructions of the tool, injected into System Prompt |
+| `outputSchema` | Output Zod schema (for type-safe result processing) |
+| `getPath()` | File path for extraction operation (used for permission matching and UI display) |
+
+## Tool registration: hierarchical assembly of `getTools()`
+
+`getAllBaseTools()` (line 191) of `src/tools.ts` is the core of tool registration:
+
+```
+Fixed tools (always available):
+  AgentTool, BashTool, FileReadTool, FileEditTool, FileWriteTool,
+  NotebookEditTool, WebFetchTool, WebSearchTool, TodoWriteTool,
+  AskUserQuestionTool, SkillTool, EnterPlanModeTool, ExitPlanModeV2Tool,
+  TaskOutputTool, BriefTool, ListMcpResourcesTool, ReadMcpResourceTool
+
+Conditional tools (runtime checks):
+  ← hasEmbeddedSearchTools()  ? []       : [GlobTool, GrepTool]
+  ← isTodoV2Enabled()         ? V2 Tasks  : []
+  ← isWorktreeModeEnabled()   ? Worktree  : []
+  ← isAgentSwarmsEnabled()    ? Teams     : []
+  ← isToolSearchEnabled()     ? ToolSearch: []
+  ← isPowerShellToolEnabled() ? PowerShell: []
+
+Feature-flag tool:
+  ← feature('COORDINATOR_MODE') ? [coordinatorMode tools]
+  ← feature('KAIROS')           ? [SleepTool, SendUserFileTool, ...]
+  ← feature('WEB_BROWSER_TOOL') ? [WebBrowserTool]
+  ← feature('HISTORY_SNIP')     ? [SnipTool]
+
+Ant-only tools:
+  ← process.env.USER_TYPE === 'ant' ? [REPLTool, ConfigTool, TungstenTool]
+```
+
+`getTools()` (line 269) applies permission filtering based on `getAllBaseTools()`:
+
+```typescript
+export const getTools = (permissionContext): Tools => {
+  const base = getAllBaseTools()
+  // Tool for filtering blanket deny rule hits
+  return filterToolsByDenyRules(base, permissionContext)
+}
+```
+
+**Key Design**: The tools list is assembled on each API call (rather than cached globally) because the result of `isEnabled()` may change depending on the runtime state.
+
+## `buildTool()` factory function
+
+Most tools are created with `buildTool()` (`src/Tool.ts:721`), which is a type-safe constructor:
+
+```typescript
+export const BashTool: Tool<...> = buildTool({
+  name: 'Bash',
+  inputSchema: lazySchema(() => z.object({command: z.string(), ...})),
+  // ...other fields
+}) satisfies ToolDef<Input, Output, Progress>
+```
+
+`satisfies ToolDef` ensures compile-time type checking and `lazySchema` delays Zod schema resolution (avoiding circular dependencies).
+
+## Complete link to tool call
+
+From AI issuing `tool_use` to result return, the following steps are taken:
+
+```
+1. API returns tool_use block (including name + input)
+   ↓
+2. StreamingToolExecutor.addTool() / runTools()
+   ↓
+3. findToolByName() Find tool
+   ↓
+4. validateInput() — input validation
+   ↓ Failure → Return error tool_result
+5. canUseTool() — Permission UI (pop up to confirm in Ask mode)
+   ↓ reject → return reject tool_result
+6. checkPermissions() — Rule matching
+   ↓
+7. call() — perform the actual operation
+   ↓ onProgress() callback updates the UI in real time
+8. Return ToolResult<Output>
+   ↓
+9. mapToolResultToToolResultBlockParam() — Convert to API format
+   ↓
+10. New messages are appended to the conversation → enter the next iteration
+```
+
+## Budget control of tool results
+
+Each tool declares an output upper limit via `maxResultSizeChars`:
+
+- **BashTool**: `30_000` (command output)
+- **SkillTool**: `100_000` (skill execution result)
+- **FileReadTool**: `Infinity` (the file content is not persisted and the Read→file→Read cycle is avoided)
+
+Results exceeding the upper limit are persisted to disk by `applyToolResultBudget()` (`src/utils/toolResultStorage.ts`), and AI only receives the preview + file path.
+
+## Extensions for MCP tools
+
+MCP Server provides tools to mark sources through the `mcpInfo` field:
+
+```typescript
+mcpInfo?: { serverName: string; toolName: string }
+```
+
+The MCP tool's `inputJSONSchema` uses JSON Schema directly (not Zod) because the schema comes from the remote protocol. They support blanket deny rules with the `mcp__server` prefix via `filterToolsByDenyRules()`.
+
+## 50+ built-in tools panorama
+
+<CardGroup cols={3}>
+  <Card title="File operations" icon="file">
+    Read / Write / Edit / Glob / Grep / NotebookEdit
+  </Card>
+  <Card title="Command execution" icon="terminal">
+    Bash / PowerShell
+  </Card>
+  <Card title="Conversation Management" icon="comments">
+    Agent / SendMessage / AskUserQuestion
+  </Card>
+  <Card title="Task Tracking" icon="list-check">
+    TaskCreate / TaskUpdate / TaskList / TaskGet / TaskOutput / TaskStop
+  </Card>
+  <Card title="Web Capabilities" icon="globe">
+    WebFetch / WebSearch / WebBrowser
+  </Card>
+  <Card title="Planning and Versioning" icon="map">
+    EnterPlanMode / ExitPlanMode / Worktree / TodoWrite / ToolSearch
+  </Card>
+</CardGroup>
+
+## Visual rendering of tools
+
+Tools not only "do things" but also "show" them. Each tool defines UI rendering via React components:
+
+- **FileEdit** → `renderToolResultMessage` shows diff view with syntax highlighting
+- **Bash** → Display command output in real time (via `onProgress` callback) with progress indicator
+- **Grep** → Highlight matching results, display file path and line number links
+- **Agent** → Display the progress bar and status of the child Agent
+- **SkillTool** → Rendering skill execution progress
+
+`isSearchOrReadCommand()` allows the tool to declare itself as a search/read operation, triggering the collapsed display mode of the UI (to avoid a large number of search results filling the screen).
+
+`getActivityDescription()` provides the spinner with an activity description (such as "Reading src/foo.ts", "Running bun test"), replacing the default tool name display.

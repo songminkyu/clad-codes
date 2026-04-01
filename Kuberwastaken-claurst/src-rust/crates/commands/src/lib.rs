@@ -25,6 +25,8 @@ pub struct CommandContext {
     pub working_dir: std::path::PathBuf,
     pub session_id: String,
     pub session_title: Option<String>,
+    /// Remote session URL set when a bridge connection is active.
+    pub remote_session_url: Option<String>,
     // Note: config already contains hooks, mcp_servers, etc.
 }
 
@@ -56,6 +58,9 @@ pub enum CommandResult {
     Silent,
     /// An error.
     Error(String),
+    /// Open the rewind/message-selector overlay in the TUI.
+    /// The TUI will call SetMessages when the user confirms.
+    OpenRewindOverlay,
 }
 
 /// Every slash command implements this trait.
@@ -148,6 +153,12 @@ pub struct ThinkBackCommand;
 pub struct ThinkBackPlayCommand;
 pub struct FeedbackCommand;
 pub struct ColorSetCommand;
+// New commands: share, teleport, btw, ctx-viz, sandbox-toggle
+pub struct ShareCommand;
+pub struct TeleportCommand;
+pub struct BtwCommand;
+pub struct CtxVizCommand;
+pub struct SandboxToggleCommand;
 pub struct NamedCommandAdapter {
     pub slash_name: &'static str,
     pub target_name: &'static str,
@@ -354,19 +365,20 @@ fn command_category(name: &str) -> &'static str {
         }
         "model" | "config" | "theme" | "color" | "vim" | "fast" | "effort"
         | "voice" | "statusline" | "output-style" | "keybindings"
-        | "privacy-settings" | "rate-limit-options" => "Settings",
-        "cost" | "stats" | "usage" | "extra-usage" | "context" => "Usage & Cost",
+        | "privacy-settings" | "rate-limit-options" | "sandbox-toggle" => "Settings",
+        "cost" | "stats" | "usage" | "extra-usage" | "context" | "ctx-viz" => "Usage & Cost",
         "status" | "doctor" | "terminal-setup" | "version" | "upgrade"
         | "release-notes" => "System",
         "login" | "logout" | "permissions" => "Auth & Permissions",
         "memory" | "files" | "diff" | "init" | "commit" | "review"
         | "security-review" => "Project",
         "mcp" | "hooks" | "ide" | "chrome" => "Integrations",
-        "session" | "resume" | "remote-control" | "remote-env" => "Sessions & Remote",
+        "session" | "resume" | "remote-control" | "remote-env"
+        | "share" | "teleport" => "Sessions & Remote",
         "help" | "exit" | "feedback" | "bug" => "General",
         "think-back" | "thinkback-play" | "thinking" | "plan" | "tasks" => "AI & Thinking",
         "copy" | "skills" | "agents" | "plugin" | "reload-plugins"
-        | "stickers" | "passes" | "desktop" | "mobile" => "Tools & Extras",
+        | "stickers" | "passes" | "desktop" | "mobile" | "btw" => "Tools & Extras",
         _ => "Other",
     }
 }
@@ -832,13 +844,57 @@ impl SlashCommand for ThemeCommand {
 #[async_trait]
 impl SlashCommand for OutputStyleCommand {
     fn name(&self) -> &str { "output-style" }
-    fn description(&self) -> &str { "Show the output-style migration guidance" }
+    fn description(&self) -> &str { "Show or switch the current output style" }
+    fn help(&self) -> &str {
+        "Usage: /output-style [style-name]\n\n\
+         With no argument: list available styles and show the current one.\n\
+         With a style name: switch to that style (persisted to settings).\n\n\
+         Built-in styles: default, verbose, concise\n\
+         Plugin-defined styles are listed automatically.\n\n\
+         Changes take effect on the next request."
+    }
 
-    async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
-        CommandResult::Message(format!(
-            "/output-style has been deprecated. Use /config to change your output style, or set it in your settings file. Changes take effect on the next session.\nCurrent output style: {}",
-            current_output_style_name(&ctx.config)
-        ))
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let arg = args.trim();
+        let valid_styles = available_output_style_names();
+        let current = current_output_style_name(&ctx.config);
+
+        if arg.is_empty() {
+            // List available styles
+            let mut lines = format!("Current output style: {}\n\nAvailable styles:\n", current);
+            for style in &valid_styles {
+                let marker = if style == current { " *" } else { "" };
+                lines.push_str(&format!("  {}{}\n", style, marker));
+            }
+            lines.push_str("\nUse /output-style <name> to switch.");
+            return CommandResult::Message(lines);
+        }
+
+        let normalized = arg.to_lowercase();
+        if !valid_styles.iter().any(|name| name == &normalized) {
+            return CommandResult::Error(format!(
+                "Unknown output style '{}'. Available styles: {}",
+                arg,
+                valid_styles.join(", ")
+            ));
+        }
+
+        let mut new_config = ctx.config.clone();
+        new_config.output_style = (normalized != "default").then(|| normalized.clone());
+        if let Err(err) = save_settings_mutation(|settings| {
+            settings.config.output_style =
+                (normalized != "default").then(|| normalized.clone());
+        }) {
+            return CommandResult::Error(format!("Failed to save configuration: {}", err));
+        }
+
+        CommandResult::ConfigChangeMessage(
+            new_config,
+            format!(
+                "Output style set to '{}'. Changes take effect on the next request.",
+                normalized
+            ),
+        )
     }
 }
 
@@ -1975,13 +2031,59 @@ impl SlashCommand for SessionCommand {
                 }
             }
             "" => {
-                CommandResult::Message(format!(
-                    "Current session stats:\n  ID: {}\n  Title: {}\n  Messages: {}\n  Model: {}\n\nUse /session list to see all sessions.",
-                    ctx.session_id,
-                    ctx.session_title.as_deref().unwrap_or("(untitled)"),
-                    ctx.messages.len(),
-                    ctx.config.effective_model()
-                ))
+                // If a bridge remote URL is active, show it prominently.
+                if let Some(ref url) = ctx.remote_session_url {
+                    let border = "─".repeat(url.len().min(60) + 4);
+                    let display_url = if url.len() > 60 {
+                        format!("{}…", &url[..60])
+                    } else {
+                        url.clone()
+                    };
+                    CommandResult::Message(format!(
+                        "Remote session active\n\
+                         ┌{border}┐\n\
+                         │  {display_url}  │\n\
+                         └{border}┘\n\n\
+                         Open the URL above on any device to connect remotely.\n\
+                         Session ID: {}",
+                        ctx.session_id,
+                    ))
+                } else {
+                    // Show current session info + recent sessions list.
+                    let sessions = cc_core::history::list_sessions().await;
+                    let mut output = format!(
+                        "Current session\n\
+                         ───────────────\n\
+                         ID:       {}\n\
+                         Title:    {}\n\
+                         Messages: {}\n\
+                         Model:    {}\n",
+                        ctx.session_id,
+                        ctx.session_title.as_deref().unwrap_or("(untitled)"),
+                        ctx.messages.len(),
+                        ctx.config.effective_model()
+                    );
+
+                    if !sessions.is_empty() {
+                        output.push_str("\nRecent sessions:\n\n");
+                        for sess in sessions.iter().take(5) {
+                            let updated = sess.updated_at.format("%Y-%m-%d %H:%M").to_string();
+                            let id_short = &sess.id[..sess.id.len().min(8)];
+                            let marker = if sess.id == ctx.session_id { " ◀ current" } else { "" };
+                            output.push_str(&format!(
+                                "  {} | {} | {} messages | {}{}\n",
+                                id_short,
+                                updated,
+                                sess.messages.len(),
+                                sess.title.as_deref().unwrap_or("(untitled)"),
+                                marker,
+                            ));
+                        }
+                        output.push_str("\nUse /session list for all sessions, /resume <id> to switch.");
+                    }
+
+                    CommandResult::Message(output)
+                }
             }
             _ => CommandResult::Error(format!("Unknown subcommand: {}\n\nUsage: /session [list]", args)),
         }
@@ -2097,6 +2199,35 @@ impl SlashCommand for SkillsCommand {
             }
         }
 
+        // Include skills contributed by installed plugins.
+        if let Some(registry) = cc_plugins::global_plugin_registry() {
+            for skill_dir in registry.all_skill_paths() {
+                if let Ok(entries) = std::fs::read_dir(&skill_dir) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        // Skills can be individual .md files or subdirs with SKILL.md.
+                        if p.is_dir() {
+                            if p.join("SKILL.md").exists() || p.join("skill.md").exists() {
+                                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                                    let skill_name = name.to_string();
+                                    if !found.contains(&skill_name) {
+                                        found.push(skill_name);
+                                    }
+                                }
+                            }
+                        } else if p.extension().map_or(false, |e| e == "md") {
+                            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                                let name = stem.to_string();
+                                if !found.contains(&name) {
+                                    found.push(name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if found.is_empty() {
             return CommandResult::Message(
                 "No skills found.\nCreate .md files in .claude/commands/ to define skills.\n\
@@ -2118,37 +2249,18 @@ impl SlashCommand for SkillsCommand {
 #[async_trait]
 impl SlashCommand for RewindCommand {
     fn name(&self) -> &str { "rewind" }
-    fn description(&self) -> &str { "Remove the last N message turns" }
-    fn help(&self) -> &str { "Usage: /rewind [n]\nRemove the last N turns (default 1)." }
+    fn description(&self) -> &str { "Interactively select a message to rewind to" }
+    fn help(&self) -> &str {
+        "Usage: /rewind\n\
+         Opens an interactive overlay to select the message to rewind to.\n\
+         Use ↑↓ to navigate, Enter to select, y/n to confirm."
+    }
 
-    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        let n: usize = args.trim().parse().unwrap_or(1).max(1);
-
-        // Each "turn" is a user+assistant pair = 2 messages.
-        let to_remove = (n * 2).min(ctx.messages.len());
-        if to_remove == 0 {
-            return CommandResult::Message("Nothing to rewind.".to_string());
+    async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
+        if ctx.messages.is_empty() {
+            return CommandResult::Message("Nothing to rewind — conversation is empty.".to_string());
         }
-
-        let new_len = ctx.messages.len().saturating_sub(to_remove);
-        let mut trimmed = ctx.messages.clone();
-        trimmed.truncate(new_len);
-
-        let removed = ctx.messages.len() - new_len;
-        let note = format!(
-            "Rewound {} turn{} ({} message{} removed).",
-            n,
-            if n == 1 { "" } else { "s" },
-            removed,
-            if removed == 1 { "" } else { "s" }
-        );
-
-        // SetMessages propagates the trimmed list back to the REPL.
-        // We use a UserMessage to surface the confirmation note.
-        // Since CommandResult can only return one variant, we use SetMessages
-        // and let the REPL show a status message.
-        let _ = note; // consumed below
-        CommandResult::SetMessages(trimmed)
+        CommandResult::OpenRewindOverlay
     }
 }
 
@@ -2352,6 +2464,8 @@ struct UiSettings {
     pub statusline_show_time: Option<bool>,
     #[serde(default)]
     pub prompt_color: Option<String>,
+    #[serde(default)]
+    pub sandbox_mode: Option<bool>,
 }
 
 fn ui_settings_path() -> std::path::PathBuf {
@@ -2857,14 +2971,15 @@ impl SlashCommand for VoiceCommand {
             Ok(_) => {
                 if enable {
                     CommandResult::Message(
-                        "Voice input enabled.\n\
+                        "Voice recording activated (Alt+V to toggle).\n\
                          Hold the configured hold-to-talk key to record.\n\
-                         Voice mode requires a Claude.ai account with voice scope.\n\
-                         Restart the REPL for the change to take effect."
+                         Voice mode requires a Claude.ai account with voice scope."
                             .to_string(),
                     )
                 } else {
-                    CommandResult::Message("Voice input disabled.".to_string())
+                    CommandResult::Message(
+                        "Voice recording deactivated (Alt+V to toggle).".to_string(),
+                    )
                 }
             }
             Err(e) => CommandResult::Error(format!("Failed to save voice setting: {}", e)),
@@ -3719,6 +3834,317 @@ impl SlashCommand for ColorSetCommand {
     }
 }
 
+// ---- /share --------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for ShareCommand {
+    fn name(&self) -> &str { "share" }
+    fn description(&self) -> &str { "Create a shareable URL for the current session" }
+    fn help(&self) -> &str {
+        "Usage: /share\n\n\
+         Attempts to create a public share link for the current conversation\n\
+         by calling the Anthropic share API.\n\n\
+         Requires authentication with claude.ai OAuth. If you are not\n\
+         authenticated, use /login first."
+    }
+
+    async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
+        // Resolve auth credential
+        let auth = ctx.config.resolve_auth_async().await;
+
+        let Some((credential, use_bearer)) = auth else {
+            return CommandResult::Message(
+                "Session sharing is available when authenticated with claude.ai OAuth.\n\
+                 Use /login to sign in."
+                    .to_string(),
+            );
+        };
+
+        // Build the request body: serialize the message list as JSON
+        let messages_json = match serde_json::to_value(&ctx.messages) {
+            Ok(v) => v,
+            Err(e) => {
+                return CommandResult::Error(format!(
+                    "Failed to serialize session messages: {}",
+                    e
+                ))
+            }
+        };
+
+        let body = serde_json::json!({
+            "session_id": ctx.session_id,
+            "title": ctx.session_title,
+            "messages": messages_json,
+        });
+
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return CommandResult::Error(format!(
+                    "Failed to build HTTP client: {}",
+                    e
+                ))
+            }
+        };
+
+        let base_url = std::env::var("ANTHROPIC_BASE_URL")
+            .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+        let url = format!("{}/api/claude_code/share_session", base_url);
+
+        let req = if use_bearer {
+            client
+                .post(&url)
+                .bearer_auth(&credential)
+        } else {
+            client
+                .post(&url)
+                .header("x-api-key", &credential)
+        };
+
+        let resp = req
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let json: serde_json::Value = match r.json().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return CommandResult::Error(format!(
+                            "Failed to parse share API response: {}",
+                            e
+                        ))
+                    }
+                };
+                let share_url = json
+                    .get("share_url")
+                    .or_else(|| json.get("url"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                match share_url {
+                    Some(u) => CommandResult::Message(format!(
+                        "Session shared successfully!\nShare URL: {}",
+                        u
+                    )),
+                    None => CommandResult::Error(
+                        "Share API returned success but no URL was found in the response."
+                            .to_string(),
+                    ),
+                }
+            }
+            Ok(r) => {
+                let status = r.status();
+                let body_text = r.text().await.unwrap_or_default();
+                CommandResult::Error(format!(
+                    "Share API returned error {}: {}",
+                    status, body_text
+                ))
+            }
+            Err(e) => CommandResult::Error(format!(
+                "Failed to contact share API: {}\n\
+                 Session sharing is available when authenticated with claude.ai OAuth.",
+                e
+            )),
+        }
+    }
+}
+
+// ---- /teleport -----------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for TeleportCommand {
+    fn name(&self) -> &str { "teleport" }
+    fn description(&self) -> &str { "Teleport to a different session or branch point" }
+    fn help(&self) -> &str {
+        "Usage: /teleport\n\n\
+         Teleports to a remote session when a bridge connection is active.\n\n\
+         When connected to a remote session (via /remote-control), this command\n\
+         jumps to the latest state of that remote session.\n\n\
+         For local-only sessions: shows the current session ID and explains\n\
+         that a bridge connection is required."
+    }
+
+    async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
+        if let Some(ref remote_url) = ctx.remote_session_url {
+            CommandResult::Message(format!(
+                "Teleporting to remote session...\n\
+                 Remote URL: {}\n\
+                 Session ID: {}\n\n\
+                 Use your browser or the claude.ai app to continue from this point.",
+                remote_url, ctx.session_id
+            ))
+        } else {
+            CommandResult::Message(format!(
+                "Teleport requires an active remote session bridge.\n\
+                 Use /session to view connection info.\n\n\
+                 Current session ID: {}\n\
+                 To enable bridge: /remote-control start",
+                ctx.session_id
+            ))
+        }
+    }
+}
+
+// ---- /btw ----------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for BtwCommand {
+    fn name(&self) -> &str { "btw" }
+    fn description(&self) -> &str { "Ask a side question without adding it to conversation history" }
+    fn help(&self) -> &str {
+        "Usage: /btw <question>\n\n\
+         Submits a background question to the model without it becoming part of\n\
+         the main conversation context. The response is shown inline but not\n\
+         stored in the message history.\n\n\
+         Example:\n\
+           /btw what is the capital of France?"
+    }
+
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let question = args.trim();
+        if question.is_empty() {
+            return CommandResult::Error(
+                "Usage: /btw <question>  — provide a question after /btw".to_string(),
+            );
+        }
+
+        // Surface as a special user message tagged as a side-question so the
+        // REPL/TUI can handle it as a non-history query. We inject a system tag
+        // that tells the backend to answer but not record the exchange.
+        CommandResult::UserMessage(format!(
+            "[/btw side-question — answer inline, do not store in history]: {}",
+            question
+        ))
+    }
+}
+
+// ---- /ctx-viz (context visualizer) ---------------------------------------
+
+#[async_trait]
+impl SlashCommand for CtxVizCommand {
+    fn name(&self) -> &str { "ctx-viz" }
+    fn aliases(&self) -> Vec<&str> { vec!["context-visualizer", "ctx"] }
+    fn description(&self) -> &str { "Visualize context window usage breakdown by category" }
+    fn help(&self) -> &str {
+        "Usage: /ctx-viz\n\n\
+         Shows a detailed breakdown of how the context window is being used:\n\
+         - System prompt token estimate\n\
+         - Conversation messages token estimate\n\
+         - Tool results token estimate\n\
+         - Total vs context window limit"
+    }
+
+    async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let model = ctx.config.effective_model().to_string();
+        let context_window: u64 = 200_000; // all current Claude models
+
+        // Estimate system prompt tokens: rough chars/4 approximation
+        // Build a minimal system prompt to estimate its size.
+        let sys_prompt_chars: usize = ctx.config.custom_system_prompt
+            .as_deref()
+            .map(|s| s.len())
+            .unwrap_or(2400 * 4); // fallback: ~2400 tokens worth
+        let sys_prompt_tokens = (sys_prompt_chars / 4).max(1) as u64;
+
+        // Estimate conversation tokens from messages
+        let (conv_chars, tool_chars): (usize, usize) = ctx.messages.iter().fold(
+            (0, 0),
+            |(conv, tool), msg| {
+                let text = msg.get_all_text();
+                // Heuristic: if the message looks like a tool result, count separately
+                if msg.role == cc_core::types::Role::User && text.starts_with('[') {
+                    (conv, tool + text.len())
+                } else {
+                    (conv + text.len(), tool)
+                }
+            },
+        );
+
+        let conv_tokens = (conv_chars / 4) as u64;
+        let tool_tokens = (tool_chars / 4) as u64;
+        let total_tokens = sys_prompt_tokens + conv_tokens + tool_tokens;
+        let pct = (total_tokens as f64 / context_window as f64) * 100.0;
+
+        let bar_width = 40usize;
+        let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
+        let bar = "█".repeat(filled) + &"░".repeat(bar_width.saturating_sub(filled));
+
+        CommandResult::Message(format!(
+            "Context Window Usage\n\
+             ────────────────────────────────────────\n\
+             Model:            {model}\n\
+             System prompt:    ~{sys:>7} tokens\n\
+             Conversation:     ~{conv:>7} tokens\n\
+             Tool results:     ~{tool:>7} tokens\n\
+             ────────────────────────────────────────\n\
+             Total:            ~{total:>7} / {window} tokens ({pct:.1}%)\n\
+             [{bar}] {pct:.1}%\n\n\
+             Use /compact to reduce context usage.",
+            model = model,
+            sys = sys_prompt_tokens,
+            conv = conv_tokens,
+            tool = tool_tokens,
+            total = total_tokens,
+            window = context_window,
+            pct = pct,
+            bar = bar,
+        ))
+    }
+}
+
+// ---- /sandbox-toggle -----------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for SandboxToggleCommand {
+    fn name(&self) -> &str { "sandbox-toggle" }
+    fn aliases(&self) -> Vec<&str> { vec!["sandbox"] }
+    fn description(&self) -> &str { "Enable or disable sandboxed execution of shell commands" }
+    fn help(&self) -> &str {
+        "Usage: /sandbox-toggle [on|off]\n\n\
+         Toggles sandboxed execution of bash/shell commands.\n\
+         When sandbox mode is enabled, shell commands run in an isolated\n\
+         environment to prevent unintended side effects.\n\n\
+         With no argument: toggle the current state.\n\
+         With 'on' or 'off': set explicitly.\n\n\
+         Note: A restart is recommended for full effect."
+    }
+
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        // Read current sandbox state from ui-settings
+        let current_ui = load_ui_settings();
+        let currently_enabled = current_ui.sandbox_mode.unwrap_or(false);
+
+        let enable = match args.trim() {
+            "on" | "enable" | "enabled" | "true" | "1" => true,
+            "off" | "disable" | "disabled" | "false" | "0" => false,
+            "" => !currently_enabled,
+            other => {
+                return CommandResult::Error(format!(
+                    "Unknown argument '{}'. Use: /sandbox-toggle [on|off]",
+                    other
+                ))
+            }
+        };
+
+        match mutate_ui_settings(|s| s.sandbox_mode = Some(enable)) {
+            Ok(_) => {
+                let state = if enable { "enabled" } else { "disabled" };
+                CommandResult::Message(format!(
+                    "Sandbox mode {}. Restart recommended for full effect.",
+                    state
+                ))
+            }
+            Err(e) => CommandResult::Error(format!("Failed to save sandbox setting: {}", e)),
+        }
+    }
+}
+
 // ---- Named-command slash adapters ----------------------------------------
 
 #[async_trait]
@@ -3890,6 +4316,12 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(ThinkBackPlayCommand),
         Box::new(FeedbackCommand),
         Box::new(ColorSetCommand),
+        // New commands: share, teleport, btw, ctx-viz, sandbox-toggle
+        Box::new(ShareCommand),
+        Box::new(TeleportCommand),
+        Box::new(BtwCommand),
+        Box::new(CtxVizCommand),
+        Box::new(SandboxToggleCommand),
     ]
 }
 
@@ -3899,6 +4331,21 @@ pub fn find_command(name: &str) -> Option<Box<dyn SlashCommand>> {
     all_commands().into_iter().find(|c| {
         c.name() == name || c.aliases().contains(&name)
     })
+}
+
+/// Build `HelpEntry` values for all non-hidden commands, suitable for
+/// populating `HelpOverlay::commands` at startup.
+pub fn build_help_entries() -> Vec<cc_tui::overlays::HelpEntry> {
+    all_commands()
+        .iter()
+        .filter(|c| !c.hidden())
+        .map(|c| cc_tui::overlays::HelpEntry {
+            name: c.name().to_string(),
+            aliases: c.aliases().join(", "),
+            description: c.description().to_string(),
+            category: command_category(c.name()).to_string(),
+        })
+        .collect()
 }
 
 /// Execute a slash command string (with leading /).
@@ -3950,6 +4397,7 @@ mod tests {
             working_dir: std::path::PathBuf::from("."),
             session_id: "test-session".to_string(),
             session_title: None,
+            remote_session_url: None,
         }
     }
 

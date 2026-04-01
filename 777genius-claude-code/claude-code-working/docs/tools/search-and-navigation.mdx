@@ -1,0 +1,155 @@
+---
+title: "Search and Navigation Tools - Accurate Location of Code Base"
+description: "Search navigation tools for analyzing Claude Code: Glob file matching, Grep content search, high-performance code retrieval based on ripgrep, helping AI accurately locate millions of lines of code."
+keywords: ["code search", "Glob", "Grep", "ripgrep", "file search"]
+---
+
+## Two search dimensions
+
+| Dimensions | Tools | Underlying implementation | Applicable scenarios |
+|------|------|----------|---------|
+| **Find files by name** | Glob | ripgrep `--files` + glob filter | "Find all test files", "Find files starting with config" |
+| **Find code by content** | Grep | ripgrep regular search | "Where is this function defined?", "Who is calling this API" |
+
+Both share the same ripgrep engine and implement different search modes through different parameter combinations.
+
+## Embedded mode of ripgrep
+
+Claude Code does not rely on system-installed ripgrep - it implements a three-level downgrade strategy in `src/utils/ripgrep.ts`:
+
+```
+Priority 1: System ripgrep (USE_BUILTIN_RIPGREP=false)
+  → Use rg binary from PATH
+  → Security considerations: only use the command name 'rg', without the full path, to prevent PATH hijacking
+
+Priority 2: Built-in mode (bundled/native build)
+  → process.execPath itself, argv0='rg'
+  → Bun statically compiles rg into binaries and distributes them through argv0
+
+Priority 3: vendor directory (npm build)
+  → vendor/ripgrep/{arch}-{platform}/rg
+  → macOS requires codesign signature + remove quarantine xattr
+```
+
+Platform adaptation example:
+```
+vendor/ripgrep/
+  ├── x86_64-darwin/rg      # macOS Intel
+  ├── arm64-darwin/rg        # macOS Apple Silicon
+  ├── x86_64-linux/rg        # Linux Intel
+  ├── arm64-linux/rg         # Linux ARM
+  └── x86_64-win32/rg.exe    # Windows
+```
+
+### macOS Code Signing
+
+rg binaries in vendor mode require ad-hoc signing to pass Gatekeeper (`codesignRipgrepIfNecessary()`):
+
+```typescript
+//Executed on first use:
+// 1. Check whether it is a valid signature
+codesign -vv -d <rg-path>
+// 2. If it is only linker-signed, re-sign it
+codesign --sign - --force --preserve-metadata=entitlements,requirements,flags,runtime <rg-path>
+// 3. Remove the isolation attribute
+xattr -d com.apple.quarantine <rg-path>
+```
+
+## Design considerations for search results
+
+### head_limit and Token budget
+
+Search results for large projects can be in the hundreds of thousands. The default is to return a maximum of 250 matches - this is not an arbitrary choice, but a constraint of the token budget:
+
+- About 50-100 tokens per matching line
+- 250 items ≈ 12,500-25,000 token
+- This is about 6-12% of the 200k context window
+- Exceeding this ratio, the AI’s reasoning quality will decrease
+
+The `head_limit` parameter of the Grep tool allows the AI to be adjusted as needed - larger values can be used when searching for small items.
+
+### Sort by modification time
+
+Glob defaults to ranking the most recently modified files first. This is not a default file system ordering, but a deliberate design decision:
+
+```
+Design hypothesis: Recently modified files are most likely to be relevant to the current task
+Actual effect: AI gives priority to seeing "live" code instead of silent historical files
+```
+
+In `src/tools/GlobTool/`, the output of ripgrep is sorted by mtime before being returned to the AI.
+
+### ripgrep error handling
+
+There is a dedicated error recovery chain for ripgrep execution (`src/utils/ripgrep.ts`):
+
+| Error | Processing |
+|------|------|
+| **EAGAIN** (Insufficient resources) | Automatically retry in single-threaded mode `-j 1` |
+| **Timeout** (default 20s, WSL 60s) | Return existing partial results, discarding the last row that may be incomplete |
+| **Buffer Overflow** | Truncate to 20MB, return collected results |
+| **SIGTERM expires** | Upgrade to SIGKILL after 5 seconds |
+
+## ToolSearch: Discover targets among 50+ tools
+
+When there are more than 50 tools available (including external tools provided by MCP), the AI may not know which one to use. **ToolSearch** (`src/tools/ToolSearchTool/`) provides a tool discovery mechanism.
+
+### Search algorithm
+
+ToolSearch implements weighted search based on keywords (`searchToolsWithKeywords()`):
+
+```
+Input: query = "database connection"
+     ↓
+1. Exact match: Check if there is an exact match of the tool name (fast path)
+2. MCP prefix matching: "mcp__postgres" → matches all postgres related tools
+3. Keyword splitting: ["database", "connection"]
+4. Tool name resolution:
+   - MCP tools: "mcp__server__action" → ["server", "action"]
+   - Common tools: "FileEditTool" → ["file", "edit", "tool"]
+5. Weighted Rating:
+   - Exact match of tool name: 10 points (MCP: 12 points)
+   - Partial match of tool name: 5 points (MCP: 6 points)
+   - searchHint match: 4 points
+   - Description match: 2 points
+6. Required word filtering: "+database" prefix indicates that it must contain
+7. Sort by score and return top-N
+```
+
+### `select:` Direct selection
+
+AI can also precisely select known tools using `select:ToolName`. This is faster than searching and supports comma separated batch selections (`select:A,B,C`).
+
+### Delayed loading (Deferred Tools)
+
+Not all tools are memory resident. MCP tools and low-frequency tools are marked as `isDeferredTool` and are only actually loaded when ToolSearch is selected. This reduces the token overhead per API call (tool descriptions take up a lot of tokens).
+
+### Caching strategy
+
+The retrieval of tool descriptions is memoized - the cache is only cleared when the deferred tool collection changes:
+
+```typescript
+// Sort the tool names and then concatenate them as cache key
+function getDeferredToolsCacheKey(deferredTools: Tools): string {
+  return deferredTools.map(t => t.name).sort().join(',')
+}
+```
+
+## Web Search and Crawl
+
+AI’s information acquisition is not limited to local code:
+
+- **WebSearch**: Search the Internet for the latest information
+- **WebFetch**: Fetch specific web content and convert it to Markdown for AI reading
+
+This allows AI to consult documentation, search Stack Overflow, and read GitHub issues—just like human developers do.
+
+### Streaming output of ripgrep
+
+For interactive scenarios (such as QuickOpen), ripgrep supports streaming output (`ripGrepStream()`):
+
+```
+rg --files → arrive chunk by chunk → split by line → onLines(lines) callback
+```
+
+There is no need to wait for ripgrep to complete the entire search - the first results are displayed while rg is still traversing the directory tree. The caller can terminate the search prematurely (e.g. after enough results are found) via AbortSignal.

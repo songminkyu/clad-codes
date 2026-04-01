@@ -11,6 +11,7 @@ use cc_core::types::ToolDefinition;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 // Sub-modules – each contains a full tool implementation.
@@ -26,6 +27,7 @@ pub mod file_read;
 pub mod file_write;
 pub mod glob_tool;
 pub mod grep_tool;
+pub mod lsp_tool;
 pub mod mcp_resources;
 pub mod todo_write;
 pub mod notebook_edit;
@@ -39,6 +41,12 @@ pub mod tool_search;
 pub mod web_fetch;
 pub mod web_search;
 pub mod worktree;
+pub mod computer_use;
+pub mod mcp_auth_tool;
+pub mod repl_tool;
+pub mod synthetic_output;
+pub mod team_tool;
+pub mod remote_trigger;
 
 // Re-exports for convenience.
 pub use ask_user::AskUserQuestionTool;
@@ -53,6 +61,7 @@ pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use glob_tool::GlobTool;
 pub use grep_tool::GrepTool;
+pub use lsp_tool::LspTool;
 pub use mcp_resources::{ListMcpResourcesTool, ReadMcpResourceTool};
 pub use todo_write::TodoWriteTool;
 pub use notebook_edit::NotebookEditTool;
@@ -65,6 +74,12 @@ pub use tool_search::ToolSearchTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
 pub use worktree::{EnterWorktreeTool, ExitWorktreeTool};
+pub use computer_use::ComputerUseTool;
+pub use mcp_auth_tool::McpAuthTool;
+pub use repl_tool::ReplTool;
+pub use synthetic_output::SyntheticOutputTool;
+pub use team_tool::{TeamCreateTool, TeamDeleteTool};
+pub use remote_trigger::RemoteTriggerTool;
 
 // ---------------------------------------------------------------------------
 // Core trait & types
@@ -117,6 +132,10 @@ pub enum PermissionLevel {
     Execute,
     /// Potentially dangerous (e.g., bypass sandbox).
     Dangerous,
+    /// Unconditionally forbidden — the action must never be executed regardless
+    /// of permission mode.  Used by BashTool when the classifier identifies a
+    /// `Critical`-risk command (e.g. `rm -rf /`, fork-bomb, `dd if=…`).
+    Forbidden,
 }
 
 /// Persistent shell state shared across Bash tool invocations within one session.
@@ -167,6 +186,8 @@ pub struct ToolContext {
     pub permission_handler: Arc<dyn PermissionHandler>,
     pub cost_tracker: Arc<CostTracker>,
     pub session_id: String,
+    pub file_history: Arc<parking_lot::Mutex<cc_core::file_history::FileHistory>>,
+    pub current_turn: Arc<AtomicUsize>,
     /// If true, suppress interactive prompts (batch / CI mode).
     pub non_interactive: bool,
     /// Optional MCP manager for ListMcpResources / ReadMcpResource tools.
@@ -207,6 +228,26 @@ impl ToolContext {
                 tool_name
             ))),
         }
+    }
+
+    pub fn current_turn_index(&self) -> usize {
+        self.current_turn.load(Ordering::Relaxed)
+    }
+
+    pub fn record_file_change(
+        &self,
+        path: PathBuf,
+        before_content: &[u8],
+        after_content: &[u8],
+        tool_name: &str,
+    ) {
+        self.file_history.lock().record_modification(
+            path,
+            before_content,
+            after_content,
+            self.current_turn_index(),
+            tool_name,
+        );
     }
 }
 
@@ -274,6 +315,16 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(ConfigTool),
         Box::new(SendMessageTool),
         Box::new(SkillTool),
+        Box::new(LspTool),
+        Box::new(ReplTool),
+        Box::new(TeamCreateTool),
+        Box::new(TeamDeleteTool),
+        Box::new(SyntheticOutputTool),
+        Box::new(McpAuthTool),
+        Box::new(RemoteTriggerTool),
+        // Computer Use is only available when compiled with the feature flag.
+        #[cfg(feature = "computer-use")]
+        Box::new(computer_use::ComputerUseTool),
     ]
 }
 
@@ -416,6 +467,10 @@ mod tests {
             permission_handler: handler,
             cost_tracker: cc_core::cost::CostTracker::new(),
             session_id: "test".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                cc_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(AtomicUsize::new(0)),
             non_interactive: true,
             mcp_manager: None,
             config: Config::default(),
@@ -440,6 +495,10 @@ mod tests {
             permission_handler: handler,
             cost_tracker: cc_core::cost::CostTracker::new(),
             session_id: "test".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                cc_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(AtomicUsize::new(0)),
             non_interactive: true,
             mcp_manager: None,
             config: Config::default(),

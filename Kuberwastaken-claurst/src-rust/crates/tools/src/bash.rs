@@ -3,6 +3,7 @@
 
 use crate::{PermissionLevel, ShellState, Tool, ToolContext, ToolResult, session_shell_state};
 use async_trait::async_trait;
+use cc_core::bash_classifier::{BashRiskLevel, classify_bash_command};
 use cc_core::tasks::{BackgroundTask, global_registry};
 use regex::Regex;
 use serde::Deserialize;
@@ -288,6 +289,15 @@ impl Tool for BashTool {
         let desc = params.description.as_deref().unwrap_or(&params.command);
         if let Err(e) = ctx.check_permission(self.name(), desc, false) {
             return ToolResult::error(e.to_string());
+        }
+
+        // Security classifier — unconditionally block Critical-risk commands.
+        if classify_bash_command(&params.command) == BashRiskLevel::Critical {
+            return ToolResult::error(format!(
+                "Command blocked: classified as Critical risk by the bash security classifier.\n\
+                 Refusing to execute: {}",
+                params.command
+            ));
         }
 
         let timeout_ms = params.timeout.min(600_000);

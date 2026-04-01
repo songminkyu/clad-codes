@@ -1,0 +1,252 @@
+---
+title: "System Prompt Dynamic Assembly - AI Working Memory Construction"
+description: "In-depth analysis of Claude Code's System Prompt dynamic assembly process: cache strategy, demarcation mark, Section registry, CLAUDE.md multi-level merging, and how to assemble fragmented context into a cache-friendly structure that can be consumed by the API."
+keywords: ["System Prompt", "System Prompt Word", "Dynamic Assembly", "CLAUDE.md", "Prompt Cache", "Cache Strategy"]
+---
+
+## From array to API call: the complete link of System Prompt
+
+System Prompt is not a piece of hard-coded text in Claude Code, but a **`string[]` array** (brand type `SystemPrompt`, defined in `src/utils/systemPromptType.ts:8`), which is sent to the API after being assembled, chunked, and cached.
+
+### Three-stage pipeline
+
+```
+getSystemPrompt() → string[] (assembly content)
+  ↓
+buildEffectiveSystemPrompt() → SystemPrompt (select priority path)
+  ↓
+buildSystemPromptBlocks() → TextBlockParam[] (blocking + cache_control flag)
+```
+
+1. **`getSystemPrompt()`** (`src/constants/prompts.ts:444`)——Collect static segments + dynamic segments and insert `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` demarcation mark
+2. **`buildEffectiveSystemPrompt()`** (`src/utils/systemPrompt.ts:41`) - Press Override > Coordinator > Agent > Custom > Default priority selection
+3. **`buildSystemPromptBlocks()`** (`src/services/api/claude.ts:3214`) - call `splitSysPromptPrefix()` to divide into blocks and append `cache_control` to each block
+
+## SystemPrompt Brand Type
+
+```typescript
+// src/utils/systemPromptType.ts:8
+export type SystemPrompt = readonly string[] & {
+  readonly __brand: 'SystemPrompt'
+}
+export function asSystemPrompt(value: readonly string[]): SystemPrompt {
+  return value as SystemPrompt // Zero-overhead type assertion
+}
+```
+
+Branded types prevent plain `string[]` from being accidentally passed into API calls - the `SystemPrompt` type is only available through an explicit conversion via `asSystemPrompt()`.
+
+## getSystemPrompt(): Panorama of content assembly
+
+`src/constants/prompts.ts:444` is the core factory function of System Prompt, returning an ordered array:
+
+| Stage | Content | Cache Strategy |
+|------|------|----------|
+| **Static Area** | Intro Section, System Rules, Doing Tasks, Actions, Using Tools, Tone & Style, Output Efficiency | Can be cached across organizations (`scope: 'global'`) |
+| **BOUNDARY** | `SYSTEM_PROMPT_DYNAMIC_BOUNDARY = '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__'` | Demarcation marker (not sent to API) |
+| **Dynamic Area** | Session Guidance, Memory, Model Override, Env Info, Language, Output Style, MCP Instructions, Scratchpad, FRC, Summarize Tool Results, Token Budget, Brief | Different for each session (`scope: 'org'` or no cache) |
+
+### Section registry of dynamic area
+
+The dynamic area is registered through `systemPromptSection()` / `DANGEROUS_uncachedSystemPromptSection()`. These two factory functions are defined in `src/constants/systemPromptSections.ts`:
+
+```typescript
+// Cached Section: Calculate once and recalculate after /clear or /compact
+systemPromptSection('memory', () => loadMemoryPrompt())
+
+// Danger: Recalculation every round will destroy the Prompt Cache
+DANGEROUS_uncachedSystemPromptSection(
+  'mcp_instructions',
+  () => isMcpInstructionsDeltaEnabled() ? null : getMcpInstructionsSection(mcpClients),
+  'MCP servers connect/disconnect between turns' // A reason must be given for destroying the cache
+)
+```
+
+`resolveSystemPromptSections()` resolves all Sections in each round of query. For Sections with `cacheBreak: false`, the cached value in `getSystemPromptSectionCache()` will be used first. Only truly dynamic content such as MCP instructions use `DANGEROUS_uncachedSystemPromptSection`.
+
+### `CLAUDE_CODE_SIMPLE` fast path
+
+When the environment variable `CLAUDE_CODE_SIMPLE` is true, the entire System Prompt is reduced to one line:
+
+```typescript
+`You are Claude Code, Anthropic's official CLI for Claude.\n\nCWD: ${getCwd()}\nDate: ${getSessionStartDate()}`
+```
+
+Skip all Section registration, cache chunking, dynamic assembly - test scenarios for minimizing token consumption.
+
+## buildEffectiveSystemPrompt(): five levels of priority
+
+`src/utils/systemPrompt.ts:41` determines which System Prompt is ultimately used:
+
+| Priority | Conditions | Behavior |
+|--------|------|------|
+| **0. Override** | `overrideSystemPrompt` is not empty | Complete replacement, returns `[override]` |
+| **1. Coordinator** | `COORDINATOR_MODE` feature + environment variable | Use coordinator-specific prompt words |
+| **2. Agent** | `mainThreadAgentDefinition` exists | Proactive mode: append to the end of the default prompt word; otherwise: replace the default prompt word |
+| **3. Custom** | `--system-prompt` parameter specification | Replace the default prompt word |
+| **4. Default** | No special conditions | Use `getSystemPrompt()` for complete output |
+
+`appendSystemPrompt` always appends to the end (except Override).
+
+## Cache strategy: chunking, marking, hitting
+
+This is the most sophisticated part of System Prompt's design.
+
+### Anthropic Prompt Cache Basics
+
+The Anthropic API's Prompt Cache allows reusing the same System Prompt prefix across requests, charging per cache hit (much lower than the full input price). The cache key is determined by the Blake2b hash of the content - any character changes will invalidate the cache.
+
+### `splitSysPromptPrefix()`: three blocking modes
+
+`src/utils/api.ts:321` is the core of the cache strategy. Three blocking modes are selected according to conditions:
+
+#### Mode 1: When MCP tool exists (`skipGlobalCacheForSystemPrompt=true`)
+
+```
+[attribution header] → cacheScope: null (do not cache)
+[system prompt prefix] → cacheScope: 'org' (organizational cache)
+[everything else] → cacheScope: 'org' (organizational cache)
+```
+
+The MCP tool list may change (connect/disconnect) within a session, breaking the basis of cross-organization caching and therefore being downgraded to the organization level.
+
+#### Mode 2: Global Cache + Boundary exists (1P exclusive)
+
+```
+[attribution header] → cacheScope: null (do not cache)
+[system prompt prefix] → cacheScope: null (no caching)
+[static content] → cacheScope: 'global' (Global cache! Shared across organizations)
+[dynamic content] → cacheScope: null (do not cache)
+```
+
+This is the most cache-efficient mode. `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` Previous static content (Intro, Rules, Tone & Style, etc.) is the same for all users and can be cached across organizations.
+
+#### Mode 3: Default (3P Provider or Boundary missing)
+
+```
+[attribution header] → cacheScope: null (do not cache)
+[system prompt prefix] → cacheScope: 'org' (organizational cache)
+[everything else] → cacheScope: 'org' (organizational cache)
+```
+
+### `getCacheControl()`: TTL decision
+
+`cache_control` object generated by `src/services/api/claude.ts:359`:
+
+```typescript
+{
+  type: 'ephemeral',
+  ttl?: '1h', // Only when a specific querySource meets the conditions
+  scope?: 'global', // Static area only
+}
+```
+
+Decision logic for 1 hour TTL (`should1hCacheTTL()`, line 394):
+- **Bedrock users**: Enabled via environment variable `ENABLE_PROMPT_CACHING_1H_BEDROCK`
+- **1P user**: Matching `querySource` through the `allowlist` array configured by GrowthBook, supporting prefix wildcards (such as `"repl_main_thread*"`)
+- **Session-level locking**: Qualification results are cached in bootstrap state to prevent GrowthBook configuration changes from causing TTL inconsistencies within the same session.
+
+### Cache corruption: Placement of Session-Specific Guidance
+
+The contents of `getSessionSpecificGuidanceSection()` (`src/constants/prompts.ts:352`) must be placed **after** `SYSTEM_PROMPT_DYNAMIC_BOUNDARY`. Because it contains:
+- The enabledTools collection of the current session
+- Runtime determination of `isForkSubagentEnabled()`
+- Result of `getIsNonInteractiveSession()`
+
+If these runtime bits are placed in the static area, they will generate 2^N Blake2b hash variants (N = runtime condition number), completely destroying the cache hit rate. Source code comments explicitly warn:
+
+> Each conditional here is a runtime bit that would otherwise multiply the Blake2b prefix hash variants (2^N). See PR #24490, #24171 for the same bug class.
+
+### `CLAUDE_CODE_SIMPLE` mode
+
+When the `CLAUDE_CODE_SIMPLE` environment variable is set, the entire system prompt words will be greatly reduced:
+
+```typescript
+return [`You are Claude Code, Anthropic's official CLI for Claude.\n\nCWD: ${getCwd()}\nDate: ${getSessionStartDate()}`]
+```
+
+## Context injection: System Context and User Context
+
+The System Prompt array itself does not contain runtime context (git status, CLAUDE.md content). Context is injected through two separate pipelines:
+
+### System Context（`src/context.ts:116`）
+
+```typescript
+export const getSystemContext = memoize(async () => {
+  return {
+    gitStatus, // git branch, status, recent commit (truncated to MAX_STATUS_CHARS=2000)
+    cacheBreaker, // cache breaker for ant users only
+  }
+})
+```
+
+- Use `lodash.memoize` cache - **Only calculated once for entire session**
+- Git status snapshot contains 5 parallel `git` commands (branch, defaultBranch, status, log, userName)
+- When `status` exceeds 2000 characters, truncate it and append a prompt. Use BashTool for more information.
+- When `systemPromptInjection` changes, clear all context caches via `getUserContext.cache.clear?.()`
+
+### User Context（`src/context.ts:155`）
+
+```typescript
+export const getUserContext = memoize(async () => {
+  return {
+    claudeMd, // Merged CLAUDE.md content
+    currentDate,         // "Today's date is YYYY-MM-DD."
+  }
+})
+```
+
+- **CLAUDE.md disabling condition**: `CLAUDE_CODE_DISABLE_CLAUDE_MDS` environment variable, or `--bare` mode (unless the directory is explicitly specified via `--add-dir`)
+- The semantics of `--bare` mode is "skip things I didn't ask for" rather than "ignore everything"
+
+### Injection location
+
+In `src/query.ts:449`:
+
+```typescript
+// System Context is appended to the end of System Prompt
+const fullSystemPrompt = asSystemPrompt(
+  appendSystemContext(systemPrompt, systemContext) // Simple splicing
+)
+```
+
+The User Context is injected via `prependUserContext()` (`src/utils/api.ts:449`) as the first user message wrapped in the `<system-reminder>` tag, placed before all conversation messages.
+
+## Attribution Header: Billing and Security
+
+The first block of System Prompt for each API request is Attribution Header (`src/constants/system.ts:30`), which contains:
+- **`cc_version`**: Claude Code version + fingerprint
+- **`cc_entrypoint`**: Entry point identification (REPL/SDK/pipe, etc.)
+- **`cch=00000`** (when NATIVE_CLIENT_ATTESTATION is enabled): The Bun native HTTP layer replaces zeros with a calculated hash before sending, and the server validates this token to confirm that the request comes from a real Claude Code client
+
+Header is always `cacheScope: null` - it varies between versions and fingerprints and is not suitable for caching.
+
+## CLAUDE.md: Project-level knowledge injection
+
+This is one of Claude Code's most clever designs. Placing a `CLAUDE.md` file in the project root directory will allow AI to "understand" your project:
+
+- **Project Overview**: What does this project do and what technology stack is used?
+- **Development Conventions**: coding style, naming conventions, branching strategy
+- **Common commands**: how to build, how to test, how to deploy
+- **Notes**: Known pitfalls, special configurations
+
+The system automatically discovers and merges multi-level CLAUDE.md:
+
+```
+~/.claude/CLAUDE.md ← User Global (Personal Preferences)
+  └── /project/CLAUDE.md ← Project root directory (team sharing)
+        └── /project/src/CLAUDE.md ← subdirectory (module specific)
+```
+
+The loading logic is implemented in `getClaudeMds()` and `getMemoryFiles()` in `src/utils/claudemd.ts` - traverses the directory tree upward from CWD and merges the contents of all matching CLAUDE.md files.
+
+## Design Insight: Why `string[]` instead of a single `string`
+
+System Prompt is designed as an array instead of a single piece of text for the purpose of **cache chunking**:
+
+1. Anthropic Prompt Cache uses **content block** (TextBlock) as the cache unit
+2. Split System Prompt into multiple blocks so that the unchanged parts (Intro, Rules) can get independent cache hits
+3. If it is a single `string`, any character change (such as date update) will cause the entire System Prompt cache to become invalid.
+4. The `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` flag allows `splitSysPromptPrefix()` to accurately mark the static area as `scope: 'global'` and the dynamic area as unmarked or marked as `scope: 'org'`
+
+This is Claude Code's core design in token cost optimization - a typical System Prompt is about 20K+ tokens, and 30-50% of the input token cost can be saved by caching chunks.

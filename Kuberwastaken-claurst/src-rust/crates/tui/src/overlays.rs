@@ -38,39 +38,33 @@ pub struct HelpOverlay {
     pub scroll_offset: u16,
     /// Live search filter — only commands matching this substring are shown.
     pub filter: String,
+    /// Dynamically populated entries from the command registry.
+    pub commands: Vec<HelpEntry>,
 }
 
 /// A single command entry shown in the help overlay.
 #[derive(Debug, Clone)]
 pub struct HelpEntry {
-    pub name: &'static str,
+    pub name: String,
     /// Comma-separated aliases, e.g. "h, ?"
-    pub aliases: &'static str,
-    pub description: &'static str,
-    pub category: &'static str,
+    pub aliases: String,
+    pub description: String,
+    pub category: String,
 }
-
-/// All built-in commands exposed in the help overlay.
-pub const HELP_ENTRIES: &[HelpEntry] = &[
-    HelpEntry { name: "help",    aliases: "h",      description: "Show this help",                              category: "General"      },
-    HelpEntry { name: "clear",   aliases: "",        description: "Clear the conversation",                     category: "General"      },
-    HelpEntry { name: "exit",    aliases: "quit, q", description: "Exit Claude Code",                           category: "General"      },
-    HelpEntry { name: "compact", aliases: "",        description: "Compact the conversation with a summary",    category: "General"      },
-    HelpEntry { name: "cost",    aliases: "",        description: "Show token usage and cost",                  category: "General"      },
-    HelpEntry { name: "version", aliases: "",        description: "Show version information",                   category: "General"      },
-    HelpEntry { name: "model",   aliases: "",        description: "Get or set the AI model",                    category: "Configuration" },
-    HelpEntry { name: "config",  aliases: "",        description: "View or edit configuration",                 category: "Configuration" },
-    HelpEntry { name: "color",   aliases: "",        description: "Set the theme color",                        category: "Configuration" },
-    HelpEntry { name: "rewind",  aliases: "",        description: "Rewind the conversation to an earlier point", category: "Conversation" },
-    HelpEntry { name: "resume",  aliases: "",        description: "Resume a previous session",                  category: "Conversation" },
-    HelpEntry { name: "status",  aliases: "",        description: "Show session status",                        category: "Conversation" },
-    HelpEntry { name: "diff",    aliases: "",        description: "Show file diffs since session start",        category: "Conversation" },
-    HelpEntry { name: "memory",  aliases: "",        description: "Manage memory / CLAUDE.md files",            category: "Memory"       },
-];
 
 impl HelpOverlay {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Populate (or replace) the command entries from the command registry.
+    /// Entries are sorted by category then name.
+    pub fn populate_from_commands(&mut self, entries: Vec<HelpEntry>) {
+        self.commands = entries;
+        // Sort stable by category, then name for consistent display.
+        self.commands.sort_by(|a, b| {
+            a.category.cmp(&b.category).then(a.name.cmp(&b.name))
+        });
     }
 
     pub fn toggle(&mut self) {
@@ -168,11 +162,12 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
 
     // --- Commands by category --------------------------------------------
     let filter_lc = overlay.filter.to_lowercase();
-    let filtered: Vec<&HelpEntry> = HELP_ENTRIES
+    let filtered: Vec<&HelpEntry> = overlay
+        .commands
         .iter()
         .filter(|e| {
             filter_lc.is_empty()
-                || e.name.contains(filter_lc.as_str())
+                || e.name.to_lowercase().contains(filter_lc.as_str())
                 || e.aliases.to_lowercase().contains(filter_lc.as_str())
                 || e.description.to_lowercase().contains(filter_lc.as_str())
         })
@@ -180,8 +175,8 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
 
     let mut current_cat = "";
     for entry in &filtered {
-        if entry.category != current_cat {
-            current_cat = entry.category;
+        if entry.category.as_str() != current_cat {
+            current_cat = entry.category.as_str();
             if !lines.is_empty() {
                 lines.push(Line::from(""));
             }
@@ -212,7 +207,7 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
                 Style::default().fg(Color::DarkGray),
             ),
             Span::raw("  "),
-            Span::raw(entry.description.to_string()),
+            Span::raw(entry.description.clone()),
         ]));
     }
 
@@ -748,6 +743,198 @@ fn kb_line<'a>(key: &str, desc: &str) -> Line<'a> {
         ),
         Span::raw(desc.to_string()),
     ])
+}
+
+// ---------------------------------------------------------------------------
+// Global Search Dialog (T2-7)
+// ---------------------------------------------------------------------------
+
+/// State for the global ripgrep search dialog.
+#[derive(Debug, Clone, Default)]
+pub struct GlobalSearchState {
+    pub open: bool,
+    pub query: String,
+    pub results: Vec<SearchResult>,
+    pub selected: usize,
+    pub total_matches: usize,
+    pub searching: bool,
+}
+
+/// A single search result from ripgrep.
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub file: String,
+    pub line: u32,
+    pub col: u32,
+    pub text: String,
+    pub context_before: Vec<String>,
+    pub context_after: Vec<String>,
+}
+
+impl GlobalSearchState {
+    pub fn open(&mut self) {
+        self.open = true;
+        self.query.clear();
+        self.results.clear();
+        self.selected = 0;
+    }
+
+    pub fn close(&mut self) { self.open = false; }
+
+    pub fn select_prev(&mut self) {
+        if self.selected > 0 { self.selected -= 1; }
+    }
+
+    pub fn select_next(&mut self) {
+        if self.selected + 1 < self.results.len() { self.selected += 1; }
+    }
+
+    pub fn push_char(&mut self, c: char) {
+        self.query.push(c);
+        self.selected = 0;
+    }
+
+    pub fn pop_char(&mut self) {
+        self.query.pop();
+        self.selected = 0;
+    }
+
+    /// Run ripgrep synchronously (should be called from tokio::task::spawn_blocking).
+    pub fn run_search(&mut self, project_root: &std::path::Path) {
+        if self.query.is_empty() {
+            self.results.clear();
+            return;
+        }
+        self.searching = true;
+        let output = std::process::Command::new("rg")
+            .args([
+                "--json",
+                "--max-count", "10",
+                "--max-filesize", "1M",
+                &self.query,
+                ".",
+            ])
+            .current_dir(project_root)
+            .output();
+
+        self.searching = false;
+        self.results.clear();
+        self.total_matches = 0;
+
+        if let Ok(out) = output {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                    match val["type"].as_str() {
+                        Some("match") => {
+                            let data = &val["data"];
+                            let file = data["path"]["text"].as_str().unwrap_or("").to_string();
+                            let line_no = data["line_number"].as_u64().unwrap_or(0) as u32;
+                            let text = data["lines"]["text"].as_str().unwrap_or("").trim_end_matches('\n').to_string();
+                            let col = data["submatches"][0]["start"].as_u64().unwrap_or(0) as u32;
+                            self.results.push(SearchResult {
+                                file,
+                                line: line_no,
+                                col,
+                                text,
+                                context_before: Vec::new(),
+                                context_after: Vec::new(),
+                            });
+                            self.total_matches += 1;
+                            if self.results.len() >= 500 { break; }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Return the selected result as a `file:line` string for prompt injection.
+    pub fn selected_ref(&self) -> Option<String> {
+        self.results.get(self.selected).map(|r| format!("{}:{}", r.file, r.line))
+    }
+}
+
+/// Render the global search dialog overlay.
+pub fn render_global_search(state: &GlobalSearchState, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
+    use ratatui::{
+        layout::Rect,
+        style::{Color, Modifier, Style},
+        text::{Line, Span},
+        widgets::{Block, Borders, Clear, Paragraph, Widget},
+    };
+
+    if !state.open { return; }
+
+    let w = (area.width * 4 / 5).max(40).min(area.width);
+    let h = (area.height * 3 / 4).max(10).min(area.height);
+    let x = area.x + (area.width - w) / 2;
+    let y = area.y + (area.height - h) / 4;
+    let dialog = Rect { x, y, width: w, height: h };
+
+    Clear.render(dialog, buf);
+    Block::default()
+        .title(" Search [Esc: close, Enter: insert, ↑↓: navigate] ")
+        .borders(Borders::ALL)
+        .style(Style::default().fg(Color::Cyan))
+        .render(dialog, buf);
+
+    let inner = Rect { x: dialog.x + 1, y: dialog.y + 1, width: dialog.width.saturating_sub(2), height: dialog.height.saturating_sub(2) };
+
+    // Query input bar (first row)
+    let query_line = Line::from(vec![
+        Span::styled("/ ", Style::default().fg(Color::Cyan)),
+        Span::styled(state.query.clone(), Style::default().fg(Color::White)),
+        Span::styled("█", Style::default().fg(Color::Cyan)),
+    ]);
+    Paragraph::new(query_line).render(Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 }, buf);
+
+    // Results
+    let results_area = Rect { x: inner.x, y: inner.y + 2, width: inner.width, height: inner.height.saturating_sub(3) };
+    let max_visible = results_area.height as usize;
+    let start = state.selected.saturating_sub(max_visible / 2);
+
+    for (i, result) in state.results[start..].iter().enumerate() {
+        if i >= max_visible { break; }
+        let selected = start + i == state.selected;
+        let y = results_area.y + i as u16;
+        let prefix = if selected { "> " } else { "  " };
+        let style = if selected {
+            Style::default().add_modifier(Modifier::BOLD).fg(Color::White)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+
+        let avail = results_area.width.saturating_sub(20) as usize;
+        let file_short = if result.file.len() > avail {
+            format!("…{}", &result.file[result.file.len() - avail..])
+        } else {
+            result.file.clone()
+        };
+
+        let text_short: String = result.text.trim().chars().take(40).collect();
+
+        let line = Line::from(vec![
+            Span::styled(prefix, style),
+            Span::styled(format!("{}:{}", file_short, result.line), style.fg(Color::Cyan)),
+            Span::styled(format!("  {}", text_short), style),
+        ]);
+        Paragraph::new(line).render(Rect { x: results_area.x, y, width: results_area.width, height: 1 }, buf);
+    }
+
+    // Status bar
+    let status = if state.searching {
+        "Searching…".to_string()
+    } else if state.results.is_empty() && !state.query.is_empty() {
+        "No matches".to_string()
+    } else if state.total_matches > 0 {
+        format!("{} matches", state.total_matches)
+    } else {
+        "Type to search".to_string()
+    };
+    let status_y = inner.y + inner.height.saturating_sub(1);
+    Paragraph::new(Line::from(vec![Span::styled(status, Style::default().fg(Color::DarkGray))]))
+        .render(Rect { x: inner.x, y: status_y, width: inner.width, height: 1 }, buf);
 }
 
 // ============================================================================

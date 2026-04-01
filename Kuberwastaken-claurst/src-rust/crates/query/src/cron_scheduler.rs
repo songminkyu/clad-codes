@@ -91,6 +91,7 @@ async fn run_scheduler_loop(
                     cost_tracker,
                     None, // background — no UI event channel
                     cancel_child,
+                    None, // no pending message queue for cron tasks
                 )
                 .await;
 

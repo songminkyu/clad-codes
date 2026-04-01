@@ -1,0 +1,182 @@
+---
+title: "Agentic Loop: The core mechanism of AI autonomous loop"
+description: "In-depth analysis of Claude Code's query() asynchronous generator loop - a complete state machine from streaming API calls, tool parallel execution, context compression, error recovery to termination conditions, based on source code level analysis of src/query.ts."
+keywords: ["Agentic Loop", "query loop", "tool_use", "state machine", "auto-compact", "streaming", "recovery"]
+---
+
+{/* The goal of this chapter: Reveal the complete state machine of Agentic Loop based on src/query.ts */}
+
+## What is Agentic Loop?
+
+Traditional chatbot: you ask a question and it answers.
+Claude Code is different: you say a requirement, and it may perform more than ten consecutive steps before giving you the final result.
+
+The mechanism behind this is called **Agentic Loop** (agent loop), and the core is implemented in the `queryLoop()` asynchronous generator function (line 241) in `src/query.ts`. It is a `while(true)` infinite loop, and each iteration represents a "think → act → observe" cycle.
+
+<Frame caption="Agentic Loop loop diagram">
+  <img src="/docs/images/agentic-loop.png" alt="Agentic Loop loop diagram" />
+</Frame>
+
+## The complete structure of the loop
+
+Each iteration of `queryLoop()` (`src/query.ts:307` `while(true)`) contains the following phases:
+
+### Phase 1: Context Pre-Processing (Pre-Processing Pipeline)
+
+Before calling the API, 5 compression/optimization steps are performed in sequence:
+
+```
+messagesForQuery(original message)
+  ↓ applyToolResultBudget() — tool result budget truncation (by maxResultSizeChars)
+  ↓ snipCompactIfNeeded() — Historical Snip compression (HISTORY_SNIP feature)
+  ↓ microcompact() — microcompact (summary of tool results)
+  ↓ applyCollapsesIfNeeded() — Context folding (CONTEXT_COLLAPSE feature)
+  ↓ autocompact() — automatic compaction (triggered when threshold is exceeded)
+messagesForQuery (processed message) → sent to API
+```
+
+The output of each step is the input to the next step, forming a serial pipeline. The number of release tokens of Snip and Microcompact will be passed to the threshold calculation of autocompact (`snipTokensFreed`) to avoid repeated compression.
+
+### Phase 2: Streaming API call (Streaming Loop)
+
+`deps.callModel()` initiates a streaming request (line 659), returning an AsyncGenerator. During streaming:
+
+- **AssistantMessage** is collected into the `assistantMessages[]` array
+- **tool_use blocks** are extracted into `toolUseBlocks[]`, set `needsFollowUp = true`
+- **StreamingToolExecutor** starts executing tools in parallel during the streaming process (without waiting for the end of the stream)
+- Recoverable errors (prompt-too-long, max-output-tokens) are **withheld** (withheld), try to recover first
+
+Key guards in streaming callbacks:
+- `backfillObservableInput()` (line 763) - backfill observable fields (such as file path expansion) for tool_use blocks, but only clone the message when new fields are added to avoid breaking the byte consistency of the prompt cache
+- Streaming downgrade detection - if `streamingFallbackOccured`, collected messages are marked as tombstone (line 717), clear and try again
+
+### Phase 3: Tool Execution
+
+If `needsFollowUp` is true, the loop does not terminate, but the tool is executed:
+
+```typescript
+// Two tool executors (mutually exclusive)
+const toolUpdates = streamingToolExecutor
+  ? streamingToolExecutor.getRemainingResults() // Streaming: Get completed + waiting
+  : runTools(toolUseBlocks, assistantMessages, canUseTool, toolUseContext)
+```
+
+After the tool results are normalized through `normalizeMessagesForAPI()`, they are merged with the original messages and enter the next round of loop iterations.
+
+### Phase 4: Terminate or Continue
+
+At the end of each iteration, `return` (termination) or `continue` (continue) is determined based on the condition:
+
+## 7 termination conditions (source code level)
+
+| Termination reason | Trigger location | Mechanism |
+|----------|---------|------|
+| **completed** | Line 1360 | AI not issuing tool_use → `needsFollowUp = false` → past stop hooks → return |
+| **blocking_limit** | Line 646 | Token count exceeds hard limit (non-autocompact mode) → Generate PTL error message → Return |
+| **aborted_streaming** | Line 1054 | `abortController.signal.aborted` → generate synthetic tool_result for unfinished tool_use → return |
+| **model_error** | Line 999 | `callModel()` throws exception → generate error message → return |
+| **prompt_too_long** | Line 1178 | 413 error and reactive compact cannot recover → suspended error message is released → return |
+| **image_error** | Line 980/1178 | Image size/size error → Return directly |
+| **stop_hook_prevented** | Line 1282 | Stop hook returns `preventContinuation: true` → return |
+
+## 4 continuation conditions (recovery path)
+
+The loop is not just a simple "continue with tool_use", it also contains multiple recovery/retry paths:
+
+### 1. Normal tool cycle
+`needsFollowUp = true` → execute tool → append new messages to `messagesForQuery` → `continue`
+
+### 2. max_output_tokens recovery (lines 1191-1255)
+When AI output is truncated (`apiError === 'max_output_tokens'`):
+- **First time**: Attempt to increase `maxOutputTokens` from default to `ESCALATED_MAX_TOKENS` (64K), no meta message, silently retry
+- **Follow-up**: Inject the recovery message "Output token limit hit. Resume directly...", retry at most `MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3` times
+- Suspended error messages are released after recovery is exhausted
+
+### 3. Prompt-Too-Long recovery (lines 1088-1186)
+When encountering a 413 error, there are two recovery phases:
+- **Context Collapse Drain** (line 1097): Commit all staged collapses, free up space and try again. If the previous round is already collapse_drain_retry, skip it
+- **Reactive Compact** (line 1123): Trigger on-the-fly compaction, generate digest and retry. `hasAttemptedReactiveCompact` prevents infinite loops
+
+### 4. Stop Hook blocking retry (lines 1285-1308)
+Stop hooks can inject blocking error messages, forcing the AI to rethink. New messages (including blocking errors) are appended to the conversation, `stopHookActive = true`, and enter the next iteration.
+
+## Model downgrade (Fallback)
+
+When the main model is not available (`FallbackTriggeredError`, line 897):
+
+1. The collected `assistantMessages` are cleared, and the tool_use block receives the synthesized tool_result: "Model fallback triggered"
+2. The thinking signature blocks are removed (`stripSignatureBlocks`) - because the thinking signature is bound to the model, cross-model playback will be 400
+3. Switch to `fallbackModel` and update `toolUseContext.options.mainLoopModel`
+4. Generate system message: "Switched to {fallback} due to high demand for {original}"
+5. Re-initiate streaming request
+
+## State machine: State object
+
+The state for each iteration is passed via the `State` type (line 204):
+
+```typescript
+type State = {
+  messages: Message[] // Current conversation message
+  toolUseContext: ToolUseContext // Tool context (including permissions)
+  autoCompactTracking: AutoCompactTrackingState // Compression tracking
+  maxOutputTokensRecoveryCount: number //Output truncation recovery count
+  hasAttemptedReactiveCompact: boolean // Whether instant compression has been attempted
+  maxOutputTokensOverride: number | undefined // Output token upper limit override
+  pendingToolUseSummary: Promise<...> | undefined // Asynchronous tool summary
+  stopHookActive: boolean | undefined // Whether Stop hook is activated
+  turnCount: number // Turn count
+transition: Continue | undefined // Reason for last continuation
+}
+```
+
+Each `continue` creates a new State object (immutable update) instead of modifying it in place. The `transition` field records why to continue - allowing subsequent iterations to detect specific recovery paths (such as `collapse_drain_retry`) to avoid loops.
+
+## Token Budget (Experimental)
+
+When the `TOKEN_BUDGET` feature is enabled (line 1311), the loop checks for token consumption before terminating:
+
+- **continuation**: The budget has not been reached but the threshold has been exceeded → Inject nudge message to let AI speed up the closing
+- **diminishing_returns**: Diminishing returns detected → early termination
+- Budget data comes from `createBudgetTracker()`, accumulated across iterations
+
+## Why not "plan once and execute in batches"
+
+<Note>
+The source code reveals why Claude Code chose to cycle step by step:
+</Note>
+
+- **Each step generates real information**: `runTools()` returns `toolResults` that are impossible to predict by the API - command output, file contents, error messages
+- **Dynamic context management**: Re-evaluate compression requirements (autocompact → microcompact → snip) before each iteration, based on the latest token count
+- **Instant Error Recovery**: No need to reinvent the wheel if the tool fails - stop hook can inject blocking errors to allow the AI to correct the strategy
+- **User Controllable**: `abortController.signal` is detected at multiple checkpoints in the loop (lines 1018, 1048, 1488) and can be aborted gracefully by the user pressing ESC
+- **Cost Control**: Token Budget is checked before each round is terminated to prevent AI invalid loops
+
+## A complete iteration example
+
+> User: "Help me find all unused import statements in the project and delete them"
+
+```
+Iteration 1: Think → Act
+  Preprocessing: no compression required (context is short)
+  API call: return tool_use(Glob, "**/*.ts")
+  Tool execution: 42 file paths returned
+  → needsFollowUp = true, continue
+
+Iteration 2: Think → Act
+  Preprocessing: 42 files results still within budget
+  API call: return tool_use(Grep, "import.*from")
+  Tool execution: 120 imports found in 15 files
+  → needsFollowUp = true, continue
+
+Iteration 3: Think → Act (multiple rounds)
+  Preprocessing: 120 Grep results trigger microcompact → summary
+  API call: returns 3 tool_use(FileEdit, ...)
+  Tool execution: Delete 5 unused imports
+  → needsFollowUp = true, continue
+
+Iteration 4: Summary
+  API call: Returns plain text "Cleaned 5 unused imports in 3 files"
+  → needsFollowUp = false
+  → Stop hooks passed
+  → return { reason: 'completed' }
+```

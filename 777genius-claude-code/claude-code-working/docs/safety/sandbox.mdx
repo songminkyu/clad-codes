@@ -1,0 +1,215 @@
+---
+title: "Sandbox mechanism - the second line of defense beyond permissions"
+description: "In-depth Claude Code sandbox mechanism: file system isolation, network restrictions and resource constraints. Even if the command passes permission approval, the sandbox can still limit the scope of its behavior."
+keywords: ["sandbox", "sandbox", "file isolation", "security sandbox", "command isolation"]
+---
+
+## The second line of defense beyond authority
+
+The permission system determines "whether this command can be executed", and the sandbox determines "to what extent it can be executed".
+
+Even if a command passes permission approval, the sandbox can still limit its behavior. The two constitute the two layers of defense in depth:
+- **Permission level** (application level): Check before calling the tool to decide whether to pop up the approval window
+- **Sandbox layer** (OS level): Enforcing constraints at the process level, even if the AI generates malicious commands, it cannot break through
+
+## Execution link: from user input to sandbox package
+
+The complete execution path of a Bash command is as follows:
+
+```
+User input → BashTool.call()
+         → shouldUseSandbox(input) ─── Do you need a sandbox?
+         → Shell.exec(command, { shouldUseSandbox })
+         → SandboxManager.wrapWithSandbox(command)
+         → spawn(wrapped_command) ─── Actual process creation
+```
+
+The key decision occurs in `shouldUseSandbox()` (`src/tools/BashTool/shouldUseSandbox.ts`), which performs the following checks:
+
+1. **Global switch**: `SandboxManager.isSandboxingEnabled()` — Check platform support + dependency integrity + user settings
+2. **Explicit skip**: If `dangerouslyDisableSandbox: true` and the policy allows (`allowUnsandboxedCommands`), the sandbox will not be used
+3. **Exclusion list**: Users can configure `sandbox.excludedCommands` in `settings.json`, and matching commands will skip the sandbox
+4. **Default behavior**: When none of the above conditions are met, **enter the sandbox**
+
+## `shouldUseSandbox()` Detailed explanation of decision logic
+
+```typescript
+// src/tools/BashTool/shouldUseSandbox.ts
+function shouldUseSandbox(input: Partial<SandboxInput>): boolean {
+  // 1. Globally not enabled → skip directly
+  if (!SandboxManager.isSandboxingEnabled()) return false
+
+  // 2. Explicitly disabled + policy allowed → skip
+  if (input.dangerouslyDisableSandbox && 
+      SandboxManager.areUnsandboxedCommandsAllowed()) return false
+
+  // 3. No command → skip
+  if (!input.command) return false
+
+  // 4. Match exclusion list → skip
+  if (containsExcludedCommand(input.command)) return false
+
+  // 5. Other cases → must be sandboxed
+  return true
+}
+```
+
+The matching mechanism of `containsExcludedCommand()` is worth noting - it is not just a simple prefix matching, but supports three modes:
+
+| Patterns | Examples | Matching behavior |
+|------|------|----------|
+| **Exact match** | `npm run lint` | Exact equality |
+| **Prefix match** | `npm run test:*` | Prefix + space or exact equality |
+| **Wildcard** | `docker*` | Use `matchWildcardPattern` |
+
+For compound commands (such as `docker ps && curl evil.com`), the system will first split it into subcommands and check them one by one. Environment variable prefixes (`FOO=bar bazel...`) and wrapper commands (`timeout 30 bazel...`) are also iteratively stripped until the fixed point - preventing bypass via nested wrappers.
+
+## Sandbox configuration model
+
+The sandbox configuration comes from the `sandbox` field in `settings.json` (`src/entrypoints/sandboxTypes.ts`):
+
+```jsonc
+{
+  "sandbox": {
+    "enabled": true, // main switch
+    "autoAllowBashIfSandboxed": true, // Commands in the sandbox are automatically allowed (skipping approval)
+    "allowUnsandboxedCommands": true, // Whether to allow dangerouslyDisableSandbox
+    "failIfUnavailable": false, // Whether to report an error and exit when the sandbox dependency is missing
+    
+    "network": {
+      "allowedDomains": ["github.com"], // Network whitelist
+      "deniedDomains": [], // Network blacklist
+      "allowLocalBinding": true, // Allow localhost binding
+      "httpProxyPort": 8888 // HTTP proxy port (MITM)
+    },
+    
+    "filesystem": {
+"allowWrite": ["~/projects"], // Additional writable paths
+      "denyWrite": ["~/.ssh"], // Deny writing path
+      "denyRead": [], // Disable reading path
+      "allowRead": [] // Re-release in denyRead
+    },
+    
+    "excludedCommands": ["docker", "npm:*"] // Commands without sandboxing
+  }
+}
+```
+
+`SandboxSettingsSchema` defines complete Zod validation rules, including some undisclosed settings such as `enabledPlatforms` (restricting the sandbox to only take effect on specific platforms).
+
+## Platform implementation differences
+
+### macOS：sandbox-exec（Seatbelt）
+
+macOS uses Apple's Seatbelt sandbox (`sandbox-exec` command), which is macOS's native process isolation mechanism.
+
+Execution process:
+1. `SandboxManager.wrapWithSandbox()` calls `BaseSandboxManager` of `@anthropic-ai/sandbox-runtime`
+2. Generate Seatbelt profile at runtime (based on network/file system rules in configuration)
+3. Wrap the original command with `sandbox-exec -p <profile> -- <command>`
+4. Seatbelt enforces constraints at the kernel level
+
+How network isolation is implemented:
+- Intercept HTTP/HTTPS requests via proxy port
+- Domain name whitelist/blacklist filtering at the proxy level
+- Unix sockets can be individually configured to allow paths
+
+### Linux：bubblewrap（bwrap）+ seccomp
+
+Linux uses `bubblewrap` (bwrap) to create namespace isolation and cooperate with seccomp to filter system calls:
+
+Dependencies (`apt install`):
+| Package | Function |
+|----|------|
+| `bubblewrap` | Create mount/PID/network namespace |
+| `socat` | Network proxy (HTTP/SOCKS) |
+| `libseccomp` / seccomp filter | Filter Unix socket system calls |
+
+Implementation differences of bwrap:
+- **glob path pattern not supported** (supported by Seatbelt on macOS) - Permission rules with glob on Linux trigger a warning
+- After execution, a 0-byte mount-point file (such as `.bashrc`) will be left in the current directory, which needs to be cleaned with `cleanupAfterCommand()`
+- seccomp cannot filter Unix sockets by path (can only allow all or deny all), which is different from macOS's release by path.
+
+### Platform support matrix
+
+| Features | macOS | Linux | WSL |
+|------|-------|-------|-----|
+| sandbox engine | sandbox-exec (Seatbelt) | bubblewrap + seccomp | WSL2 only |
+| File glob | ✅ Full support | ⚠️ Only `/**` suffix | Same as Linux |
+| Network Unix socket by path | ✅ | ❌ | ❌ |
+| Dependency check | ripgrep | bwrap + socat + ripgrep + seccomp | Same as Linux |
+
+## Sandbox initialization process
+
+```
+REPL/SDK start
+  → main.tsx → init.ts
+  → SandboxManager.initialize(sandboxAskCallback)
+    → detectWorktreeMainRepoPath() // Detect git worktree and release the main repository .git
+    → convertToSandboxRuntimeConfig() // Build SandboxRuntimeConfig
+    → BaseSandboxManager.initialize() // Start the underlying runtime
+    → settingsChangeDetector.subscribe() // Subscribe to settings changes and dynamically update configurations
+```
+
+`convertToSandboxRuntimeConfig()` (`src/utils/sandbox/sandbox-adapter.ts`) completes the conversion from user settings to runtime configuration:
+
+1. **Network Rules**: Extract domain names from `WebFetch(domain:...)` permission rules → `allowedDomains`
+2. **File system rules**: Extract path from `Edit(...)` / `Read(...)` permission rules → `allowWrite` / `denyWrite` / `denyRead`
+3. **Security hardening**:
+   - Automatically add the project directory to `allowWrite`
+   - Automatically add the `settings.json` path to `denyWrite` (to prevent sandbox escape)
+   - Automatically add `.claude/skills` to `denyWrite` (to prevent skill injection)
+   - Detect bare git repo attack vector and protect `HEAD`/`objects`/`refs`
+
+## Design tradeoffs of `dangerouslyDisableSandbox`
+
+The naming of this parameter itself conveys the design intent - it is not "turn off the sandbox", but "dangerously disable the sandbox".
+
+Double insurance mechanism:
+1. **Calling side**: The model can be set to `dangerouslyDisableSandbox: true` in `inputSchema` of BashTool
+2. **Policy side**: Administrators can completely disable this parameter through `allowUnsandboxedCommands: false` (enterprise deployment scenario)
+
+```typescript
+// Even if the AI requests dangerouslyDisableSandbox, the policy layer can still override it
+if (input.dangerouslyDisableSandbox && 
+    SandboxManager.areUnsandboxedCommandsAllowed()) {
+  return false // Only actually skip the sandbox if the policy allows it
+}
+```
+
+`autoAllowBashIfSandboxed` further complements this model: when enabled, **commands in the sandbox are automatically allowed to execute** without the need for item-by-item approval. This is based on a trust assumption - if OS-level sandboxing already limits the capabilities of commands, then item-by-item approval at the application layer becomes redundant.
+
+## Sandbox violation processing
+
+When a command attempts to violate sandbox constraints:
+
+1. Capture violation events at runtime (file/network access denied)
+2. `SandboxManager.annotateStderrWithSandboxFailures()` injects `<sandbox_violations>` tag in the output
+3. The UI layer is cleared and displayed through `removeSandboxViolationTags()`
+4. Violation events are persisted through `SandboxViolationStore` and can be used for auditing
+
+## Complete execution link example
+
+Take `npm install` as an example:
+
+```
+1. User inputs in REPL → Claude decides to call BashTool
+2. BashTool.validateInput() → Pass
+3. BashTool.checkPermissions() → Check permission rules
+   ├── autoAllowBashIfSandboxed = true and sandbox is available → automatically allowed
+   └── Otherwise → Pop-up window asking user to confirm
+4. BashTool.call() → runShellCommand()
+5. shouldUseSandbox({ command: "npm install" })
+   ├── SandboxManager.isSandboxingEnabled() → true
+   ├── dangerouslyDisableSandbox → undefined
+   └── containsExcludedCommand() → false (unless the user configures npm to exclude)
+   → Result: true, sandbox required
+6. Shell.exec() → SandboxManager.wrapWithSandbox("npm install")
+   ├── macOS: sandbox-exec -p <generated-profile> -- bash -c 'npm install'
+   └── Linux: bwrap ... bash -c 'npm install'
+7. spawn(wrapped_command) → The child process is executed in the sandbox
+8. Execution completed → SandboxManager.cleanupAfterCommand()
+   ├── Clean bwrap residual files (Linux)
+   └── scrubBareGitRepoFiles() (safety cleaning)
+9. The results are returned to Claude → displayed to the user
+```

@@ -1,0 +1,121 @@
+---
+title: "Why write this white paper - Claude Code reverse engineering analysis"
+description: "A white paper on reverse engineering analysis of Anthropic's official Claude Code CLI. By decompiling a TypeScript single-file bundle, you can deeply analyze the runtime behavior and source code structure."
+keywords: ["Claude Code", "Reverse Engineering", "White Paper", "Decompilation", "TypeScript"]
+---
+
+## What is this white paper?
+
+This is a **reverse engineering analysis** of the **Claude Code CLI** officially released by Anthropic.
+
+The source code has been decompiled (TypeScript single-file bundle reverse engineering), retaining the core functional modules, but contains a large number of `unknown`/`never`/`{}` type errors - these do not affect Bun runtime execution, but mean that our analysis is based on runtime behavior + residual source code structure, rather than the original source code.
+
+**This is not:**
+-Official documentation or tutorials
+- API Reference Manual
+- Feature promotion of Claude Code
+
+**This is:**
+- Architectural deconstruction of a production-level agentic system
+- The "why" behind every design decision
+- Reusable engineering patterns: agentic loop, tool abstraction, context engineering, security defense in depth
+
+## The most subtle design decisions in the reverse engineering process
+
+### 1. Agentic Loop’s self-healing ability
+
+The core loop implemented by `src/query.ts` is not simply "send request → receive response". It is a **self-healing state machine**:
+
+- API returns error (current limit, token exceeds limit) → automatic retry/downgrade
+- Tool execution timeout → background + notification mechanism
+- Too long conversation triggers compaction → seamlessly continue after compressing history
+- User Interruption → Generate `UserInterruptionMessage` to let AI understand what happened
+
+This is not "if-else stacking," but rather letting the AI decide its next step based on context - even if the unexpected happens.
+
+### 2. Hierarchical strategy of context engineering
+
+AI has no real "memory", and Claude Code creates this illusion through careful layering:
+
+| Layers | Mechanisms | Persistence |
+|----|------|--------|
+| **System Prompt** | Project structure, git status, CLAUDE.md | Rebuild each round |
+| **Conversation History** | Complete User/Assistant/Tool message | Within session |
+| **Compaction** | Automatically compress long conversations into summary | Replace the original message after compression |
+| **Memory file** | Notes persisted across sessions | Permanent (user controllable) |
+| **File History** | File modification timestamp snapshot | In-session |
+
+The strategy when assembling System Prompt in `src/context.ts` is: **Unchanged content first, changed content last** - This takes advantage of the cache mechanism of the API, and the cache token can be reused when the prefix remains unchanged.
+
+### 3. Dual-track permission system of tool system
+
+`src/tools/BashTool/shouldUseSandbox.ts` demonstrates an elegant two-fold security model:
+
+- **Application layer**: Permission rules determine "whether it can be executed" (whitelist/blacklist/user confirmation)
+- **OS layer**: The sandbox determines "what can be done during execution" (file system/network/process isolation)
+
+The trust assumptions of the two layers are different: the application layer trusts user configuration, and the OS layer does not trust anything. Even if the AI ​​bypasses application-layer permissions (theoretically impossible, but defense-in-depth), the OS-layer sandbox still limits actual harm.
+
+### 4. Global switch of Feature Flag
+
+A single line of code in `src/entrypoints/cli.tsx` determines the behavior of the entire system:
+
+```typescript
+const feature = (_name: string) => false;
+```
+
+All `feature('FLAG_NAME')` calls return `false` - this means that experimental features inside Anthropic (COORDINATOR_MODE, KAIROS, PROACTIVE, etc.) are all disabled. In official builds, these flags are injected at compile time through Bun's `bun:bundle`, and different user groups see different functionality.
+
+This is a **progressive release architecture**: the same code base, controlling feature visibility through feature flags, without the need to maintain multiple branches.
+
+### 5. Compaction binning strategy
+
+`src/services/compact/` implements three compression strategies:
+
+- **Micro-compact**: When a single tool output is too long, the result will be truncated
+- **Auto-compact**: When the conversation token is close to the upper limit, automatically compress the history
+- **Reactive-compact**: When the API returns a token over-limit error, retry after emergency compression.
+
+This isn't simply "cutting out old messages" - it's using the AI itself to summarize previous conversations, retaining semantic information. Insert a `TombstoneMessage` to mark the boundary after compression.
+
+## Read the roadmap
+
+Recommended reading order, with each chapter addressing a core question:
+
+```
+What is Claude Code (you are reading) ← Building Intuition
+    │
+    ├── Architecture panorama ← Five-layer architecture + data flow
+    │
+    ├── Security System ← Trust and Control
+    │ ├── Permission Model ← Application Layer Security
+    │ ├── Sandbox mechanism ← OS layer security
+    │ └── Plan Mode ← User-led mode
+    │
+    ├── Conversation Engine ← How AI Thinks
+    │ ├── Agentic Loop ← Core Loop
+    │ ├── Streaming response ← Real-time communication
+    │ └── Multi-turn dialogue ← Context management
+    │
+    ├── Contextual Engineering ← Memory and Budgeting
+    │ ├── System Prompt ← Context Assembly
+    │ ├── Token Budget ← Budget Management
+    │ └── Project memory ← Cross-session persistence
+    │
+    ├── Tool system ← AI hands
+    │ ├── Tool Overview ← Unified Interface
+    │ ├── Shell execution ← Bash tool
+    │ └── Search & Navigation ← Glob/Grep
+    │
+    └── Agent and Extension ← Capability Expansion
+        ├── Child Agent ← Parallel Task
+        ├── Custom Agent ← User-defined
+        └── MCP protocol ← External tool access
+```
+
+## Who should read it?
+
+- **AI Agent Developer**: Want to understand the architectural pattern of production-level agentic systems
+- **Security Engineer**: Interested in trust models when AI operates in real-world environments
+- **Tool Builder**: is building similar coding assistant or CLI tools
+- **Curiosity-Driven Developer**: Want to know "how does the AI programming assistant work?"

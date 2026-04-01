@@ -1,0 +1,159 @@
+---
+title: "The Privileged World of Ant - Exclusive Features for Anthropic Employees"
+description: "Completely records the exclusive tools, commands, APIs and codenames unlocked when Claude Code identity gating layer: USER_TYPE === 'ant', revealing the differences between internal and external builds."
+keywords: ["Ant Privileges", "USER_TYPE", "Identity Gating", "Internal Features", "Anthropic Employees"]
+---
+
+{/* The goal of this chapter: Completely record the identity gating layer - everything exclusive to ant construction */}
+
+## What is Ant
+
+`USER_TYPE` is a build-time constant injected through the Bun packager's `--define`. This is set to `'ant'` in Anthropic's internal builds, and `'external'` in publicly released builds:
+
+```typescript
+// Decompiled version (src/entrypoints/cli.tsx line 16)
+(globalThis as any).BUILD_TARGET = "external";
+```
+
+Since this is a compile-time constant, Bun does constant folding - all `process.env.USER_TYPE === 'ant'` becomes directly `false` in the external build, and subsequent code is removed by DCE. But in the decompiled version, these codes remain intact.
+
+`USER_TYPE === 'ant'` appears in **60+ locations** in the code base, controlling all aspects of tools, commands, APIs, UI, etc.
+
+## Ant-Only Tools
+
+The following tools are loaded into the tools registry only in internal builds:
+
+| Tools | Code Location | Usage |
+|------|---------|------|
+| **REPLTool** | `src/tools/REPLTool/` | Advanced REPL mode - wraps tools such as Bash/Read/Edit/Glob/Grep/Agent in VM |
+| **SuggestBackgroundPRTool** | `src/tools/SuggestBackgroundPRTool/` | Suggest creating PR in the background |
+| **ConfigTool** | `src/tools/ConfigTool/` | Interactive configuration editor, including Gates tab for overriding GrowthBook flags |
+| **TungstenTool** | `src/tools/TungstenTool/` | Terminal panel tool based on tmux (stubbed in the decompiled version) |
+
+```typescript
+// src/tools.ts lines 16-24
+const REPLTool =
+  process.env.USER_TYPE === 'ant'
+    ? require('./tools/REPLTool/REPLTool.js').REPLTool
+    : null
+const SuggestBackgroundPRTool =
+  process.env.USER_TYPE === 'ant'
+    ? require('./tools/SuggestBackgroundPRTool/SuggestBackgroundPRTool.js')
+        .SuggestBackgroundPRTool
+    : null
+```
+
+## Ant-Only Command
+
+`src/commands.ts` registers 25+ slash commands that are only available in internal builds:
+
+<AccordionGroup>
+  <Accordion title="Debug Class">
+    - `breakCache` — clear cache
+    - `ctx_viz` — Visualize context window usage
+    - `debugToolCall` — debugging tool call
+    - `env` — display environment variables
+    - `mockLimits` — simulate rate limits
+    - `resetLimits` — reset rate limits
+  </Accordion>
+  <Accordion title="Experimental"
+    - `bughunter` — Bug hunter mode
+    - `goodClaude` — quality assessment tool
+    - `antTrace` — trace analysis
+    - `perfIssue` — performance problem diagnosis
+  </Accordion>
+  <Accordion title="Workflow Class">
+    - `commit` — fast commit
+    - `commitPushPr` — one-click submission + push + create PR
+    - `issue` — Create a GitHub Issue
+    - `autofixPr` — Automatically fix problems in PRs
+    - `share` — share a conversation
+    - `summary` — generate a summary
+  </Accordion>
+  <Accordion title="Infrastructure">
+    - `backfillSessions` — backfill session data
+- `bridgeKick` — restart Bridge connection
+    - `oauthRefresh` — Refresh OAuth Token
+    - `teleport` — teleport to the specified context
+    - `onboarding` — novice guide
+    - `agentsPlatform` — Agents platform management
+    - `version` — Build details
+    - `initVerifiers` — initialize verifiers
+  </Accordion>
+</AccordionGroup>
+
+<Note>
+These commands are also hidden in `IS_DEMO` mode, preventing internal functionality from being exposed in the demo environment.
+</Note>
+
+## Beta API Headers
+
+The beta headers sent by Claude Code to the API are also divided into two categories: public and internal:
+
+| Header | Features | Visibility |
+|--------|------|--------|
+| `claude-code-20250219` | Claude Code logo | Public |
+| `interleaved-thinking-2025-05-14` | Interleaved thinking mode | Public |
+| `context-1m-2025-08-07` | 1M context window | Public |
+| `context-management-2025-06-27` | Context Management | Public |
+| `web-search-2025-03-05` | Web search | Public |
+| `effort-2025-11-24` | Inference strength control | Public |
+| `fast-mode-2026-02-01` | fast mode | public |
+| `token-efficient-tools-2026-03-28` | Token efficient tools | Public |
+| `advisor-tool-2026-03-01` | Advisor Tool | Public |
+| **`cli-internal-2026-02-09`** | Internal CLI functionality | **Ant-Only** |
+| **`afk-mode-2026-01-31`** | AFK mode (automatic approval without keyboard) | **Feature Flag** |
+| **`summarize-connector-text-2026-03-13`** | Connector text summary | **Feature Flag** |
+
+```typescript
+// src/constants/betas.ts lines 29-30
+export const CLI_INTERNAL_BETA_HEADER =
+  process.env.USER_TYPE === 'ant' ? 'cli-internal-2026-02-09' : ''
+```
+
+The `cli-internal` header means that Anthropic's API server also maintains a set of ant-only server-side behaviors - this is not just client-side gating.
+
+## Internal code system
+
+Anthropic has a strong culture of "animal naming":
+
+| Codename | Identity | Source |
+|------|------|------|
+| **Tengu** (Tengu) | Claude Code project code name | `tengu_` prefix of all GrowthBook flags, analysis event name |
+| **Capybara** (Capybara) | Model code name | Name blocked by Undercover Mode in `src/constants/prompts.ts` |
+| **Fennec** (Fennec Fox) | Retired model alias | `src/migrations/migrateFennecToOpus.ts` - old name has been migrated to Opus |
+
+These codenames are strictly filtered in commits in public repositories through Undercover Mode.
+
+## Environment variable switch
+
+In addition to `USER_TYPE`, there are also a series of sophisticated environment variables to control various functions:
+
+<AccordionGroup>
+  <Accordion title="Function disable switch">
+    - `CLAUDE_CODE_SIMPLE` — simplified mode (disables advanced features)
+    - `CLAUDE_CODE_DISABLE_THINKING` — disable thinking
+    - `DISABLE_INTERLEAVED_THINKING` — disable interleaved thinking
+    - `DISABLE_COMPACT` — disable message compression
+    - `DISABLE_AUTO_COMPACT` — disable automatic compression
+    - `CLAUDE_CODE_DISABLE_AUTO_MEMORY` — disable automatic memory
+- `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` — disable background tasks
+  </Accordion>
+  <Accordion title="Function enablement switch">
+    - `CLAUDE_CODE_VERIFY_PLAN` — enables VerifyPlanExecutionTool
+    - `ENABLE_LSP_TOOL` — Enable the LSP language server tool
+    - `CLAUDE_CODE_UNDERCOVER` — Force enable Undercover Mode
+    - `CLAUDE_CODE_TERMINAL_RECORDING` — enable terminal recording (asciicast)
+    - `CLAUDE_CODE_ABLATION_BASELINE` — Enable baseline control mode
+  </Accordion>
+  <Accordion title="Environment Configuration">
+    - `CLAUDE_CODE_REMOTE` — remote execution mode (automatically increases heap memory limit)
+    - `CLAUDE_CODE_COORDINATOR_MODE` — Enable Coordinator mode
+    - `CLAUDE_INTERNAL_FC_OVERRIDES` — GrowthBook flag overrides (ant-only)
+    - `IS_DEMO` — Demo mode (hide internal commands and sensitive information)
+  </Accordion>
+</AccordionGroup>
+
+<Note>
+`ABLATION_BASELINE` is particularly interesting - it turns off thinking, compaction, auto-memory and background tasks simultaneously and is used to measure the **causal impact** of these advanced features on AI performance. This is a serious "scientific controlled experiment" tool.
+</Note>

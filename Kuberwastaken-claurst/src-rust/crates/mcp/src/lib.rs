@@ -10,6 +10,8 @@
 // - Resource management (resources/list, resources/read)
 // - Prompt templates (prompts/list, prompts/get)
 // - Transport: stdio (subprocess) and HTTP/SSE
+// - Environment variable expansion in server configs
+// - Connection manager with exponential-backoff reconnection
 
 use async_trait::async_trait;
 use cc_core::config::McpServerConfig;
@@ -21,10 +23,85 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 pub use client::McpClient;
 pub use types::*;
+pub use connection_manager::{McpConnectionManager, McpServerStatus};
+
+pub mod connection_manager;
+pub mod registry;
+pub mod oauth;
+
+// ---------------------------------------------------------------------------
+// Environment variable expansion
+// ---------------------------------------------------------------------------
+
+/// Expand `${VAR_NAME}` and `${VAR_NAME:-default}` patterns in `input` using
+/// the process environment.  Unknown variables without a default are left as-is
+/// (matching the TS behaviour: report missing but don't crash).
+pub fn expand_env_vars(input: &str) -> String {
+    let mut result = input.to_string();
+    // We iterate from left to right, always restarting the search after each
+    // substitution so that replaced values are not re-scanned.
+    let mut search_from = 0;
+    loop {
+        match result[search_from..].find("${") {
+            None => break,
+            Some(rel_start) => {
+                let start = search_from + rel_start;
+                match result[start..].find('}') {
+                    None => break, // unclosed brace — stop
+                    Some(rel_end) => {
+                        let end = start + rel_end; // index of '}'
+                        let inner = &result[start + 2..end]; // content between ${ and }
+
+                        // Support ${VAR:-default} syntax
+                        let (var_name, default_value) = if let Some(pos) = inner.find(":-") {
+                            (&inner[..pos], Some(&inner[pos + 2..]))
+                        } else {
+                            (inner, None)
+                        };
+
+                        let replacement = match std::env::var(var_name) {
+                            Ok(val) => val,
+                            Err(_) => match default_value {
+                                Some(def) => def.to_string(),
+                                None => {
+                                    // Leave the original text in place; advance past it
+                                    search_from = end + 1;
+                                    continue;
+                                }
+                            },
+                        };
+
+                        result = format!("{}{}{}", &result[..start], replacement, &result[end + 1..]);
+                        // Continue scanning from where the replacement ends
+                        search_from = start + replacement.len();
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Expand env vars in every string field of a `McpServerConfig`.
+/// Returns a new owned config; the original is not modified.
+pub fn expand_server_config(config: &McpServerConfig) -> McpServerConfig {
+    McpServerConfig {
+        name: config.name.clone(),
+        command: config.command.as_deref().map(expand_env_vars),
+        args: config.args.iter().map(|a| expand_env_vars(a)).collect(),
+        env: config
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), expand_env_vars(v)))
+            .collect(),
+        url: config.url.as_deref().map(expand_env_vars),
+        server_type: config.server_type.clone(),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 Types
@@ -215,7 +292,11 @@ pub mod types {
     #[serde(tag = "type", rename_all = "lowercase")]
     pub enum McpContent {
         Text { text: String },
-        Image { data: String, #[serde(rename = "mimeType")] mime_type: String },
+        Image {
+            data: String,
+            #[serde(rename = "mimeType")]
+            mime_type: String,
+        },
         Resource { resource: ResourceContents },
     }
 
@@ -303,7 +384,7 @@ pub mod transport {
             let command = config
                 .command
                 .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("MCP server '{}' has no command", config.name))?;
+                .ok_or_else(|| anyhow::anyhow!("MCP server '{}' has no command configured", config.name))?;
 
             let mut cmd = Command::new(command);
             cmd.args(&config.args)
@@ -312,20 +393,27 @@ pub mod transport {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
 
-            let mut child = cmd.spawn()?;
+            let mut child = cmd.spawn().map_err(|e| {
+                anyhow::anyhow!(
+                    "MCP server '{}': failed to spawn '{}': {}",
+                    config.name,
+                    command,
+                    e
+                )
+            })?;
 
             let stdin = child
                 .stdin
                 .take()
-                .ok_or_else(|| anyhow::anyhow!("Could not get stdin"))?;
+                .ok_or_else(|| anyhow::anyhow!("MCP server '{}': could not capture stdin", config.name))?;
             let stdout = child
                 .stdout
                 .take()
-                .ok_or_else(|| anyhow::anyhow!("Could not get stdout"))?;
+                .ok_or_else(|| anyhow::anyhow!("MCP server '{}': could not capture stdout", config.name))?;
 
             let (tx, rx) = mpsc::unbounded_channel::<String>();
 
-            // Background reader task
+            // Background reader task — forwards stdout lines to the channel.
             tokio::spawn(async move {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
@@ -359,7 +447,8 @@ pub mod transport {
             let line = rx.recv().await;
             match line {
                 Some(s) => {
-                    let resp: JsonRpcResponse = serde_json::from_str(&s)?;
+                    let resp: JsonRpcResponse = serde_json::from_str(&s)
+                        .map_err(|e| anyhow::anyhow!("MCP response parse error: {} (raw: {})", e, s))?;
                     Ok(Some(resp))
                 }
                 None => Ok(None),
@@ -398,7 +487,8 @@ pub mod client {
 
     impl McpClient {
         /// Connect to an MCP server using stdio transport and complete the
-        /// initialize handshake.
+        /// initialize handshake.  The `config` should already have env vars
+        /// expanded via `expand_server_config`.
         pub async fn connect_stdio(config: &McpServerConfig) -> anyhow::Result<Self> {
             let transport = transport::StdioTransport::spawn(config).await?;
             let client = Self {
@@ -432,7 +522,8 @@ pub mod client {
 
             let result: InitializeResult = self
                 .call("initialize", Some(serde_json::to_value(&params)?))
-                .await?;
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP server '{}' initialize failed: {}", self.server_name, e))?;
 
             self.server_info = Some(result.server_info);
             self.capabilities = result.capabilities.clone();
@@ -486,6 +577,14 @@ pub mod client {
             };
             self.call("tools/call", Some(serde_json::to_value(&params)?))
                 .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "MCP server '{}': tool '{}' call failed: {}",
+                        self.server_name,
+                        name,
+                        e
+                    )
+                })
         }
 
         pub async fn list_resources(&self) -> anyhow::Result<Vec<McpResource>> {
@@ -500,7 +599,13 @@ pub mod client {
                 .get("contents")
                 .and_then(|c| c.as_array())
                 .and_then(|arr| arr.first())
-                .ok_or_else(|| anyhow::anyhow!("No contents in response"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "MCP server '{}': no contents in resources/read response for '{}'",
+                        self.server_name,
+                        uri
+                    )
+                })?;
             Ok(serde_json::from_value(contents.clone())?)
         }
 
@@ -534,7 +639,7 @@ pub mod client {
                     .transport
                     .recv()
                     .await?
-                    .ok_or_else(|| anyhow::anyhow!("MCP transport closed"))?;
+                    .ok_or_else(|| anyhow::anyhow!("MCP transport closed while waiting for response to '{}'", method))?;
 
                 // Check if this response matches our request id
                 let resp_id = resp.id.as_ref().and_then(|v| v.as_u64()).unwrap_or(0);
@@ -546,15 +651,16 @@ pub mod client {
 
                 if let Some(err) = resp.error {
                     return Err(anyhow::anyhow!(
-                        "MCP error {}: {}",
+                        "MCP error {} from '{}': {}",
                         err.code,
+                        method,
                         err.message
                     ));
                 }
 
                 let result = resp
                     .result
-                    .ok_or_else(|| anyhow::anyhow!("No result in MCP response"))?;
+                    .ok_or_else(|| anyhow::anyhow!("No result in MCP response for '{}'", method))?;
                 return Ok(serde_json::from_value(result)?);
             }
         }
@@ -568,43 +674,151 @@ pub mod client {
 /// Manages a pool of MCP server connections.
 pub struct McpManager {
     clients: HashMap<String, McpClient>,
+    /// Servers that failed to connect during `connect_all`.
+    failed_servers: Vec<(String, String)>, // (name, error)
+}
+
+#[derive(Debug, Clone)]
+pub struct McpServerCatalog {
+    pub tool_count: usize,
+    pub resource_count: usize,
+    pub prompt_count: usize,
+    pub resources: Vec<String>,
+    pub prompts: Vec<String>,
 }
 
 impl McpManager {
     pub fn new() -> Self {
         Self {
             clients: HashMap::new(),
+            failed_servers: Vec::new(),
         }
     }
 
     /// Connect to all configured MCP servers.
+    ///
+    /// - Expands env vars in each config before connecting.
+    /// - Logs success/failure clearly.
+    /// - Continues on failure (does not bail out on first error).
+    /// - Tracks failed servers in `failed_servers()`.
     pub async fn connect_all(configs: &[McpServerConfig]) -> Self {
         let mut manager = Self::new();
         for config in configs {
-            match config.server_type.as_str() {
+            // Expand env vars before using the config
+            let expanded = expand_server_config(config);
+
+            match expanded.server_type.as_str() {
                 "stdio" => {
-                    debug!(server = %config.name, "Connecting to MCP server via stdio");
-                    match McpClient::connect_stdio(config).await {
+                    debug!(
+                        server = %expanded.name,
+                        command = ?expanded.command,
+                        "Connecting to MCP server via stdio"
+                    );
+                    match McpClient::connect_stdio(&expanded).await {
                         Ok(client) => {
-                            let name = config.name.clone();
-                            manager.clients.insert(name, client);
+                            info!(
+                                server = %expanded.name,
+                                tools = client.tools.len(),
+                                resources = client.resources.len(),
+                                "MCP server connected"
+                            );
+                            manager.clients.insert(expanded.name.clone(), client);
                         }
                         Err(e) => {
                             error!(
-                                server = %config.name,
+                                server = %expanded.name,
                                 error = %e,
                                 "Failed to connect to MCP server"
                             );
+                            manager
+                                .failed_servers
+                                .push((expanded.name.clone(), e.to_string()));
                         }
                     }
                 }
                 other => {
-                    warn!(transport = other, "Unsupported MCP transport type");
+                    warn!(
+                        server = %expanded.name,
+                        transport = other,
+                        "Unsupported MCP transport type; skipping server"
+                    );
+                    manager.failed_servers.push((
+                        expanded.name.clone(),
+                        format!("unsupported transport: {}", other),
+                    ));
                 }
             }
         }
         manager
     }
+
+    // -----------------------------------------------------------------------
+    // Status / query API (used by /mcp command and McpConnectionManager)
+    // -----------------------------------------------------------------------
+
+    /// Return all connected server names.
+    pub fn server_names(&self) -> Vec<String> {
+        self.clients.keys().cloned().collect()
+    }
+
+    /// Return status for a single server.
+    pub fn server_status(&self, name: &str) -> McpServerStatus {
+        if let Some(client) = self.clients.get(name) {
+            McpServerStatus::Connected {
+                tool_count: client.tools.len(),
+            }
+        } else if let Some((_, err)) = self.failed_servers.iter().find(|(n, _)| n == name) {
+            McpServerStatus::Disconnected {
+                last_error: Some(err.clone()),
+            }
+        } else {
+            McpServerStatus::Disconnected { last_error: None }
+        }
+    }
+
+    /// Return status for every configured server (connected + failed).
+    pub fn all_statuses(&self) -> HashMap<String, McpServerStatus> {
+        let mut map = HashMap::new();
+        for (name, client) in &self.clients {
+            map.insert(
+                name.clone(),
+                McpServerStatus::Connected {
+                    tool_count: client.tools.len(),
+                },
+            );
+        }
+        for (name, err) in &self.failed_servers {
+            map.insert(
+                name.clone(),
+                McpServerStatus::Disconnected {
+                    last_error: Some(err.clone()),
+                },
+            );
+        }
+        map
+    }
+
+    /// Servers that failed to connect during `connect_all`.
+    /// Each entry is `(server_name, error_message)`.
+    pub fn failed_servers(&self) -> &[(String, String)] {
+        &self.failed_servers
+    }
+
+    /// Return counts and names for tools/resources/prompts on connected servers.
+    pub fn server_catalog(&self, name: &str) -> Option<McpServerCatalog> {
+        let client = self.clients.get(name)?;
+        Some(McpServerCatalog {
+            tool_count: client.tools.len(),
+            resource_count: client.resources.len(),
+            prompt_count: client.prompts.len(),
+            resources: client.resources.iter().map(|r| r.name.clone()).collect(),
+            prompts: client.prompts.iter().map(|p| p.name.clone()).collect(),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Tool / resource helpers
+    // -----------------------------------------------------------------------
 
     /// Get all tool definitions from all connected servers.
     pub fn all_tool_definitions(&self) -> Vec<(String, ToolDefinition)> {
@@ -638,19 +852,15 @@ impl McpManager {
             }
         }
         Err(anyhow::anyhow!(
-            "No MCP server found for tool: {}",
-            prefixed_name
+            "No MCP server found for tool '{}'. Connected servers: [{}]",
+            prefixed_name,
+            self.clients.keys().cloned().collect::<Vec<_>>().join(", ")
         ))
     }
 
     /// Number of connected servers.
     pub fn server_count(&self) -> usize {
         self.clients.len()
-    }
-
-    /// List all connected server names.
-    pub fn server_names(&self) -> Vec<&str> {
-        self.clients.keys().map(|s| s.as_str()).collect()
     }
 
     /// Get server instructions (from initialize response).
@@ -700,7 +910,7 @@ impl McpManager {
         let client = self
             .clients
             .get(server_name)
-            .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", server_name))?;
+            .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found or not connected", server_name))?;
 
         let contents = client.read_resource(uri).await?;
         Ok(serde_json::to_value(&contents)?)
@@ -714,29 +924,121 @@ impl Default for McpManager {
 }
 
 // ---------------------------------------------------------------------------
-// MCP Tool wrapper: makes MCP tools act like native cc-tools
+// MCP result → string conversion
 // ---------------------------------------------------------------------------
-// (This would be in cc-tools but is here to avoid circular deps)
 
-/// Convert MCP tool call result to a string for the model.
+/// Convert an MCP tool call result to a string for the model.
+///
+/// Content type handling:
+/// - `text`     → the text itself
+/// - `image`    → `[Image: <mime_type>]` with a short base64 preview
+/// - `resource` → `[Resource: <uri>]` plus text content if present
+///
+/// Mixed content is joined with newlines.
+/// If all content is empty, returns an empty string.
 pub fn mcp_result_to_string(result: &CallToolResult) -> String {
-    result
+    let parts: Vec<String> = result
         .content
         .iter()
-        .filter_map(|c| match c {
-            McpContent::Text { text } => Some(text.as_str()),
-            McpContent::Image { .. } => Some("[image]"),
+        .map(|c| match c {
+            McpContent::Text { text } => text.clone(),
+            McpContent::Image { data, mime_type } => {
+                // Show a short preview (first 32 chars of base64) so the model
+                // knows an image was returned without embedding the full blob.
+                let preview_len = data.len().min(32);
+                let preview = &data[..preview_len];
+                let ellipsis = if data.len() > 32 { "…" } else { "" };
+                format!(
+                    "[Image: {} | base64 preview: {}{}]",
+                    mime_type, preview, ellipsis
+                )
+            }
             McpContent::Resource { resource } => {
-                resource.text.as_deref().or(Some("[binary resource]"))
+                let mut parts = vec![format!("[Resource: {}]", resource.uri)];
+                if let Some(ref text) = resource.text {
+                    parts.push(text.clone());
+                } else if resource.blob.is_some() {
+                    let mime = resource
+                        .mime_type
+                        .as_deref()
+                        .unwrap_or("application/octet-stream");
+                    parts.push(format!("[Binary resource: {}]", mime));
+                }
+                parts.join("\n")
             }
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+
+    parts.join("\n")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- env expansion -----------------------------------------------------
+
+    #[test]
+    fn test_expand_env_vars_no_vars() {
+        assert_eq!(expand_env_vars("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_expand_env_vars_known_var() {
+        std::env::set_var("_CC_TEST_VAR", "rustacean");
+        let out = expand_env_vars("hello ${_CC_TEST_VAR}!");
+        assert_eq!(out, "hello rustacean!");
+        std::env::remove_var("_CC_TEST_VAR");
+    }
+
+    #[test]
+    fn test_expand_env_vars_default_value() {
+        std::env::remove_var("_CC_MISSING_VAR");
+        let out = expand_env_vars("val=${_CC_MISSING_VAR:-fallback}");
+        assert_eq!(out, "val=fallback");
+    }
+
+    #[test]
+    fn test_expand_env_vars_missing_no_default() {
+        std::env::remove_var("_CC_REALLY_MISSING");
+        // Missing with no default → keep original
+        let out = expand_env_vars("${_CC_REALLY_MISSING}");
+        assert_eq!(out, "${_CC_REALLY_MISSING}");
+    }
+
+    #[test]
+    fn test_expand_env_vars_multiple() {
+        std::env::set_var("_CC_A", "foo");
+        std::env::set_var("_CC_B", "bar");
+        let out = expand_env_vars("${_CC_A}/${_CC_B}");
+        assert_eq!(out, "foo/bar");
+        std::env::remove_var("_CC_A");
+        std::env::remove_var("_CC_B");
+    }
+
+    #[test]
+    fn test_expand_server_config() {
+        std::env::set_var("_CC_TEST_HOME", "/home/user");
+        let cfg = McpServerConfig {
+            name: "test".to_string(),
+            command: Some("${_CC_TEST_HOME}/bin/server".to_string()),
+            args: vec!["--root".to_string(), "${_CC_TEST_HOME}".to_string()],
+            env: {
+                let mut m = HashMap::new();
+                m.insert("PATH".to_string(), "${_CC_TEST_HOME}/bin".to_string());
+                m
+            },
+            url: None,
+            server_type: "stdio".to_string(),
+        };
+        let expanded = expand_server_config(&cfg);
+        assert_eq!(expanded.command.as_deref(), Some("/home/user/bin/server"));
+        assert_eq!(expanded.args[1], "/home/user");
+        assert_eq!(expanded.env.get("PATH").map(|s| s.as_str()), Some("/home/user/bin"));
+        std::env::remove_var("_CC_TEST_HOME");
+    }
+
+    // ---- JSON-RPC -----------------------------------------------------------
 
     #[test]
     fn test_json_rpc_request_serialization() {
@@ -745,6 +1047,8 @@ mod tests {
         assert!(json.contains("\"jsonrpc\":\"2.0\""));
         assert!(json.contains("\"method\":\"tools/list\""));
     }
+
+    // ---- McpTool → ToolDefinition ------------------------------------------
 
     #[test]
     fn test_mcp_tool_to_definition() {
@@ -760,4 +1064,158 @@ mod tests {
         assert_eq!(def.name, "search");
         assert_eq!(def.description, "Search the web");
     }
+
+    // ---- mcp_result_to_string ----------------------------------------------
+
+    #[test]
+    fn test_result_to_string_text() {
+        let result = CallToolResult {
+            content: vec![McpContent::Text {
+                text: "hello".to_string(),
+            }],
+            is_error: false,
+        };
+        assert_eq!(mcp_result_to_string(&result), "hello");
+    }
+
+    #[test]
+    fn test_result_to_string_image() {
+        let result = CallToolResult {
+            content: vec![McpContent::Image {
+                data: "abc123".to_string(),
+                mime_type: "image/png".to_string(),
+            }],
+            is_error: false,
+        };
+        let s = mcp_result_to_string(&result);
+        assert!(s.contains("Image:"));
+        assert!(s.contains("image/png"));
+        assert!(s.contains("abc123"));
+    }
+
+    #[test]
+    fn test_result_to_string_resource_with_text() {
+        let result = CallToolResult {
+            content: vec![McpContent::Resource {
+                resource: ResourceContents {
+                    uri: "file:///foo.txt".to_string(),
+                    mime_type: Some("text/plain".to_string()),
+                    text: Some("file contents".to_string()),
+                    blob: None,
+                },
+            }],
+            is_error: false,
+        };
+        let s = mcp_result_to_string(&result);
+        assert!(s.contains("[Resource: file:///foo.txt]"));
+        assert!(s.contains("file contents"));
+    }
+
+    #[test]
+    fn test_result_to_string_resource_binary() {
+        let result = CallToolResult {
+            content: vec![McpContent::Resource {
+                resource: ResourceContents {
+                    uri: "file:///img.png".to_string(),
+                    mime_type: Some("image/png".to_string()),
+                    text: None,
+                    blob: Some("BASE64==".to_string()),
+                },
+            }],
+            is_error: false,
+        };
+        let s = mcp_result_to_string(&result);
+        assert!(s.contains("[Resource: file:///img.png]"));
+        assert!(s.contains("[Binary resource: image/png]"));
+    }
+
+    #[test]
+    fn test_result_to_string_mixed() {
+        let result = CallToolResult {
+            content: vec![
+                McpContent::Text {
+                    text: "line one".to_string(),
+                },
+                McpContent::Text {
+                    text: "line two".to_string(),
+                },
+            ],
+            is_error: false,
+        };
+        assert_eq!(mcp_result_to_string(&result), "line one\nline two");
+    }
+
+    // ---- McpManager --------------------------------------------------------
+
+    #[test]
+    fn test_manager_server_names_empty() {
+        let mgr = McpManager::new();
+        assert!(mgr.server_names().is_empty());
+    }
+
+    #[test]
+    fn test_manager_all_statuses_empty() {
+        let mgr = McpManager::new();
+        assert!(mgr.all_statuses().is_empty());
+    }
+
+    #[test]
+    fn test_manager_failed_servers_empty() {
+        let mgr = McpManager::new();
+        assert!(mgr.failed_servers().is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resource subscriptions (T2-12)
+// ---------------------------------------------------------------------------
+
+use tokio::sync::mpsc as tokio_mpsc;
+
+/// Notification that a resource has changed.
+#[derive(Debug, Clone)]
+pub struct ResourceChangedEvent {
+    pub server_name: String,
+    pub uri: String,
+}
+
+/// Subscription handle for a single MCP resource URI.
+pub struct ResourceSubscription {
+    pub server_name: String,
+    pub uri: String,
+}
+
+/// Subscribe to resource changes on an MCP server.
+/// Stubs the subscription request — real dispatch requires server notification stream.
+pub async fn subscribe_resource_stub(
+    server_name: &str,
+    uri: &str,
+) -> tokio_mpsc::Receiver<ResourceChangedEvent> {
+    let (_tx, rx) = tokio_mpsc::channel(32);
+    // In production: send resources/subscribe RPC; store tx in connection state
+    tracing::info!(server_name, uri, "MCP resource subscription registered (stub)");
+    rx
+}
+
+/// Unsubscribe from resource change notifications.
+///
+/// Sends `resources/unsubscribe` JSON-RPC request to the named server via
+/// `McpManager`.  Returns an error if the server is not connected or the
+/// request fails.
+pub async fn unsubscribe_resource(
+    manager: &McpManager,
+    server_name: &str,
+    uri: &str,
+) -> Result<(), String> {
+    let client = manager
+        .clients
+        .get(server_name)
+        .ok_or_else(|| format!("unsubscribe_resource: server '{}' not connected", server_name))?;
+
+    let params = serde_json::json!({ "uri": uri });
+    client
+        .call_tool("resources/unsubscribe", Some(params))
+        .await
+        .map_err(|e| format!("unsubscribe_resource failed: {e}"))
+        .map(|_| ())
 }

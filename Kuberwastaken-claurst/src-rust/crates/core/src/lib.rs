@@ -3,6 +3,36 @@
 //
 // All sub-modules are defined inline below.
 
+// Session transcript persistence (JSONL, matches TS sessionStorage.ts schema).
+pub mod session_storage;
+
+// Attachment pipeline — assembles per-turn context attachments (T1-6).
+pub mod attachments;
+
+// Git utilities (T4-3).
+pub mod git_utils;
+
+// Utility modules ported from src/utils/
+pub mod token_budget;
+pub mod truncate;
+pub mod format_utils;
+pub mod crypto_utils;
+pub mod status_notices;
+pub mod auto_mode;
+
+// Remote session sync and cloud session API (T3-1, T3-2).
+pub mod remote_session;
+pub mod cloud_session;
+
+// CLAUDE.md hierarchical memory loading (T4-1).
+pub mod claudemd;
+
+// Message manipulation utilities (T4-2).
+pub mod message_utils;
+
+// Per-session file modification history (T4-6).
+pub mod file_history;
+
 // Re-export commonly used types at the crate root
 pub use error::{ClaudeError, Result};
 pub use types::{
@@ -391,6 +421,9 @@ pub mod config {
         PostToolUse,
         /// Fires when the model finishes its turn (stop).
         Stop,
+        /// Fires after the model samples a response, before tool execution.
+        /// Corresponds to `hooks.PostModelTurn` in settings.json.
+        PostModelTurn,
         /// Fires when the user submits a prompt.
         UserPromptSubmit,
         /// General-purpose notification event.
@@ -425,6 +458,8 @@ pub mod config {
         pub verbose: bool,
         pub output_format: OutputFormat,
         pub mcp_servers: Vec<McpServerConfig>,
+        #[serde(default)]
+        pub lsp_servers: Vec<crate::lsp::LspServerConfig>,
         pub allowed_tools: Vec<String>,
         pub disallowed_tools: Vec<String>,
         pub env: HashMap<String, String>,
@@ -2421,7 +2456,7 @@ pub mod oauth {
             .expect("valid OAuth authorize base URL");
         {
             let mut q = u.query_pairs_mut();
-            q.append_pair("code", "true");
+            q.append_pair("code", "true"); // tells the login page to show Claude Max upsell
             q.append_pair("client_id", CLIENT_ID);
             q.append_pair("response_type", "code");
             let redirect = if is_manual {
@@ -2456,6 +2491,13 @@ pub mod memdir;
 pub mod oauth_config;
 pub mod migrations;
 pub mod output_styles;
+pub mod feature_gates;
+pub mod tips;
+pub mod remote_settings;
+pub mod settings_sync;
+pub mod effort;
+pub mod prompt_history;
+pub mod bash_classifier;
 
 // ---------------------------------------------------------------------------
 // tasks module — background task registry

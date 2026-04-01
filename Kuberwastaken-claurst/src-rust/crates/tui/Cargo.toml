@@ -8,6 +8,7 @@ cc-core = { workspace = true }
 cc-api = { workspace = true }
 cc-tools = { workspace = true }
 cc-query = { workspace = true }
+cc-mcp = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
@@ -19,3 +20,8 @@ crossterm = { workspace = true }
 unicode-width = { workspace = true }
 chrono = { workspace = true }
 parking_lot = { workspace = true }
+dirs = { workspace = true }
+similar = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

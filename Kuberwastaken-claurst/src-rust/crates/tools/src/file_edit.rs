@@ -135,6 +135,13 @@ impl Tool for FileEditTool {
             ));
         }
 
+        ctx.record_file_change(
+            path.clone(),
+            content.as_bytes(),
+            new_content.as_bytes(),
+            self.name(),
+        );
+
         // Build a diff snippet for the response
         let replacements = if params.replace_all { count } else { 1 };
         let msg = format!(

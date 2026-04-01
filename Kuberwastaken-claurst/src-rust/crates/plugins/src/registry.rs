@@ -133,6 +133,39 @@ impl PluginRegistry {
         defs
     }
 
+    /// Collect paths to all `skills/` directories contributed by enabled plugins.
+    pub fn all_skill_paths(&self) -> Vec<std::path::PathBuf> {
+        let mut paths = Vec::new();
+        for plugin in self.enabled() {
+            if let Some(ref p) = plugin.skills_path {
+                paths.push(p.clone());
+            }
+        }
+        paths
+    }
+
+    /// Collect paths to all `agents/` directories contributed by enabled plugins.
+    pub fn all_agent_paths(&self) -> Vec<std::path::PathBuf> {
+        let mut paths = Vec::new();
+        for plugin in self.enabled() {
+            if let Some(ref p) = plugin.agents_path {
+                paths.push(p.clone());
+            }
+        }
+        paths
+    }
+
+    /// Collect paths to all `output-styles/` directories contributed by enabled plugins.
+    pub fn all_output_style_paths(&self) -> Vec<std::path::PathBuf> {
+        let mut paths = Vec::new();
+        for plugin in self.enabled() {
+            if let Some(ref p) = plugin.output_styles_path {
+                paths.push(p.clone());
+            }
+        }
+        paths
+    }
+
     /// Build the `HookRegistry` from all enabled plugins.
     pub fn build_hook_registry(&self) -> HookRegistry {
         let mut registry: HookRegistry = HashMap::new();

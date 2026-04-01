@@ -1,0 +1,211 @@
+---
+title: "Custom Agent - Complete link from Markdown to runtime"
+description: "Revealing the complete link of Claude Code's custom Agent: the Markdown data model defined by the Agent, three loading sources, tool filtering strategy and linkage mechanism with AgentTool."
+keywords: ["Customized Agent", "Agent Definition", "Markdown Agent", "Agent Configuration", "Role Customization"]
+---
+
+{/* The goal of this chapter: reveal the complete data model defined by Agent, loading discovery mechanism, tool filtering and linkage with AgentTool */}
+
+## Three sources of Agent definition
+
+Claude Code's Agents are not only customized by users - the system has three types of sources, merged according to priority:
+
+| Source | Location | Priority |
+|------|------|--------|
+| **Built-in** | `src/tools/AgentTool/built-in/` hardcoded | lowest (can be overridden) |
+| **Plugin** | Register through the plug-in system | Medium |
+| **User/Project/Policy** | `.claude/agents/*.md` or settings.json | highest |
+
+The merge logic is in `getActiveAgentsFromList()`: remove duplicates by `agentType`, the latter overwrites the former. This means you can place an `Explore.md` in `.claude/agents/` to completely replace the built-in Explore Agent.
+
+## Complete format of Markdown Agent file
+
+```markdown
+---
+# === Required fields ===
+name: "reviewer" # Agent identification (agentType)
+description: "Code review specialist, read-only analysis"
+
+# === Tool Control ===
+tools: "Read,Glob,Grep,Bash" # List of allowed tools (comma separated)
+disallowedTools: "Write,Edit" # Explicitly disabled tools
+
+# === Model configuration ===
+model: "haiku" #Specify the model (or "inherit" to inherit the main thread)
+effort: "high" # Reasoning effort: low/medium/high or integer
+
+# === Behavior Control ===
+maxTurns: 10 # Maximum agentic turns
+permissionMode: "plan" # Permission mode: plan/bypassPermissions, etc.
+background: true #Always run as a background task
+initialPrompt: "/search TODO" # First round user message prefix (supports slash command)
+
+# === Isolation and persistence ===
+isolation: "worktree" # Run in an independent git worktree
+memory: "project" # Persistent memory scope: user/project/local
+
+# === MCP Server ===
+mcpServers:
+  - "slack" # refers to the configured MCP server
+  - database: # inline definition
+      command: "npx"
+      args: ["mcp-db"]
+
+# === Hooks ===
+hooks:
+  PreToolUse:
+    - command: "audit-log.sh"
+      timeout: 5000
+
+# === Skills ===
+skills: "code-review,security-review" # Preloaded skills (comma separated)
+
+# === Display ===
+color: "blue" # Agent color identification in the terminal
+---
+
+You are a code review expert. Your job is to...
+
+(Text content = system prompt)
+```
+
+### Field parsing details
+
+- **`tools`**: parsed through `parseAgentToolsFromFrontmatter()`, supports comma separated strings or arrays
+- **`model: "inherit"`**: Use the model of the main thread (case sensitive, only lowercase "inherit" is valid)
+- **`memory`**: When enabled, automatically inject the `Write`/`Edit`/`Read` tools (even if `tools` is not included), and append the memory command at the end of the system prompt
+- **`isolation: "remote"`**: only available inside Anthropic (`USER_TYPE === 'ant'`), external builds only support `worktree`
+- **`background`**: `true` makes the Agent always run in the background and the main thread does not wait for the result
+
+## Loading and discovery mechanism
+
+`getAgentDefinitionsWithOverrides()` (cached by `memoize`) performs the complete discovery process:
+
+```
+1. Load Markdown file
+   ├── loadMarkdownFilesForSubdir('agents', cwd)
+   │ ├── ~/.claude/agents/*.md (user level, source = 'userSettings')
+   │ ├── .claude/agents/*.md (project level, source = 'projectSettings')
+   │ └── managed/policy sources (policy level, source = 'policySettings')
+   │
+   └── Each .md file:
+       ├── Parse YAML frontmatter
+       ├── Text as system prompt
+       ├── Verify required fields (name, description)
+       ├── Silently skip .md files without frontmatter (may be reference documentation)
+       └── Parsing failure → recorded to failedFiles, without blocking other Agents
+
+2. Parallel loading of Plugin Agents
+   └── loadPluginAgents() → memoized
+
+3. Initialize Memory Snapshots (if AGENT_MEMORY_SNAPSHOT is enabled)
+   └── initializeAgentMemorySnapshots()
+
+4. Merge Built-in + Plugin + Custom
+   └── getActiveAgentsFromList() → Remove duplicates by agentType, the latter overwrites the former
+
+5. Assign colors
+   └── setAgentColor(agentType, color) → Distinguish between different Agents in the terminal UI
+```
+
+## Implementation of tool filtering
+
+When an Agent is forked, `AgentTool` filters the list of available tools based on `tools` / `disallowedTools` in the definition:
+
+```
+All tools
+  ↓ disallowedTools Remove
+  ↓ tools whitelist filtering (if specified)
+Available tools
+```
+
+- **`tools` not specified**: Agent can use all tools (default omnipotent)
+- **`tools` specification**: only listed tools can be used
+- **`disallowedTools`**: Even if `tools` is not specified, these tools are disabled
+- **Auto-injection**: `Write`/`Edit`/`Read` is automatically added when `memory` is enabled
+
+Take the built-in Explore Agent as an example:
+
+```typescript
+// src/tools/AgentTool/built-in/exploreAgent.ts
+disallowedTools: [
+  'Agent', // Agent calls cannot be nested
+  'ExitPlanMode', // No plan mode required
+  'FileEdit', // read-only
+  'FileWrite', // read-only
+  'NotebookEdit', // read-only
+]
+```
+
+## System Prompt injection method
+
+The Agent's system prompt is generated lazily through the `getSystemPrompt()` closure:
+
+```typescript
+// Markdown Agent
+getSystemPrompt: () => {
+  if (isAutoMemoryEnabled() && memory) {
+    return systemPrompt + '\n\n' + loadAgentMemoryPrompt(agentType, memory)
+  }
+  return systemPrompt
+}
+```
+
+This means:
+1. **Markdown text = complete system prompt** - not appending, but replacing the default prompt
+2. **Memory command** is automatically appended to the end when memory is enabled.
+3. **Lazy calculation of closures** - memory status may change after the file is loaded.
+
+For Built-in Agent, `getSystemPrompt` accepts the `toolUseContext` parameter, which can dynamically adjust the prompt content based on the runtime state (such as whether to use the embedded search tool).
+
+## Linkage with AgentTool
+
+When the main Agent needs to derive sub-Agents:
+
+```
+AgentTool.call({ subagent_type: "reviewer", ... })
+  ↓
+1. Find agentType === "reviewer" from agentDefinitions.activeAgents
+  ↓
+2. Check requiredMcpServers (if the Agent requires specific MCP servers)
+  ↓
+3. Filter tool list (tools/disallowedTools)
+  ↓
+4. Analytical model:
+   - "inherit" → use main thread model
+   - Specific model name → use directly
+   - unspecified → main thread model
+  ↓
+5. Parse permission mode (permissionMode)
+  ↓
+6. Build an isolation environment (if isolation === "worktree")
+  ↓
+7. Inject system prompt (getSystemPrompt())
+  ↓
+8. Inject initialPrompt (if defined)
+  ↓
+9. Start sub-Agent loop (forkSubagent / runAgent)
+```
+
+## Built-in Agent Reference
+
+| Agent | agentType | Role | Tool Limitations | Model |
+|-------|-----------|------|---------|------|
+| **General Purpose** | `general-purpose` | Default sub-Agent | All tools | Main thread model |
+| **Explore** | `Explore` | Code search expert | Read-only (no Write/Edit) | haiku (external) |
+| **Plan** | `Plan` | Planning Expert | Read-only + ExitPlanMode | inherit |
+| **Verification** | `verification` | Result verification | Controlled by feature flag | — |
+| **Code Guide** | `claude-code-guide` | Claude Code Usage Guide | Read-only | — |
+| **Statusline Setup** | `statusline-setup` | Terminal status bar configuration | Limited | — |
+
+The SDK entry (`sdk-ts`/`sdk-py`/`sdk-cli`) does not load the Code Guide Agent. The environment variable `CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS` can completely disable the built-in Agent, providing a blank canvas to SDK users.
+
+## Agent Memory: Persistent Agent state
+
+When the `memory` field is enabled, the Agent obtains persistent memory across sessions:
+
+- **`local`**: valid for the current project and current user
+- **`project`**: The current project is shared by all users
+- **`user`**: shared by all projects
+
+Memory is injected at the end of the system prompt through `loadAgentMemoryPrompt()`, and contains instructions for reading and writing memory. The Agent Memory Snapshot mechanism synchronizes `user` level memory between projects.

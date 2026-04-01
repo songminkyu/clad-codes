@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 cc-core = { workspace = true }
 cc-api = { workspace = true }
+cc-plugins = { workspace = true }
 cc-tools = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -18,6 +19,7 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+dirs = { workspace = true }
 parking_lot = { workspace = true }
 tokio-util = { workspace = true }
 

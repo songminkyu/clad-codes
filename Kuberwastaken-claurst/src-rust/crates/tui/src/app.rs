@@ -2,17 +2,24 @@
 
 use crate::bridge_state::BridgeConnectionState;
 use crate::dialogs::PermissionRequest;
+use crate::diff_viewer::{DiffViewerState, build_turn_diff};
+use crate::mcp_view::{McpServerView, McpToolView, McpViewState, McpViewStatus};
 use crate::notifications::{NotificationKind, NotificationQueue};
 use crate::overlays::{
-    HelpOverlay, HistorySearchOverlay, MessageSelectorOverlay, RewindFlowOverlay, SelectorMessage,
+    GlobalSearchState, HelpOverlay, HistorySearchOverlay, MessageSelectorOverlay,
+    RewindFlowOverlay, SelectorMessage,
 };
 use crate::plugin_views::PluginHintBanner;
 use crate::privacy_screen::PrivacyScreen;
+use crate::prompt_input::{InputMode, PromptInputState, VimMode};
 use crate::render;
 use crate::settings_screen::SettingsScreen;
+use crate::stats_dialog::StatsDialogState;
 use crate::theme_screen::ThemeScreen;
+use crate::{agents_view::{AgentInfo, AgentStatus, AgentsMenuState, AgentsRoute}, diff_viewer::DiffPane};
 use cc_core::config::{Config, Settings, Theme};
 use cc_core::cost::CostTracker;
+use cc_core::file_history::FileHistory;
 use cc_core::keybindings::{
     KeyContext, KeybindingResolver, KeybindingResult, ParsedKeystroke, UserKeybindings,
 };
@@ -21,13 +28,72 @@ use cc_query::QueryEvent;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use std::cell::Cell;
 use std::io::Stdout;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::debug;
+
+const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("agents", "Browse agent definitions and active agents"),
+    ("config", "Open settings"),
+    ("diff", "Inspect the current diff"),
+    ("help", "Show help"),
+    ("mcp", "Browse configured MCP servers"),
+    ("privacy", "Open privacy settings"),
+    ("settings", "Open settings"),
+    ("stats", "Open token and cost stats"),
+    ("theme", "Open the theme picker"),
+];
 
 // ---------------------------------------------------------------------------
 // Supporting types
 // ---------------------------------------------------------------------------
+
+/// Effort level indicator shown in the status bar.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EffortLevel {
+    Low,    // ○
+    Medium, // ◐
+    High,   // ●
+    Max,    // ◉  (Opus 4.6 only)
+}
+
+impl Default for EffortLevel {
+    fn default() -> Self {
+        Self::High
+    }
+}
+
+/// Visual style for inline system messages in the conversation pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SystemMessageStyle {
+    Info,
+    Warning,
+    /// Compact / auto-compact boundary marker.
+    Compact,
+}
+
+/// A synthetic system annotation inserted between conversation messages.
+/// `after_index` is the index in `App::messages` after which this annotation
+/// should appear (0 = before all messages, 1 = after message 0, etc.).
+#[derive(Debug, Clone)]
+pub struct SystemAnnotation {
+    pub after_index: usize,
+    pub text: String,
+    pub style: SystemMessageStyle,
+}
+
+/// A displayable item in the conversation pane — either a real message or
+/// a synthetic system annotation (e.g. compact boundary).
+/// Used only by `render.rs`; constructed on the fly from `messages` +
+/// `system_annotations`.
+#[derive(Debug, Clone)]
+pub enum DisplayMessage {
+    /// A real conversation turn.
+    Conversation(Message),
+    /// An injected system notice (e.g. compact boundary).
+    System { text: String, style: SystemMessageStyle },
+}
 
 /// Status of an active or completed tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,7 +201,14 @@ pub struct App {
     pub config: Config,
     pub cost_tracker: Arc<CostTracker>,
     pub messages: Vec<Message>,
+    /// Combined display list kept in sync with `messages`: real conversation turns
+    /// plus injected system annotations. Used by the renderer so it can iterate
+    /// a single sequence instead of merging two lists on every frame.
+    pub display_messages: Vec<DisplayMessage>,
+    /// Synthetic system annotations interleaved between real messages at render time.
+    pub system_annotations: Vec<SystemAnnotation>,
     pub input: String,
+    pub prompt_input: PromptInputState,
     pub input_history: Vec<String>,
     pub history_index: Option<usize>,
     pub scroll_offset: usize,
@@ -159,12 +232,35 @@ pub struct App {
     // Cursor position within input (byte offset)
     pub cursor_pos: usize,
 
+    // ---- Scrollback / auto-scroll -----------------------------------------
+
+    /// When `true`, the message pane follows the latest messages automatically.
+    pub auto_scroll: bool,
+    /// Count of messages that arrived while the user was scrolled up.
+    pub new_messages_while_scrolled: usize,
+
+    // ---- Token warning tracking -------------------------------------------
+
+    /// Which threshold (0 = none, 80, 95, 100) was last notified so we only
+    /// show each banner once.
+    pub token_warning_threshold_shown: u8,
+
+    // ---- Session timing ---------------------------------------------------
+
+    /// Instant the session started (used for elapsed-time in the status bar).
+    pub session_start: std::time::Instant,
+    /// Incremented whenever transcript-visible state changes so rendering can
+    /// reuse cached layout between keystrokes.
+    pub transcript_version: Cell<u64>,
+
     // ---- New overlay / notification fields --------------------------------
 
     /// Full-screen help overlay (? / F1).
     pub help_overlay: HelpOverlay,
     /// Ctrl+R history search overlay.
     pub history_search_overlay: HistorySearchOverlay,
+    /// Global ripgrep search / quick-open overlay.
+    pub global_search: GlobalSearchState,
     /// Message selector used by /rewind.
     pub message_selector: MessageSelectorOverlay,
     /// Multi-step rewind flow overlay.
@@ -179,6 +275,27 @@ pub struct App {
     pub session_title: Option<String>,
     /// Remote session URL (set when bridge connects; readable by commands).
     pub remote_session_url: Option<String>,
+    /// Live MCP manager snapshot source when available.
+    pub mcp_manager: Option<Arc<cc_mcp::McpManager>>,
+    /// Queued request for a real MCP reconnect from the interactive loop.
+    pub pending_mcp_reconnect: bool,
+    /// Shared file-history service used for turn diff reconstruction.
+    pub file_history: Option<Arc<parking_lot::Mutex<FileHistory>>>,
+    /// Shared query-loop turn counter for turn-local diff reconstruction.
+    pub current_turn: Option<Arc<std::sync::atomic::AtomicUsize>>,
+
+    // ---- Visual mode indicators -------------------------------------------
+
+    /// Plan mode — input border turns blue, [PLAN] shown in status bar.
+    pub plan_mode: bool,
+    /// Fast mode — lightning bolt shown before model name, border turns yellow.
+    pub fast_mode: bool,
+    /// Effort level shown as ○/◐/●/◉ in the status bar next to the model name.
+    pub effort_level: EffortLevel,
+    /// "While you were away" summary text shown on the welcome screen.
+    pub away_summary: Option<String>,
+    /// When streaming stalled (used to turn the spinner red after 3 s).
+    pub stall_start: Option<std::time::Instant>,
 
     // ---- Settings / theme / privacy screens --------------------------------
 
@@ -188,6 +305,23 @@ pub struct App {
     pub theme_screen: ThemeScreen,
     /// Privacy settings dialog (/privacy-settings).
     pub privacy_screen: PrivacyScreen,
+    /// Token/cost analytics dialog.
+    pub stats_dialog: StatsDialogState,
+    /// MCP server browser and tool detail view.
+    pub mcp_view: McpViewState,
+    /// Agent definitions and active agent status overlay.
+    pub agents_menu: AgentsMenuState,
+    /// Diff viewer overlay.
+    pub diff_viewer: DiffViewerState,
+
+    // ---- Voice hold-to-talk ------------------------------------------------
+
+    /// The global voice recorder, Some when voice is enabled in config.
+    pub voice_recorder: Option<Arc<Mutex<cc_core::voice::VoiceRecorder>>>,
+    /// True while recording is active (Alt+V toggled on).
+    pub voice_recording: bool,
+    /// Receiver for VoiceEvent messages produced by the recorder task.
+    pub voice_event_rx: Option<tokio::sync::mpsc::Receiver<cc_core::voice::VoiceEvent>>,
 }
 
 impl App {
@@ -198,7 +332,10 @@ impl App {
             config,
             cost_tracker,
             messages: Vec::new(),
+            display_messages: Vec::new(),
+            system_annotations: Vec::new(),
             input: String::new(),
+            prompt_input: PromptInputState::new(),
             input_history: Vec::new(),
             history_index: None,
             scroll_offset: 0,
@@ -217,8 +354,14 @@ impl App {
             history_search: None,
             keybindings: KeybindingResolver::new(&user_keybindings),
             cursor_pos: 0,
+            auto_scroll: true,
+            new_messages_while_scrolled: 0,
+            token_warning_threshold_shown: 0,
+            session_start: std::time::Instant::now(),
+            transcript_version: Cell::new(0),
             help_overlay: HelpOverlay::new(),
             history_search_overlay: HistorySearchOverlay::new(),
+            global_search: GlobalSearchState::default(),
             message_selector: MessageSelectorOverlay::new(),
             rewind_flow: RewindFlowOverlay::new(),
             bridge_state: BridgeConnectionState::Disconnected,
@@ -226,9 +369,50 @@ impl App {
             plugin_hints: Vec::new(),
             session_title: None,
             remote_session_url: None,
+            mcp_manager: None,
+            pending_mcp_reconnect: false,
+            file_history: None,
+            current_turn: None,
+            plan_mode: false,
+            fast_mode: false,
+            effort_level: EffortLevel::default(),
+            away_summary: None,
+            stall_start: None,
             settings_screen: SettingsScreen::new(),
             theme_screen: ThemeScreen::new(),
             privacy_screen: PrivacyScreen::new(),
+            stats_dialog: StatsDialogState::new(),
+            mcp_view: McpViewState::new(),
+            agents_menu: AgentsMenuState::new(),
+            diff_viewer: DiffViewerState::new(),
+            voice_recorder: {
+                // Check whether voice input has been enabled via the /voice command
+                // (stored in ~/.claude/ui-settings.json).  We also accept
+                // CLAUDE_CODE_VOICE_ENABLED=1 as an override for easier testing.
+                let voice_on = std::env::var("CLAUDE_CODE_VOICE_ENABLED")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false)
+                    || {
+                        let path = cc_core::config::Settings::config_dir()
+                            .join("ui-settings.json");
+                        std::fs::read_to_string(&path)
+                            .ok()
+                            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                            .and_then(|v| v["voice_enabled"].as_bool())
+                            .unwrap_or(false)
+                    };
+                if voice_on {
+                    let recorder = cc_core::voice::global_voice_recorder();
+                    if let Ok(mut r) = recorder.lock() {
+                        r.set_enabled(true);
+                    }
+                    Some(recorder)
+                } else {
+                    None
+                }
+            },
+            voice_recording: false,
+            voice_event_rx: None,
         }
     }
 
@@ -257,6 +441,7 @@ impl App {
     /// Handle slash commands that should open UI screens rather than execute
     /// as normal commands. Returns `true` if the command was intercepted.
     pub fn intercept_slash_command(&mut self, cmd: &str) -> bool {
+        self.close_secondary_views();
         match cmd {
             "config" | "settings" => {
                 self.settings_screen.open();
@@ -276,26 +461,303 @@ impl App {
                 self.privacy_screen.open();
                 true
             }
+            "stats" => {
+                self.stats_dialog.open();
+                true
+            }
+            "mcp" => {
+                let servers = self.load_mcp_servers();
+                self.mcp_view.open(servers);
+                true
+            }
+            "agents" => {
+                self.open_agents_menu();
+                true
+            }
+            "diff" => {
+                let root = self.project_root();
+                self.diff_viewer.open(&root);
+                true
+            }
+            "changes" => {
+                let root = self.project_root();
+                self.refresh_turn_diff_from_history();
+                self.diff_viewer.open_turn(&root);
+                true
+            }
+            "search" | "find" => {
+                self.global_search.open();
+                true
+            }
             _ => false,
         }
     }
 
+    fn close_secondary_views(&mut self) {
+        self.stats_dialog.close();
+        self.mcp_view.close();
+        self.agents_menu.close();
+        self.diff_viewer.close();
+    }
+
+    fn project_root(&self) -> std::path::PathBuf {
+        self.config
+            .project_dir
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    }
+
+    fn refresh_global_search(&mut self) {
+        let root = self.project_root();
+        self.global_search.run_search(&root);
+    }
+
+    fn load_mcp_servers(&self) -> Vec<McpServerView> {
+        if let Some(manager) = self.mcp_manager.as_ref() {
+            let tool_defs = manager.all_tool_definitions();
+            return self
+                .config
+                .mcp_servers
+                .iter()
+                .map(|server| {
+                    let transport = server
+                        .url
+                        .as_ref()
+                        .map(|_| server.server_type.clone())
+                        .or_else(|| server.command.as_ref().map(|_| "stdio".to_string()))
+                        .unwrap_or_else(|| server.server_type.clone());
+
+                    let tools: Vec<McpToolView> = tool_defs
+                        .iter()
+                        .filter(|(server_name, _)| server_name == &server.name)
+                        .map(|(_, tool_def)| McpToolView {
+                            name: tool_def
+                                .name
+                                .strip_prefix(&format!("{}_", server.name))
+                                .unwrap_or(&tool_def.name)
+                                .to_string(),
+                            server: server.name.clone(),
+                            description: tool_def.description.clone(),
+                            input_schema: Some(tool_def.input_schema.to_string()),
+                        })
+                        .collect();
+
+                    let (status, error_message) = match manager.server_status(&server.name) {
+                        cc_mcp::McpServerStatus::Connected { .. } => {
+                            (McpViewStatus::Connected, None)
+                        }
+                        cc_mcp::McpServerStatus::Connecting => {
+                            (McpViewStatus::Connecting, None)
+                        }
+                        cc_mcp::McpServerStatus::Disconnected { last_error } => {
+                            if last_error.is_some() {
+                                (McpViewStatus::Error, last_error)
+                            } else {
+                                (McpViewStatus::Disconnected, None)
+                            }
+                        }
+                        cc_mcp::McpServerStatus::Failed { error, .. } => {
+                            (McpViewStatus::Error, Some(error))
+                        }
+                    };
+
+                    let catalog = manager.server_catalog(&server.name);
+                    McpServerView {
+                        name: server.name.clone(),
+                        transport,
+                        status,
+                        tool_count: catalog
+                            .as_ref()
+                            .map(|entry| entry.tool_count)
+                            .unwrap_or_else(|| tools.len()),
+                        resource_count: catalog
+                            .as_ref()
+                            .map(|entry| entry.resource_count)
+                            .unwrap_or(0),
+                        prompt_count: catalog
+                            .as_ref()
+                            .map(|entry| entry.prompt_count)
+                            .unwrap_or(0),
+                        resources: catalog
+                            .as_ref()
+                            .map(|entry| entry.resources.clone())
+                            .unwrap_or_default(),
+                        prompts: catalog
+                            .as_ref()
+                            .map(|entry| entry.prompts.clone())
+                            .unwrap_or_default(),
+                        error_message,
+                        tools,
+                    }
+                })
+                .collect();
+        }
+
+        self.config
+            .mcp_servers
+            .iter()
+            .map(|server| {
+                let transport = server
+                    .url
+                    .as_ref()
+                    .map(|_| server.server_type.clone())
+                    .or_else(|| server.command.as_ref().map(|_| "stdio".to_string()))
+                    .unwrap_or_else(|| server.server_type.clone());
+                let description = if let Some(url) = &server.url {
+                    format!("Endpoint: {}", url)
+                } else if let Some(command) = &server.command {
+                    let args = if server.args.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", server.args.join(" "))
+                    };
+                    format!("Command: {}{}", command, args)
+                } else {
+                    "Configured server".to_string()
+                };
+                McpServerView {
+                    name: server.name.clone(),
+                    transport,
+                    status: McpViewStatus::Disconnected,
+                    tool_count: 0,
+                    resource_count: 0,
+                    prompt_count: 0,
+                    resources: vec![],
+                    prompts: vec![],
+                    error_message: None,
+                    tools: vec![McpToolView {
+                        name: "connection".to_string(),
+                        server: server.name.clone(),
+                        description,
+                        input_schema: None,
+                    }],
+                }
+            })
+            .collect()
+    }
+
+    fn open_agents_menu(&mut self) {
+        let root = self.project_root();
+        self.agents_menu.open(&root);
+        self.agents_menu.active_agents = self
+            .agent_status
+            .iter()
+            .enumerate()
+            .map(|(idx, (name, status))| AgentInfo {
+                id: format!("agent-{}", idx + 1),
+                name: name.clone(),
+                status: match status.as_str() {
+                    "running" => AgentStatus::Running,
+                    "waiting" | "waiting_for_tool" => AgentStatus::WaitingForTool,
+                    "complete" | "completed" | "done" => AgentStatus::Complete,
+                    "failed" | "error" => AgentStatus::Failed,
+                    _ => AgentStatus::Idle,
+                },
+                current_tool: None,
+                turns_completed: 0,
+                is_coordinator: false,
+                last_output: Some(status.clone()),
+            })
+            .collect();
+    }
+
     /// Add a message directly (e.g. from a non-streaming source).
     pub fn add_message(&mut self, role: Role, text: String) {
-        self.messages.push(match role {
+        let msg = match role {
             Role::User => Message::user(text),
             Role::Assistant => Message::assistant(text),
+        };
+        self.messages.push(msg);
+        self.invalidate_transcript();
+        self.on_new_message();
+    }
+
+    pub fn replace_messages(&mut self, messages: Vec<Message>) {
+        self.messages = messages;
+        self.invalidate_transcript();
+    }
+
+    pub fn push_message(&mut self, message: Message) {
+        self.messages.push(message);
+        self.invalidate_transcript();
+        self.on_new_message();
+    }
+
+    /// Push a synthetic system annotation into the conversation pane.
+    /// It will appear after the current last message.
+    pub fn push_system_message(&mut self, text: String, style: SystemMessageStyle) {
+        self.system_annotations.push(SystemAnnotation {
+            after_index: self.messages.len(),
+            text,
+            style,
         });
+        self.invalidate_transcript();
+    }
+
+    /// Called whenever a new message is appended to `messages`.
+    /// Manages the auto-scroll / new-message-counter state.
+    fn on_new_message(&mut self) {
+        if self.auto_scroll {
+            // Auto-scroll: keep offset at 0 so render shows the bottom.
+            self.scroll_offset = 0;
+        } else {
+            self.new_messages_while_scrolled =
+                self.new_messages_while_scrolled.saturating_add(1);
+        }
+    }
+
+    pub fn invalidate_transcript(&self) {
+        self.transcript_version
+            .set(self.transcript_version.get().wrapping_add(1));
+    }
+
+    /// Check current token usage and push token warning notifications as
+    /// appropriate.  Call this after updating `token_count`.
+    pub fn check_token_warnings(&mut self) {
+        let window =
+            cc_query::context_window_for_model(&self.model_name) as u32;
+        if window == 0 {
+            return;
+        }
+        let pct = (self.token_count as f64 / window as f64 * 100.0) as u8;
+
+        // Only escalate — never repeat a threshold already shown.
+        if pct >= 100 && self.token_warning_threshold_shown < 100 {
+            self.token_warning_threshold_shown = 100;
+            self.notifications.push(
+                NotificationKind::Error,
+                "Context window full. Running auto-compact\u{2026}".to_string(),
+                None,
+            );
+        } else if pct >= 95 && self.token_warning_threshold_shown < 95 {
+            self.token_warning_threshold_shown = 95;
+            self.notifications.push(
+                NotificationKind::Error,
+                "Context window 95% full! Run /compact now.".to_string(),
+                None, // persistent until dismissed
+            );
+        } else if pct >= 80 && self.token_warning_threshold_shown < 80 {
+            self.token_warning_threshold_shown = 80;
+            self.notifications.push(
+                NotificationKind::Warning,
+                "Context window 80% full. Consider /compact.".to_string(),
+                Some(30),
+            );
+        }
     }
 
     /// Take the current input buffer, push it to history, and return it.
     pub fn take_input(&mut self) -> String {
-        let input = std::mem::take(&mut self.input);
-        self.cursor_pos = 0;
+        let input = self.prompt_input.take();
         if !input.is_empty() {
-            self.input_history.push(input.clone());
-            self.history_index = None;
+            self.prompt_input.history.push(input.clone());
+            self.prompt_input.history_pos = None;
+            self.prompt_input.history_draft.clear();
+            self.input_history = self.prompt_input.history.clone();
+            self.history_index = self.prompt_input.history_pos;
         }
+        self.refresh_prompt_input();
         input
     }
 
@@ -321,6 +783,97 @@ impl App {
         self.rewind_flow.open(selector_msgs);
     }
 
+    /// Return the elapsed session time as a human-readable string, e.g. "2m 5s".
+    pub fn elapsed_str(&self) -> String {
+        let secs = self.session_start.elapsed().as_secs();
+        if secs < 60 {
+            format!("{}s", secs)
+        } else {
+            format!("{}m {}s", secs / 60, secs % 60)
+        }
+    }
+
+    fn prompt_mode(&self) -> InputMode {
+        if self.is_streaming {
+            InputMode::Readonly
+        } else if self.plan_mode {
+            InputMode::Plan
+        } else {
+            InputMode::Default
+        }
+    }
+
+    fn sync_legacy_prompt_fields(&mut self) {
+        self.input = self.prompt_input.text.clone();
+        self.cursor_pos = self.prompt_input.cursor;
+        self.history_index = self.prompt_input.history_pos;
+    }
+
+    fn refresh_prompt_input(&mut self) {
+        self.prompt_input.mode = self.prompt_mode();
+        self.prompt_input.update_suggestions(PROMPT_SLASH_COMMANDS);
+        self.sync_legacy_prompt_fields();
+    }
+
+    pub fn set_prompt_text(&mut self, text: String) {
+        self.prompt_input.replace_text(text);
+        self.refresh_prompt_input();
+    }
+
+    pub fn attach_turn_diff_state(
+        &mut self,
+        file_history: Arc<parking_lot::Mutex<FileHistory>>,
+        current_turn: Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        self.file_history = Some(file_history);
+        self.current_turn = Some(current_turn);
+        self.refresh_turn_diff_from_history();
+    }
+
+    pub fn attach_mcp_manager(&mut self, mcp_manager: Arc<cc_mcp::McpManager>) {
+        self.mcp_manager = Some(mcp_manager);
+    }
+
+    pub fn refresh_mcp_view(&mut self) {
+        let servers = self.load_mcp_servers();
+        self.mcp_view.open(servers);
+    }
+
+    pub fn take_pending_mcp_reconnect(&mut self) -> bool {
+        let pending = self.pending_mcp_reconnect;
+        self.pending_mcp_reconnect = false;
+        pending
+    }
+
+    fn clear_prompt(&mut self) {
+        self.prompt_input.clear();
+        self.refresh_prompt_input();
+    }
+
+    fn refresh_turn_diff_from_history(&mut self) {
+        let Some(file_history) = self.file_history.as_ref() else {
+            self.diff_viewer.set_turn_diff(Vec::new());
+            return;
+        };
+        let Some(current_turn) = self.current_turn.as_ref() else {
+            self.diff_viewer.set_turn_diff(Vec::new());
+            return;
+        };
+
+        let turn_index = current_turn.load(std::sync::atomic::Ordering::Relaxed);
+        if turn_index == 0 {
+            self.diff_viewer.set_turn_diff(Vec::new());
+            return;
+        }
+
+        let root = self.project_root();
+        let files = {
+            let history = file_history.lock();
+            build_turn_diff(&history, turn_index, &root)
+        };
+        self.diff_viewer.set_turn_diff(files);
+    }
+
     // -------------------------------------------------------------------
     // Event handling
     // -------------------------------------------------------------------
@@ -328,6 +881,9 @@ impl App {
     /// Process a keyboard event. Returns `true` when the input should be
     /// submitted (Enter pressed with no blocking dialog).
     pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
+        if self.global_search.open {
+            return self.handle_global_search_key(key);
+        }
         let key_context = self.current_key_context();
         if let Some(keystroke) = key_event_to_keystroke(&key) {
             let had_pending_chord = self.keybindings.has_pending_chord();
@@ -341,6 +897,26 @@ impl App {
             }
         } else {
             self.keybindings.cancel_chord();
+        }
+
+        if self.diff_viewer.open {
+            self.handle_diff_viewer_key(key);
+            return false;
+        }
+
+        if self.agents_menu.open {
+            self.handle_agents_menu_key(key);
+            return false;
+        }
+
+        if self.mcp_view.open {
+            self.handle_mcp_view_key(key);
+            return false;
+        }
+
+        if self.stats_dialog.open {
+            self.handle_stats_dialog_key(key);
+            return false;
         }
 
         // Settings screen intercepts keys
@@ -384,6 +960,10 @@ impl App {
             return self.handle_history_search_overlay_key(key);
         }
 
+        if self.global_search.open {
+            return self.handle_global_search_key(key);
+        }
+
         // Legacy history-search mode intercepts most keys
         if self.history_search.is_some() {
             return self.handle_history_search_key(key);
@@ -409,6 +989,59 @@ impl App {
             }
         }
 
+        // ---- Voice hold-to-talk (Alt+V toggles recording on/off) ----------
+        if key.code == KeyCode::Char('v')
+            && key.modifiers.contains(KeyModifiers::ALT)
+            && self.voice_recorder.is_some()
+        {
+            if !self.voice_recording {
+                // First press: start recording.
+                let (tx, rx) = tokio::sync::mpsc::channel(8);
+                self.voice_event_rx = Some(rx);
+                self.voice_recording = true;
+                if let Some(ref recorder_arc) = self.voice_recorder {
+                    let recorder = recorder_arc.clone();
+                    // Use spawn_blocking so we don't hold a std::sync::MutexGuard
+                    // across an await point.  start_recording internally spawns a
+                    // tokio task and returns quickly, so blocking is negligible.
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(mut r) = recorder.lock() {
+                            // start_recording is async but its real work happens in
+                            // a spawned task; use block_on to drive the short setup.
+                            tokio::runtime::Handle::current()
+                                .block_on(r.start_recording(tx))
+                                .ok();
+                        }
+                    });
+                }
+                self.notifications.push(
+                    NotificationKind::Info,
+                    "Recording\u{2026} (press Alt+V again to transcribe)".to_string(),
+                    None,
+                );
+            } else {
+                // Second press: stop recording.  stop_recording() just flips an
+                // AtomicBool; drive it synchronously to avoid Send issues.
+                self.voice_recording = false;
+                if let Some(ref recorder_arc) = self.voice_recorder {
+                    let recorder = recorder_arc.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(mut r) = recorder.lock() {
+                            tokio::runtime::Handle::current()
+                                .block_on(r.stop_recording())
+                                .ok();
+                        }
+                    });
+                }
+                self.notifications.push(
+                    NotificationKind::Info,
+                    "Transcribing\u{2026}".to_string(),
+                    Some(10),
+                );
+            }
+            return false;
+        }
+
         match key.code {
             // ---- Quit / cancel ----------------------------------------
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -422,7 +1055,7 @@ impl App {
                 }
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.input.is_empty() {
+                if self.prompt_input.is_empty() {
                     self.should_quit = true;
                 }
             }
@@ -430,12 +1063,16 @@ impl App {
             // ---- History search ----------------------------------------
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Open the new overlay-based history search
-                let overlay = HistorySearchOverlay::open(&self.input_history);
+                let overlay = HistorySearchOverlay::open(&self.prompt_input.history);
                 self.history_search_overlay = overlay;
                 // Also open legacy for backwards compat
                 let mut hs = HistorySearch::new();
-                hs.update_matches(&self.input_history);
+                hs.update_matches(&self.prompt_input.history);
                 self.history_search = Some(hs);
+            }
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.global_search.open();
+                self.refresh_global_search();
             }
 
             // ---- Help overlay ------------------------------------------
@@ -450,82 +1087,88 @@ impl App {
 
             // ---- Text entry (blocked while streaming) ------------------
             KeyCode::Char(c) if !self.is_streaming => {
-                let byte_pos = self.char_boundary_at(self.cursor_pos);
-                self.input.insert(byte_pos, c);
-                self.cursor_pos += c.len_utf8();
+                if self.prompt_input.vim_enabled && self.prompt_input.vim_mode != VimMode::Insert {
+                    self.prompt_input.vim_command(&c.to_string());
+                } else {
+                    self.prompt_input.insert_char(c);
+                }
+                self.refresh_prompt_input();
             }
             KeyCode::Backspace if !self.is_streaming => {
-                if self.cursor_pos > 0 {
-                    let end = self.char_boundary_at(self.cursor_pos);
-                    let start = self.prev_char_boundary(end);
-                    self.input.drain(start..end);
-                    self.cursor_pos = start;
-                }
+                self.prompt_input.backspace();
+                self.refresh_prompt_input();
             }
             KeyCode::Delete if !self.is_streaming => {
-                let start = self.char_boundary_at(self.cursor_pos);
-                if start < self.input.len() {
-                    let end = self.next_char_boundary(start);
-                    self.input.drain(start..end);
-                }
+                self.prompt_input.delete();
+                self.refresh_prompt_input();
             }
             KeyCode::Left if !self.is_streaming => {
-                if self.cursor_pos > 0 {
-                    let end = self.char_boundary_at(self.cursor_pos);
-                    self.cursor_pos = self.prev_char_boundary(end);
-                }
+                self.prompt_input.move_left();
+                self.sync_legacy_prompt_fields();
             }
             KeyCode::Right if !self.is_streaming => {
-                let start = self.char_boundary_at(self.cursor_pos);
-                if start < self.input.len() {
-                    self.cursor_pos = self.next_char_boundary(start);
-                }
+                self.prompt_input.move_right();
+                self.sync_legacy_prompt_fields();
             }
             KeyCode::Home if !self.is_streaming => {
-                self.cursor_pos = 0;
+                self.prompt_input.cursor = 0;
+                self.sync_legacy_prompt_fields();
             }
             KeyCode::End if !self.is_streaming => {
-                self.cursor_pos = self.input.len();
+                self.prompt_input.cursor = self.prompt_input.text.len();
+                self.sync_legacy_prompt_fields();
+            }
+            KeyCode::Tab if !self.is_streaming => {
+                if !self.prompt_input.suggestions.is_empty() {
+                    if self.prompt_input.suggestion_index.is_none() {
+                        self.prompt_input.suggestion_index = Some(0);
+                    }
+                    self.prompt_input.accept_suggestion();
+                    self.refresh_prompt_input();
+                }
             }
 
             // ---- Submit ------------------------------------------------
             KeyCode::Enter if !self.is_streaming => {
+                // New user input: snap back to bottom.
+                self.auto_scroll = true;
+                self.new_messages_while_scrolled = 0;
+                self.scroll_offset = 0;
                 return true;
             }
 
             // ---- Input history navigation ------------------------------
             KeyCode::Up => {
-                if !self.input_history.is_empty() {
-                    let idx = match self.history_index {
-                        Some(i) => i.saturating_sub(1),
-                        None => self.input_history.len().saturating_sub(1),
-                    };
-                    self.history_index = Some(idx);
-                    self.input = self.input_history[idx].clone();
-                    self.cursor_pos = self.input.len();
+                if !self.prompt_input.suggestions.is_empty() && self.prompt_input.text.starts_with('/') {
+                    self.prompt_input.suggestion_prev();
+                } else if !self.prompt_input.history.is_empty() {
+                    self.prompt_input.history_up();
                 }
+                self.refresh_prompt_input();
             }
             KeyCode::Down => {
-                if let Some(idx) = self.history_index {
-                    if idx + 1 < self.input_history.len() {
-                        let new_idx = idx + 1;
-                        self.history_index = Some(new_idx);
-                        self.input = self.input_history[new_idx].clone();
-                        self.cursor_pos = self.input.len();
-                    } else {
-                        self.history_index = None;
-                        self.input.clear();
-                        self.cursor_pos = 0;
-                    }
+                if !self.prompt_input.suggestions.is_empty() && self.prompt_input.text.starts_with('/') {
+                    self.prompt_input.suggestion_next();
+                } else if self.prompt_input.history_pos.is_some() {
+                    self.prompt_input.history_down();
                 }
+                self.refresh_prompt_input();
             }
 
             // ---- Scroll ------------------------------------------------
             KeyCode::PageUp => {
                 self.scroll_offset = self.scroll_offset.saturating_add(10);
+                // Scrolling up disables auto-follow.
+                self.auto_scroll = false;
             }
             KeyCode::PageDown => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(10);
+                let new_off = self.scroll_offset.saturating_sub(10);
+                self.scroll_offset = new_off;
+                if new_off == 0 {
+                    // Scrolled all the way back to bottom — re-enable auto-follow.
+                    self.auto_scroll = true;
+                    self.new_messages_while_scrolled = 0;
+                }
             }
 
             _ => {}
@@ -534,7 +1177,11 @@ impl App {
     }
 
     fn current_key_context(&self) -> KeyContext {
-        if self.settings_screen.visible {
+        if self.diff_viewer.open {
+            KeyContext::DiffDialog
+        } else if self.agents_menu.open || self.mcp_view.open || self.stats_dialog.open {
+            KeyContext::Select
+        } else if self.settings_screen.visible {
             KeyContext::Settings
         } else if self.theme_screen.visible {
             KeyContext::ThemePicker
@@ -556,6 +1203,102 @@ impl App {
     // -------------------------------------------------------------------
     // New overlay key handlers
     // -------------------------------------------------------------------
+
+    fn handle_stats_dialog_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.stats_dialog.close(),
+            KeyCode::Tab | KeyCode::Right => self.stats_dialog.next_tab(),
+            KeyCode::BackTab | KeyCode::Left => self.stats_dialog.prev_tab(),
+            KeyCode::Char('r') => self.stats_dialog.cycle_range(),
+            KeyCode::Up => self.stats_dialog.scroll = self.stats_dialog.scroll.saturating_sub(1),
+            KeyCode::Down => self.stats_dialog.scroll = self.stats_dialog.scroll.saturating_add(1),
+            _ => {}
+        }
+    }
+
+    fn handle_mcp_view_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.mcp_view.close(),
+            KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.mcp_view.switch_pane(),
+            KeyCode::Up => self.mcp_view.select_prev(),
+            KeyCode::Down => self.mcp_view.select_next(),
+            KeyCode::Backspace => self.mcp_view.pop_search_char(),
+            KeyCode::Char('r') => {
+                self.pending_mcp_reconnect = true;
+                self.status_message = Some("Reconnecting MCP runtime...".to_string());
+            }
+            KeyCode::Char(c) if key.modifiers.is_empty() => {
+                if self.mcp_view.active_pane != crate::mcp_view::McpViewPane::ServerList {
+                    self.mcp_view.push_search_char(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_agents_menu_key(&mut self, key: KeyEvent) {
+        if matches!(self.agents_menu.route, AgentsRoute::Editor(_)) {
+            match key.code {
+                KeyCode::Esc => self.agents_menu.go_back(),
+                KeyCode::Tab | KeyCode::Down => self.agents_menu.editor_next_field(),
+                KeyCode::BackTab | KeyCode::Up => self.agents_menu.editor_prev_field(),
+                KeyCode::Enter => self.agents_menu.editor_insert_newline(),
+                KeyCode::Backspace => self.agents_menu.editor_backspace(),
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    match self.agents_menu.save_editor() {
+                        Ok(msg) => self.status_message = Some(msg),
+                        Err(err) => {
+                            self.agents_menu.editor.error = Some(err.clone());
+                            self.agents_menu.editor.saved_message = None;
+                            self.status_message = Some(err);
+                        }
+                    }
+                }
+                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.agents_menu.editor_insert_char(ch);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => self.agents_menu.go_back(),
+            KeyCode::Up => self.agents_menu.select_prev(),
+            KeyCode::Down => self.agents_menu.select_next(),
+            KeyCode::Enter | KeyCode::Right => self.agents_menu.confirm_selection(),
+            KeyCode::Left => self.agents_menu.go_back(),
+            _ => {}
+        }
+    }
+
+    fn handle_diff_viewer_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.diff_viewer.close(),
+            KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.diff_viewer.switch_pane(),
+            KeyCode::Char('d') => {
+                let root = self.project_root();
+                self.diff_viewer.toggle_diff_type(&root);
+            }
+            KeyCode::Up => {
+                if self.diff_viewer.active_pane == DiffPane::FileList {
+                    self.diff_viewer.select_prev();
+                } else {
+                    self.diff_viewer.scroll_detail_up();
+                }
+            }
+            KeyCode::Down => {
+                if self.diff_viewer.active_pane == DiffPane::FileList {
+                    self.diff_viewer.select_next();
+                } else {
+                    self.diff_viewer.scroll_detail_down();
+                }
+            }
+            KeyCode::PageUp => self.diff_viewer.scroll_detail_up(),
+            KeyCode::PageDown => self.diff_viewer.scroll_detail_down(),
+            _ => {}
+        }
+    }
 
     fn handle_help_overlay_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
@@ -594,10 +1337,9 @@ impl App {
             KeyCode::Enter => {
                 if let Some(entry) = self
                     .history_search_overlay
-                    .current_entry(&self.input_history)
+                    .current_entry(&self.prompt_input.history)
                 {
-                    self.input = entry.to_string();
-                    self.cursor_pos = self.input.len();
+                    self.set_prompt_text(entry.to_string());
                 }
                 self.history_search_overlay.close();
                 self.history_search = None;
@@ -620,7 +1362,7 @@ impl App {
                 }
             }
             KeyCode::Backspace => {
-                let history = self.input_history.clone();
+                let history = self.prompt_input.history.clone();
                 self.history_search_overlay.pop_char(&history);
                 if let Some(hs) = self.history_search.as_mut() {
                     hs.query.pop();
@@ -628,7 +1370,7 @@ impl App {
                 }
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let history = self.input_history.clone();
+                let history = self.prompt_input.history.clone();
                 self.history_search_overlay.push_char(c, &history);
                 if let Some(hs) = self.history_search.as_mut() {
                     hs.query.push(c);
@@ -661,8 +1403,10 @@ impl App {
             RewindStep::Confirming { .. } => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     if let Some(idx) = self.rewind_flow.accept_confirm() {
-                        // Truncate conversation to the selected message index
+                        // Truncate conversation to the selected message index.
                         self.messages.truncate(idx);
+                        // Remove system annotations placed after the truncation point.
+                        self.system_annotations.retain(|a| a.after_index <= idx);
                         self.notifications.push(
                             NotificationKind::Success,
                             format!("Rewound to message #{}", idx),
@@ -675,6 +1419,32 @@ impl App {
                 }
                 _ => {}
             },
+        }
+        false
+    }
+
+    fn handle_global_search_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc => {
+                self.global_search.close();
+            }
+            KeyCode::Enter => {
+                if let Some(selected) = self.global_search.selected_ref() {
+                    self.set_prompt_text(selected);
+                }
+                self.global_search.close();
+            }
+            KeyCode::Up => self.global_search.select_prev(),
+            KeyCode::Down => self.global_search.select_next(),
+            KeyCode::Backspace => {
+                self.global_search.pop_char();
+                self.refresh_global_search();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.global_search.push_char(c);
+                self.refresh_global_search();
+            }
+            _ => {}
         }
         false
     }
@@ -693,54 +1463,52 @@ impl App {
                 false
             }
             "exit" => {
-                if self.input.is_empty() {
+                if self.prompt_input.is_empty() {
                     self.should_quit = true;
                 }
                 false
             }
             "redraw" => false,
             "historySearch" => {
-                let overlay = HistorySearchOverlay::open(&self.input_history);
+                let overlay = HistorySearchOverlay::open(&self.prompt_input.history);
                 self.history_search_overlay = overlay;
                 let mut hs = HistorySearch::new();
-                hs.update_matches(&self.input_history);
+                hs.update_matches(&self.prompt_input.history);
                 self.history_search = Some(hs);
+                false
+            }
+            "openSearch" => {
+                self.global_search.open();
+                self.refresh_global_search();
                 false
             }
             "submit" => !self.is_streaming,
             "historyPrev" => {
-                if !self.input_history.is_empty() {
-                    let idx = match self.history_index {
-                        Some(i) => i.saturating_sub(1),
-                        None => self.input_history.len().saturating_sub(1),
-                    };
-                    self.history_index = Some(idx);
-                    self.input = self.input_history[idx].clone();
-                    self.cursor_pos = self.input.len();
+                if !self.prompt_input.history.is_empty() {
+                    self.prompt_input.history_up();
+                    self.refresh_prompt_input();
                 }
                 false
             }
             "historyNext" => {
-                if let Some(idx) = self.history_index {
-                    if idx + 1 < self.input_history.len() {
-                        let new_idx = idx + 1;
-                        self.history_index = Some(new_idx);
-                        self.input = self.input_history[new_idx].clone();
-                        self.cursor_pos = self.input.len();
-                    } else {
-                        self.history_index = None;
-                        self.input.clear();
-                        self.cursor_pos = 0;
-                    }
+                if self.prompt_input.history_pos.is_some() {
+                    self.prompt_input.history_down();
+                    self.refresh_prompt_input();
                 }
                 false
             }
             "scrollUp" => {
                 self.scroll_offset = self.scroll_offset.saturating_add(10);
+                self.auto_scroll = false;
                 false
             }
             "scrollDown" => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(10);
+                let new_off = self.scroll_offset.saturating_sub(10);
+                self.scroll_offset = new_off;
+                if new_off == 0 {
+                    self.auto_scroll = true;
+                    self.new_messages_while_scrolled = 0;
+                }
                 false
             }
             "yes" => {
@@ -775,9 +1543,8 @@ impl App {
             "select" => {
                 // Legacy history search select
                 if let Some(hs) = self.history_search.as_ref() {
-                    if let Some(entry) = hs.current_entry(&self.input_history) {
-                        self.input = entry.to_string();
-                        self.cursor_pos = self.input.len();
+                    if let Some(entry) = hs.current_entry(&self.prompt_input.history) {
+                        self.set_prompt_text(entry.to_string());
                     }
                 }
                 self.history_search = None;
@@ -824,9 +1591,8 @@ impl App {
                 self.history_search_overlay.close();
             }
             KeyCode::Enter => {
-                if let Some(entry) = hs.current_entry(&self.input_history) {
-                    self.input = entry.to_string();
-                    self.cursor_pos = self.input.len();
+                if let Some(entry) = hs.current_entry(&self.prompt_input.history) {
+                    self.set_prompt_text(entry.to_string());
                 }
                 self.history_search = None;
                 self.history_search_overlay.close();
@@ -844,14 +1610,14 @@ impl App {
             }
             KeyCode::Backspace => {
                 hs.query.pop();
-                let history = self.input_history.clone();
+                let history = self.prompt_input.history.clone();
                 if let Some(hs) = self.history_search.as_mut() {
                     hs.update_matches(&history);
                 }
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 hs.query.push(c);
-                let history = self.input_history.clone();
+                let history = self.prompt_input.history.clone();
                 if let Some(hs) = self.history_search.as_mut() {
                     hs.update_matches(&history);
                 }
@@ -911,29 +1677,49 @@ impl App {
     // Query event handling
     // -------------------------------------------------------------------
 
+    /// Push a completed assistant message and trigger auto-scroll bookkeeping.
+    fn push_assistant_message(&mut self, text: String) {
+        let msg = Message::assistant(text);
+        self.messages.push(msg);
+        self.invalidate_transcript();
+        self.on_new_message();
+    }
+
     /// Process a query event from the agentic loop.
     pub fn handle_query_event(&mut self, event: QueryEvent) {
         match event {
             QueryEvent::Stream(stream_evt) => {
                 self.is_streaming = true;
                 match stream_evt {
-                    cc_api::StreamEvent::ContentBlockDelta { delta, .. } => match delta {
-                        cc_api::streaming::ContentDelta::TextDelta { text } => {
-                            self.streaming_text.push_str(&text);
-                        }
-                        cc_api::streaming::ContentDelta::ThinkingDelta { thinking } => {
-                            debug!(len = thinking.len(), "Thinking delta received");
-                        }
-                        _ => {}
-                    },
-                    cc_api::StreamEvent::MessageStop => {
-                        self.is_streaming = false;
-                        if !self.streaming_text.is_empty() {
-                            let text = std::mem::take(&mut self.streaming_text);
-                            self.messages.push(Message::assistant(text));
+                    cc_api::StreamEvent::ContentBlockDelta { delta, .. } => {
+                        // Reset stall timer on any incoming delta — we're making progress.
+                        self.stall_start = None;
+                        match delta {
+                            cc_api::streaming::ContentDelta::TextDelta { text } => {
+                                self.streaming_text.push_str(&text);
+                                self.invalidate_transcript();
+                            }
+                            cc_api::streaming::ContentDelta::ThinkingDelta { thinking } => {
+                                debug!(len = thinking.len(), "Thinking delta received");
+                            }
+                            _ => {}
                         }
                     }
-                    _ => {}
+                    cc_api::StreamEvent::MessageStop => {
+                        self.is_streaming = false;
+                        self.stall_start = None;
+                        if !self.streaming_text.is_empty() {
+                            let text = std::mem::take(&mut self.streaming_text);
+                            self.push_assistant_message(text);
+                        }
+                    }
+                    _ => {
+                        // Any other stream event: if we have no stall_start yet,
+                        // record now so the red-spinner timer can begin.
+                        if self.stall_start.is_none() {
+                            self.stall_start = Some(std::time::Instant::now());
+                        }
+                    }
                 }
             }
 
@@ -953,6 +1739,7 @@ impl App {
                         output_preview: None,
                     });
                 }
+                self.invalidate_transcript();
             }
 
             QueryEvent::ToolEnd {
@@ -961,11 +1748,14 @@ impl App {
                 result,
                 is_error,
             } => {
-                let preview = if result.len() > 120 {
-                    format!("{}…", &result[..120])
-                } else {
-                    result.clone()
-                };
+                // Build a multi-line preview: show up to 3 lines, truncate if more.
+                let all_lines: Vec<&str> = result.lines().collect();
+                let preview_lines = all_lines.len().min(3);
+                let mut preview = all_lines[..preview_lines].join("\n");
+                let remaining = all_lines.len().saturating_sub(preview_lines);
+                if remaining > 0 {
+                    preview.push_str(&format!("\n\u{2026} {} more lines", remaining));
+                }
                 if let Some(block) =
                     self.tool_use_blocks.iter_mut().find(|b| b.id == tool_id)
                 {
@@ -976,21 +1766,25 @@ impl App {
                     };
                     block.output_preview = Some(preview);
                 }
+                self.invalidate_transcript();
                 if is_error {
                     self.status_message = Some(format!("Tool error: {}", result));
                 } else {
                     self.status_message = None;
                 }
+                self.refresh_turn_diff_from_history();
             }
 
-            QueryEvent::TurnComplete { turn, stop_reason } => {
+            QueryEvent::TurnComplete { turn, stop_reason, .. } => {
                 debug!(turn, stop_reason, "Turn complete");
                 self.is_streaming = false;
                 if !self.streaming_text.is_empty() {
                     let text = std::mem::take(&mut self.streaming_text);
-                    self.messages.push(Message::assistant(text));
+                    self.push_assistant_message(text);
                 }
                 self.tool_use_blocks.retain(|b| b.status != ToolStatus::Running);
+                self.invalidate_transcript();
+                self.refresh_turn_diff_from_history();
             }
 
             QueryEvent::Status(msg) => {
@@ -1000,11 +1794,34 @@ impl App {
             QueryEvent::Error(msg) => {
                 self.is_streaming = false;
                 self.streaming_text.clear();
-                self.messages
-                    .push(Message::assistant(format!("Error: {}", msg)));
-                self.status_message = Some(format!("Error: {}", msg));
+                self.invalidate_transcript();
+                let err_msg = format!("Error: {}", msg);
+                self.push_assistant_message(err_msg.clone());
+                self.status_message = Some(err_msg);
+            }
+            QueryEvent::TokenWarning { state, pct_used } => {
+                // Display a status bar warning when approaching the context limit.
+                use cc_query::compact::TokenWarningState;
+                let msg = match state {
+                    TokenWarningState::Ok => None,
+                    TokenWarningState::Warning => Some(format!(
+                        "Context window {:.0}% full — consider /compact",
+                        pct_used * 100.0
+                    )),
+                    TokenWarningState::Critical => Some(format!(
+                        "Context window {:.0}% full — /compact recommended now",
+                        pct_used * 100.0
+                    )),
+                };
+                if let Some(warning) = msg {
+                    self.status_message = Some(warning);
+                }
             }
         }
+
+        // Re-sync token count from tracker and check warning thresholds.
+        self.token_count = self.cost_tracker.total_tokens() as u32;
+        self.check_token_warnings();
     }
 
     // -------------------------------------------------------------------
@@ -1032,68 +1849,47 @@ impl App {
 
             // Poll for events with a short timeout so we can redraw for animation
             if event::poll(std::time::Duration::from_millis(50))? {
-                if let Event::Key(key) = event::read()? {
-                    let should_submit = self.handle_key_event(key);
-                    if self.should_quit {
-                        return Ok(None);
-                    }
-                    if should_submit {
-                        // Check if this is a slash command that should open a UI screen
-                        if crate::input::is_slash_command(&self.input) {
-                            let cmd = {
-                                let (c, _) = crate::input::parse_slash_command(&self.input);
-                                c.to_string()
-                            };
-                            if self.intercept_slash_command(&cmd) {
-                                self.input.clear();
-                                self.cursor_pos = 0;
-                                continue;
+                match event::read()? {
+                    Event::Key(key) => {
+                        // On Windows crossterm fires Press + Release; only handle Press.
+                        if key.kind != crossterm::event::KeyEventKind::Press {
+                            continue;
+                        }
+                        let should_submit = self.handle_key_event(key);
+                        if self.should_quit {
+                            return Ok(None);
+                        }
+                        if should_submit {
+                            // Check if this is a slash command that should open a UI screen
+                            if crate::input::is_slash_command(&self.prompt_input.text) {
+                                let cmd = {
+                                    let (c, _) =
+                                        crate::input::parse_slash_command(&self.prompt_input.text);
+                                    c.to_string()
+                                };
+                                if self.intercept_slash_command(&cmd) {
+                                    self.clear_prompt();
+                                    continue;
+                                }
+                            }
+                            let input = self.take_input();
+                            if !input.is_empty() {
+                                return Ok(Some(input));
                             }
                         }
-                        let input = self.take_input();
-                        if !input.is_empty() {
-                            return Ok(Some(input));
-                        }
                     }
+                    Event::Paste(data)
+                        if !self.is_streaming
+                            && self.permission_request.is_none()
+                            && !self.history_search_overlay.visible
+                            && self.history_search.is_none() =>
+                    {
+                        self.prompt_input.paste(&data);
+                        self.refresh_prompt_input();
+                    }
+                    _ => {}
                 }
             }
         }
-    }
-
-    // -------------------------------------------------------------------
-    // UTF-8 cursor helpers
-    // -------------------------------------------------------------------
-
-    fn char_boundary_at(&self, pos: usize) -> usize {
-        let len = self.input.len();
-        let pos = pos.min(len);
-        let mut p = pos;
-        while p < len && !self.input.is_char_boundary(p) {
-            p += 1;
-        }
-        p
-    }
-
-    fn prev_char_boundary(&self, pos: usize) -> usize {
-        if pos == 0 {
-            return 0;
-        }
-        let mut p = pos - 1;
-        while p > 0 && !self.input.is_char_boundary(p) {
-            p -= 1;
-        }
-        p
-    }
-
-    fn next_char_boundary(&self, pos: usize) -> usize {
-        let len = self.input.len();
-        if pos >= len {
-            return len;
-        }
-        let mut p = pos + 1;
-        while p < len && !self.input.is_char_boundary(p) {
-            p += 1;
-        }
-        p
     }
 }

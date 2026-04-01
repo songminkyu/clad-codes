@@ -31,3 +31,5 @@ chrono = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
 crossterm = { workspace = true }
+parking_lot = { workspace = true }
+

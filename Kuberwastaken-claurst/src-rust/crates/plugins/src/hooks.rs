@@ -231,6 +231,116 @@ pub fn event_key(kind: &HookEventKind) -> String {
     kind.to_string()
 }
 
+// ---------------------------------------------------------------------------
+// PostToolUse hook dispatch (T2-14)
+// ---------------------------------------------------------------------------
+
+/// Dispatch PostToolUse hooks for a completed tool call.
+///
+/// Mirrors the TS plugin hook dispatch path in src/plugins/hooks.ts.
+/// All matching hooks run concurrently; results are collected.
+/// Non-blocking: non-zero exit logs a warning but doesn't fail the tool call.
+pub async fn dispatch_post_tool_hooks(
+    registry: &HookRegistry,
+    tool_name: &str,
+    tool_input_json: &str,
+    tool_result_json: &str,
+) -> Vec<String> {
+    let event_name = event_key(&HookEventKind::PostToolUse);
+
+    let matching_hooks: Vec<RegisteredHook> = match registry.get(&event_name) {
+        None => return Vec::new(),
+        Some(hooks) => hooks
+            .iter()
+            .filter(|h| {
+                let pattern = h.matcher.as_deref().unwrap_or("*");
+                glob_match(pattern, tool_name)
+            })
+            .cloned()
+            .collect(),
+    };
+
+    if matching_hooks.is_empty() {
+        return Vec::new();
+    }
+
+    let tool_name = tool_name.to_string();
+    let tool_input = tool_input_json.to_string();
+    let tool_result = tool_result_json.to_string();
+
+    let mut tasks = Vec::new();
+    for hook in matching_hooks {
+        let tn = tool_name.clone();
+        let ti = tool_input.clone();
+        let tr = tool_result.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            run_post_tool_hook(&hook.command, &tn, &ti, &tr)
+        });
+        tasks.push(task);
+    }
+
+    let mut outputs = Vec::new();
+    for task in tasks {
+        if let Ok(Ok(output)) = task.await {
+            if !output.is_empty() {
+                outputs.push(output);
+            }
+        }
+    }
+    outputs
+}
+
+/// Run a single PostToolUse hook command synchronously.
+fn run_post_tool_hook(
+    command: &str,
+    tool_name: &str,
+    tool_input_json: &str,
+    tool_result_json: &str,
+) -> Result<String, std::io::Error> {
+    let output = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
+        .args(if cfg!(windows) {
+            vec!["/C", command]
+        } else {
+            vec!["-c", command]
+        })
+        .env("CLAUDE_TOOL_NAME", tool_name)
+        .env("CLAUDE_TOOL_INPUT", tool_input_json)
+        .env("CLAUDE_TOOL_RESULT", tool_result_json)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::warn!(
+            tool_name,
+            command,
+            exit_code = output.status.code().unwrap_or(-1),
+            stderr = %stderr,
+            "PostToolUse hook returned non-zero exit"
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(stdout.trim().to_string())
+}
+
+/// Simple glob pattern matching: `*` matches any sequence of chars.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if pattern == text {
+        return true;
+    }
+    // Handle patterns like "File*" or "*Tool"
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return text.starts_with(prefix);
+    }
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        return text.ends_with(suffix);
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4,8 +4,11 @@
 // CronDeleteTool  – remove an existing scheduled task
 // CronListTool    – list all scheduled tasks
 //
-// Scheduled tasks are stored in a global in-memory store (session-only).
-// Optionally persisted to `.claude/scheduled_tasks.json` (durable mode).
+// Scheduled tasks are stored in a global in-memory store.
+// Durable tasks are persisted to `~/.claude/scheduled_tasks.json`.
+//
+// On first use the store is initialised from the JSON file; tasks older than
+// 7 days are automatically purged on load (matching TypeScript behaviour).
 //
 // Cron expression format: "M H DoM Mon DoW" (standard 5-field cron in local
 // time). For example:
@@ -19,6 +22,7 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::debug;
@@ -38,8 +42,67 @@ pub struct CronTask {
     pub created_at: u64,
 }
 
+/// 7 days in seconds — tasks older than this are purged on load.
+const MAX_TASK_AGE_SECS: u64 = 7 * 24 * 3600;
+
+/// Whether the store has been initialised from disk for this process.
+static STORE_INITIALISED: once_cell::sync::Lazy<tokio::sync::Mutex<bool>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(false));
+
 static CRON_STORE: Lazy<Arc<RwLock<HashMap<String, CronTask>>>> =
     Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
+
+// ---------------------------------------------------------------------------
+// Disk path helpers
+// ---------------------------------------------------------------------------
+
+/// Path to `~/.claude/scheduled_tasks.json`.
+fn scheduled_tasks_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".claude").join("scheduled_tasks.json"))
+}
+
+/// Ensure the store has been loaded from disk (once per process).
+async fn ensure_store_loaded() {
+    let mut init = STORE_INITIALISED.lock().await;
+    if *init {
+        return;
+    }
+    *init = true;
+
+    // Load from ~/.claude/scheduled_tasks.json if it exists.
+    let path = match scheduled_tasks_path() {
+        Some(p) => p,
+        None => return,
+    };
+
+    let data = match tokio::fs::read_to_string(&path).await {
+        Ok(d) => d,
+        Err(_) => return, // file doesn't exist yet — that's fine
+    };
+
+    let tasks: Vec<CronTask> = match serde_json::from_str(&data) {
+        Ok(t) => t,
+        Err(e) => {
+            debug!("Failed to parse scheduled_tasks.json: {}", e);
+            return;
+        }
+    };
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut store = CRON_STORE.write().await;
+    for task in tasks {
+        // Drop tasks older than MAX_TASK_AGE_SECS
+        if now_secs.saturating_sub(task.created_at) > MAX_TASK_AGE_SECS {
+            debug!("Cron task {} expired, skipping on load", task.id);
+            continue;
+        }
+        store.insert(task.id.clone(), task);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public scheduler API (used by cc-query cron_scheduler)
@@ -97,6 +160,7 @@ fn cron_range_matches(part: &str, value: u32) -> bool {
 /// Return all tasks whose cron expression fires at `dt`.
 /// One-shot tasks (recurring=false) are removed from the store after being returned.
 pub async fn pop_due_tasks(dt: &DateTime<Local>) -> Vec<CronTask> {
+    ensure_store_loaded().await;
     let mut store = CRON_STORE.write().await;
     let due: Vec<CronTask> = store
         .values()
@@ -235,7 +299,7 @@ impl Tool for CronCreateTool {
         })
     }
 
-    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
         let params: CronCreateInput = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -248,9 +312,14 @@ impl Tool for CronCreateTool {
             ));
         }
 
+        // Ensure persistent tasks are loaded from disk before we check the count.
+        ensure_store_loaded().await;
+
         let mut store = CRON_STORE.write().await;
         if store.len() >= 50 {
-            return ToolResult::error("Too many scheduled jobs (max 50). Cancel one first.".to_string());
+            return ToolResult::error(
+                "Too many scheduled jobs (max 50). Cancel one first.".to_string(),
+            );
         }
 
         let id = Uuid::new_v4().to_string()[..8].to_string();
@@ -268,27 +337,25 @@ impl Tool for CronCreateTool {
             created_at: now,
         };
 
-        // Optionally persist to disk
+        store.insert(id.clone(), task);
+
+        // Persist to ~/.claude/scheduled_tasks.json for durable tasks.
         if params.durable {
-            if let Err(e) = persist_tasks_to_disk(&store, ctx).await {
+            if let Err(e) = persist_tasks_to_disk(&store).await {
                 debug!("Failed to persist cron task to disk: {}", e);
             }
         }
 
-        store.insert(id.clone(), task);
         let human = cron_to_human(&params.cron);
 
         let where_note = if params.durable {
-            "Persisted to .claude/scheduled_tasks.json"
+            "Persisted to ~/.claude/scheduled_tasks.json"
         } else {
             "Session-only (dies when Claude exits)"
         };
 
         let msg = if params.recurring {
-            format!(
-                "Scheduled recurring job {} ({}). {}",
-                id, human, where_note
-            )
+            format!("Scheduled recurring job {} ({}). {}", id, human, where_note)
         } else {
             format!(
                 "Scheduled one-shot task {} ({}). {}. Will fire once then auto-delete.",
@@ -340,8 +407,17 @@ impl Tool for CronDeleteTool {
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
 
+        // Load disk state first so we don't accidentally drop persisted tasks.
+        ensure_store_loaded().await;
+
         let mut store = CRON_STORE.write().await;
-        if store.remove(&params.id).is_some() {
+        if let Some(removed) = store.remove(&params.id) {
+            // If it was durable, update the file.
+            if removed.durable {
+                if let Err(e) = persist_tasks_to_disk(&store).await {
+                    debug!("Failed to update scheduled_tasks.json after delete: {}", e);
+                }
+            }
             ToolResult::success(format!("Deleted cron task '{}'.", params.id))
         } else {
             ToolResult::error(format!("Cron task '{}' not found.", params.id))
@@ -373,6 +449,9 @@ impl Tool for CronListTool {
     }
 
     async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+        // Merge in-memory store with any persisted tasks from disk.
+        ensure_store_loaded().await;
+
         let store = CRON_STORE.read().await;
 
         if store.is_empty() {
@@ -413,23 +492,19 @@ impl Tool for CronListTool {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Persist all durable tasks to `.claude/scheduled_tasks.json`.
-async fn persist_tasks_to_disk(
-    store: &HashMap<String, CronTask>,
-    ctx: &ToolContext,
-) -> Result<(), String> {
+/// Persist all durable tasks to `~/.claude/scheduled_tasks.json`.
+async fn persist_tasks_to_disk(store: &HashMap<String, CronTask>) -> Result<(), String> {
     let durable: Vec<&CronTask> = store.values().filter(|t| t.durable).collect();
-    let json = serde_json::to_string_pretty(&durable)
-        .map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(&durable).map_err(|e| e.to_string())?;
 
-    let dir = ctx.working_dir.join(".claude");
-    tokio::fs::create_dir_all(&dir)
+    let path = scheduled_tasks_path().ok_or_else(|| "Cannot determine home directory".to_string())?;
+    let dir = path.parent().ok_or("No parent directory")?;
+
+    tokio::fs::create_dir_all(dir)
         .await
         .map_err(|e| e.to_string())?;
 
-    tokio::fs::write(dir.join("scheduled_tasks.json"), json)
-        .await
-        .map_err(|e| e.to_string())?;
+    tokio::fs::write(&path, json).await.map_err(|e| e.to_string())?;
 
     Ok(())
 }

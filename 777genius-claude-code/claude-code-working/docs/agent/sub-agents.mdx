@@ -1,0 +1,194 @@
+---
+title: "Sub-Agent Mechanism - AgentTool's Execution Link and Isolation Architecture"
+description: "Analysis of Claude Code sub-Agent from the source code perspective: complete execution link of AgentTool.call(), Prompt Cache sharing of Fork sub-process, Worktree isolation, independent assembly of tool pool, and data format for result return."
+keywords: ["Sub Agent", "AgentTool", "Task Delegation", "forkSubagent", "Sub Process Isolation"]
+---
+
+{/* The goal of this chapter: reveal the complete execution link, tool isolation, communication protocol and life cycle management of the sub-Agent from the source code perspective */}
+
+## Execution link overview
+
+The full path of an `Agent(prompt="fix bug")` call:
+
+```
+AI generation tool_use: { prompt: "Fix bug", subagent_type: "Explore" }
+  ↓
+AgentTool.call() ← Entry (AgentTool.tsx:239)
+  ├── Parse effectiveType (fork vs named agent)
+  ├── filterDeniedAgents() ← Permission filtering
+  ├── Check requiredMcpServers ← MCP dependency verification (wait up to 30s)
+  ├── assembleToolPool(workerPermissionContext) ← Independent assembly tool pool
+  ├── createAgentWorktree() ← Optional worktree isolation
+  ↓
+runAgent() ← core execution (runAgent.ts:248)
+  ├── getAgentSystemPrompt() ← Build agent-specific system prompt
+  ├── initializeAgentMcpServers() ← agent-level MCP server
+  ├── executeSubagentStartHooks() ← Hook injection
+  ├── query() ← Enter the standard agentic loop
+  │ ├── Message flow yields one by one
+  │ └── recordSidechainTranscript() ← JSONL persistence
+  ↓
+finalizeAgentTool() ← Summary of results
+  ├── Extract text content + usage statistics
+  └── mapToolResultToToolResultBlockParam() ← formatted as tool_result
+```
+
+## Two sub-Agent paths: Named Agent vs Fork
+
+`AgentTool.call()` takes two completely different paths depending on whether `subagent_type` is provided (`AgentTool.tsx:322-356`):
+
+| Dimensions | Named Agent (`subagent_type` specified) | Fork child process (`subagent_type` omitted) |
+|------|-------------------------------------|--------------------------------------|
+| **Trigger condition** | `subagent_type` has a value | `isForkSubagentEnabled()` && No type specified |
+| **System Prompt** | Agent's own `getSystemPrompt()` | Inherit the complete System Prompt of parent Agent |
+| **ToolPool** | `assembleToolPool()` Independent assembly | The original tool pool of the parent Agent (`useExactTools: true`) |
+| **Context** | Task description only | Full conversation history of the parent Agent (`forkContextMessages`) |
+| **Model** | Can be specified independently | Inherit parent model (`model: 'inherit'`) |
+| **Permission Mode** | `permissionMode` defined by Agent | `'bubble'` (floated to parent terminal) |
+| **Purpose** | Professional task delegation | Prompt Cache hit rate optimization |
+
+The core of the design of the Fork path is **Prompt Cache sharing**: all fork child processes share the parent Agent's complete `assistant` message (all `tool_use` blocks), filled with the same placeholder `tool_result`, and only the last `text` block contains the respective instructions. This makes API request prefix bytes completely consistent, maximizing cache hits.
+
+```typescript
+// forkSubagent.ts:142 — Placeholder results for all fork child processes
+const FORK_PLACEHOLDER_RESULT = 'Fork started — processing in background'
+
+// buildForkedMessages() build:
+// [assistant(full tool_use), user(placeholder_results..., subprocess instructions)]
+```
+
+### Fork recursion protection
+
+The fork child process retains the Agent tool (for cache-identical tool defs), but prevents recursive forks with two lines of defense (`AgentTool.tsx:332`):
+
+1. **`querySource` check** (compression safety): `context.options.querySource === 'agent:builtin:fork'`
+2. **Message scanning** (downgrade cover): detect `<fork-boilerplate>` tag
+
+## Independent assembly of tool pool
+
+The child Agent does not inherit the tool restrictions of the parent Agent - its tool pool is assembled completely independently (`AgentTool.tsx:573-577`):
+
+```typescript
+const workerPermissionContext = {
+  ...appState.toolPermissionContext,
+  mode: selectedAgent.permissionMode ?? 'acceptEdits'
+}
+const workerTools = assembleToolPool(workerPermissionContext, appState.mcp.tools)
+```
+
+Key design decisions:
+- **Permission mode independent**: The child Agent uses `selectedAgent.permissionMode` (default `acceptEdits`) and is not restricted by the current mode of the parent Agent
+- **MCP tool inheritance**: `appState.mcp.tools` contains all connected MCP tools and is automatically obtained by the child Agent
+- **Agent-level MCP server**: `initializeAgentMcpServers()` in `runAgent()` can additionally connect to a dedicated MCP server for a specific Agent
+
+### resolveAgentTools for tool filtering
+
+`runAgent.ts:500-502` Further filtering after tool assembly:
+
+```typescript
+const resolvedTools = useExactTools
+  ? availableTools // Fork: Use the parent tool directly
+  : resolveAgentTools(agentDefinition, availableTools, isAsync).resolvedTools
+```
+
+`resolveAgentTools()` will filter the available tools according to the `tools` field in the Agent definition, and map `['*']` to the full range of tools.
+
+## Worktree isolation mechanism
+
+The `isolation: "worktree"` parameter allows the child Agent to work in an independent git worktree (`AgentTool.tsx:590-593`):
+
+```typescript
+const slug = `agent-${earlyAgentId.slice(0, 8)}`
+worktreeInfo = await createAgentWorktree(slug)
+```
+
+Worktree life cycle:
+1. **Create**: Create an independent working copy under `.git/worktrees/`
+2. **CWD Override**: `runWithCwdOverride(worktreePath, fn)` allows all file operations to be performed in worktree
+3. **Path Translation**: Inject path translation notification (`buildWorktreeNotice`) when Fork + worktree
+4. **Cleaning** (`cleanupWorktreeIfNeeded`):
+   - Hook-based worktree → always retained
+   - Changed → Keep, return `worktreePath`
+   - No changes → Automatically delete
+
+## Life cycle management: synchronous vs asynchronous
+
+### Asynchronous Agent (running in the background)
+
+When `run_in_background=true` or `selectedAgent.background=true`, the Agent immediately returns to the `async_launched` state (`AgentTool.tsx:686-764`):
+
+```
+registerAsyncAgent(agentId, ...) ← Register to AppState.tasks
+  ↓ (void — Leave it alone)
+runAsyncAgentLifecycle() ← background execution
+  ├── runAgent().onCacheSafeParams ← Progress summary initialization
+  ├── Message flow iteration
+  ├── completeAsyncAgent() ← Mark complete
+  ├── classifyHandoffIfNeeded() ← Security check
+  └── enqueueAgentNotification() ← Notify the main Agent
+```
+
+The asynchronous Agent obtains an independent `AbortController`, which is not shared with the parent Agent - the user presses ESC to cancel the main thread and will not kill the background Agent.
+
+### Synchronize Agent (run in the foreground)
+
+The key feature of the synchronization Agent is that it can be backgrounded (`AgentTool.tsx:818-833`):
+
+```typescript
+const registration = registerAgentForeground({
+  autoBackgroundMs: getAutoBackgroundMs() || undefined // Default 120s
+})
+backgroundPromise = registration.backgroundSignal.then(...)
+```
+
+In each iteration of the agentic loop, the system uses `Promise.race` to compete for the next message and background signal:
+
+```typescript
+const raceResult = await Promise.race([
+  nextMessagePromise.then(r => ({ type: 'message', result: r })),
+  backgroundPromise // Triggered when autoBackgroundMs exceeds
+])
+```
+
+After backgrounding, the foreground iterator is terminated (`agentIterator.return()`) and a new `runAgent()` is restarted with `isAsync: true` while the foreground's output file continues to be written.
+
+## Result return format
+
+`mapToolResultToToolResultBlockParam()` returns different formats according to the status (`AgentTool.tsx:1298-1375`):
+
+| Status | Return content |
+|------|---------|
+| `completed` | content + `<usage>` block (token/tool_calls/duration) |
+| `async_launched` | agentId + outputFile path + operation guide |
+| `teammate_spawned` | agent_id + name + team_name |
+| `remote_launched` | taskId + sessionUrl + outputFile |
+
+For one-time built-in Agents (Explore, Plan), the `<usage>` block is omitted - saving about 1-2 Gtok context windows per week.
+
+## MCP dependent waiting mechanism
+
+If the Agent declares `requiredMcpServers`, `call()` will wait for these server connections to complete (`AgentTool.tsx:371-410`):
+
+```typescript
+const MAX_WAIT_MS = 30_000 // Maximum wait 30 seconds
+const POLL_INTERVAL_MS = 500 // Poll every 500ms
+```
+
+Early exit condition: Stop waiting immediately if any required server enters the `failed` state. Tool availability is determined by `mcp__` prefix tool name resolution (`mcp__serverName__toolName`).
+
+## Applicable scenarios
+
+<CardGroup cols={2}>
+  <Card title="Parallel Research" icon="magnifying-glass">
+    Multiple fork sub-processes search in different directions in parallel and share the Prompt Cache prefix, with only different instructions.
+  </Card>
+  <Card title="Professional delegation" icon="code-branch">
+    Use named Agents (Explore/Plan/verification) to perform professional tasks, restricted toolset + independent permissions
+  </Card>
+  <Card title="Isolation Experiment" icon="flask">
+    `isolation: "worktree"` Try the solution in an independent working copy without affecting the main branch
+  </Card>
+  <Card title="Background Build" icon="layer-group">
+    `run_in_background: true` starts a long build/test task and the main Agent continues to work
+  </Card>
+</CardGroup>

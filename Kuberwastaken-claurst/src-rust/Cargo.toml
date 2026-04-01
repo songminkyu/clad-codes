@@ -68,9 +68,13 @@ bytes = "1"
 base64 = "0.22"
 sha2 = "0.10"
 hex = "0.4"
+getrandom = "0.2"
+enigo = "0.2"
+xcap = "0.0.13"
 url = "2"
 mime = "0.3"
 urlencoding = "2"
+open = "5"
 
 # Text processing
 similar = "2"

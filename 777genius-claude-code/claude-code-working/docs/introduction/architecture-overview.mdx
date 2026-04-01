@@ -1,0 +1,112 @@
+---
+title: "Architecture panorama - Detailed explanation of Claude Code's five-layer architecture"
+description: "From the interaction layer to the infrastructure layer, a detailed explanation of Claude Code's five-layer architecture design. Source-level data flow analysis based on src/main.tsx, src/QueryEngine.ts, src/query.ts, src/tools.ts, src/services/api/claude.ts."
+keywords: ["Claude Code Architecture", "Five-layer Architecture", "QueryEngine", "Agentic Loop", "Data Flow"]
+---
+
+{/* The goal of this chapter: explain the overall structure clearly in one picture and establish a coordinate system for subsequent chapters */}
+
+## Five-layer architecture
+
+Claude Code is divided into five levels from top to bottom. Each level has clear responsibilities and clear boundaries:
+
+<Frame caption="Claude Code five-layer architecture">
+  <img src="/docs/images/architecture-layers.png" alt="Claude Code five-layer architecture diagram" />
+</Frame>
+
+| Hierarchy | Responsibilities | Entry source code | Keywords |
+|------|------|---------|--------|
+| **Interaction layer** | Terminal UI, user input, message display | `src/screens/REPL.tsx` | React/Ink, PromptInput |
+| **Orchestration layer** | Multi-round dialogue, session persistence, cost tracking | `src/QueryEngine.ts` | QueryEngine, transcript |
+| **Core loop layer** | Single round: send request → get response → execute tool → loop | `src/query.ts` | Agentic Loop, State |
+| **Tool layer** | The "hands" of AI - reading and writing files, executing commands | `src/tools.ts` → `src/Tool.ts` | Tool interface, MCP |
+| **Communication Layer** | Streaming communication with Claude API | `src/services/api/claude.ts` | Streaming, Provider |
+
+## Source code tracking of a main data flow
+
+<Frame caption="Core Data Flow">
+  <img src="/docs/images/data-flow.png" alt="Claude Code core data flow" />
+</Frame>
+
+The operation of the entire system can be condensed into a core data flow. The following is the source code path corresponding to each step:
+
+### 1. User input → REPL
+
+`src/screens/REPL.tsx` is a terminal UI component based on React/Ink. User input is processed by `processUserInput()` (`src/utils/processUserInput/processUserInput.ts`), which supports slash commands, file attachments, images, etc.
+
+### 2. QueryEngine orchestration
+
+`src/QueryEngine.ts` is the middle layer between REPL and `query()`, managing:
+- **Session state**: message array, tool permission context (`ToolPermissionContext`), file history snapshot
+- **Cost Tracking**: `accumulateUsage()` / `getTotalCost()` Accumulated token usage
+- **Transcript persistence**: `recordTranscript()` serializes conversations to disk, supports `--resume`
+- **File History**: `fileHistoryMakeSnapshot()` creates a snapshot before modification, supports undo
+
+Key method: `queryEngine.query()` constructs `QueryParams` and calls `query()` asynchronous generator.
+
+### 3. Agentic Loop（`src/query.ts`）
+
+`query()` is an `AsyncGenerator`, and each iteration of the `while(true)` loop contains:
+
+```
+① Context preprocessing pipeline:
+   applyToolResultBudget → snipCompact → microcompact → contextCollapse → autocompact
+
+② Streaming API call:
+   deps.callModel() → AsyncGenerator<StreamEvent | Message>
+   Collect assistantMessages[], toolUseBlocks[]
+
+③ Tool execution:
+   StreamingToolExecutor (parallel) or runTools (serial)
+   → toolResults[]
+
+④ Termination/continuation judgment:
+   needsFollowUp ? continue : return { reason }
+```
+
+The complete state machine is passed between iterations via the `State` type (`src/query.ts:204`), containing 10 fields (messages, autoCompactTracking, maxOutputTokensRecoveryCount, etc.).
+
+### 4. Tool layer (`src/tools.ts` → `src/Tool.ts`)
+
+`getAllBaseTools()` (`src/tools.ts:191`) assembles a list of 50+ tools, passes it to the API after being filtered by `filterToolsByDenyRules()` permissions.
+
+Each tool implements `Tool<Input, Output, Progress>` interface (`src/Tool.ts:362`), core method chain:
+```
+validateInput() → canUseTool() (UI layer) → checkPermissions() → call() → ToolResult
+```
+
+### 5. Communication layer (`src/services/api/claude.ts`)
+
+The API client supports 4 types of Providers:
+- **Anthropic Direct**: Default
+- **AWS Bedrock**：`ANTHROPIC_BEDROCK_BASE_URL`
+- **Google Vertex**：`ANTHROPIC_VERTEX_PROJECT_ID`
+- **Azure**: via custom base URL
+
+`deps.callModel()` initiates a streaming request and returns the `BetaRawMessageStreamEvent` event stream. Support Prompt Cache (`cache_control`), thinking blocks, multi-turn tool use.
+
+## Four core design principles
+
+<AccordionGroup>
+  <Accordion title="Streaming-first"">
+    All API communication is streaming - `deps.callModel()` returns an AsyncGenerator and the user sees the AI "typing out" the answer verbatim. StreamingToolExecutor starts executing tools in parallel during the streaming process, without waiting for the end of the stream. When the model is downgraded (Fallback), the collected assistantMessages are marked as tombstone and cleared, and the entire streaming request is retried.
+  </Accordion>
+  <Accordion title="Tool as Capability">
+    Each tool is a `Tool<Input, Output, Progress>` structured type, created through the `buildTool()` factory. `getTools()` is assembled on every API call (not globally cached) because `isEnabled()` may change with runtime state. The MCP tool marks the source through the `mcpInfo` field and supports server-level blanket deny.
+  </Accordion>
+  <Accordion title="Permission as Boundary (Permission as Boundary)">
+    Each tool call is double-checked by `validateInput() → checkPermissions()`. Permission rules are gathered from 5 sources (session → project → user → managed → default), supporting matching methods such as tool name, command mode, path prefix, etc. Plan Mode is switched to read-only mode through `prepareContextForPlanMode()` and automatically restored when exiting.
+  </Accordion>
+  <Accordion title="Context as Memory"">
+    System Prompt is dynamically assembled by `fetchSystemPromptParts()` and contains CLAUDE.md, git status, date, MCP server list. Auto-compact evaluates the token threshold before each iteration and triggers compaction when exceeded. The compressed summaries are replaced with the original messages via `buildPostCompactMessages()`, and `taskBudgetRemaining` is accumulated across compression boundaries.
+  </Accordion>
+</AccordionGroup>
+
+## Entrance and guidance
+
+| Entry | Files | Description |
+|------|------|------|
+| CLI startup | `src/entrypoints/cli.tsx` | Inject `feature()` polyfill (always returns false), MACRO global variable |
+| Command definition | `src/main.tsx` | Commander.js parses parameters and initializes auth/analytics/policy |
+| One-time initialization | `src/entrypoints/init.ts` | Telemetry configuration, trust dialog box |
+| Pipe mode | `src/main.tsx` `-p` flag | `echo "say hello" \| bun run dev -p` |

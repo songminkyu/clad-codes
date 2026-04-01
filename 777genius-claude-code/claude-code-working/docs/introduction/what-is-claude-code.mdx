@@ -1,0 +1,111 @@
+---
+title: "What is Claude Code - Terminal Native Agentic Coding System"
+description: "Claude Code is an agentic coding system that runs in the terminal. You can read code, modify files, run commands, and debug programs directly in your project directory. Understand its technical positioning, architectural differences, and core capabilities."
+keywords: ["Claude Code", "AI programming assistant", "Agentic Coding", "Terminal AI", "CLI AI"]
+og:image: "https://raw.githubusercontent.com/777genius/claude-code-working/main/docs/images/architecture-layers.png"
+---
+
+## One sentence definition
+
+Claude Code is an agentic coding system running in a local terminal. It's not a chatbot that gives advice - it reads code, changes files, runs commands, and debugs programs directly in your project directory, with full shell capabilities.
+
+## Technical positioning: terminal-native agentic system
+
+The key to understanding Claude Code lies in three words:
+
+| Positioning keywords | Meaning |
+|-----------|------|
+| **Terminal-native** | Native CLI application, not IDE plug-in, not web interface, not API wrapper |
+| **Agentic** | AI autonomous decision-making tool call chain, not a "question and answer" chat mode |
+| **Coding system** | For the whole process of software engineering, not a general Q&A tool |
+
+**Architectural level** differences from similar tools (not feature list):
+
+| Tools | Architecture Patterns | Run Location | Tool Execution |
+|------|----------|----------|----------|
+| **Claude Code** | Terminal-native agentic loop | Local process | Direct shell execution |
+| Cursor / Copilot | IDE-integrated autocomplete + chat | IDE in-process | LSP / IDE API |
+| Aider | CLI chat → git patch | local process | mainly file operations |
+| ChatGPT / Claude.ai | Cloud chat + artifacts | Browser/cloud | Sandbox container |
+
+Core difference: Claude Code has **full shell access** - which means it can do anything you can do in the terminal, but it also requires corresponding security mechanisms to restrict this ability.
+
+## End-to-end example: from input to output
+
+When you type `bun run dev There is a TypeScript error, help me fix it` in the terminal, what happens to the system?
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ 1. Entry layer (cli.tsx → main.tsx) │
+│ feature() = false, MACRO injection, start Commander.js CLI │
+├─────────────────────────────────────────────────────────┤
+│ 2. Interaction layer (REPL.tsx — React/Ink) │
+│ PromptInput captures user input → UserMessage joins the session │
+├─────────────────────────────────────────────────────────┤
+│ 3. Orchestration layer (QueryEngine.ts) │
+│Manage turn life cycle, token budget, compaction trigger │
+├─────────────────────────────────────────────────────────┤
+│ 4. Core loop (query.ts — Agentic Loop) │
+│ Assemble context → Call API → Collect streaming response → Call parsing tool │
+│ → Permission check → Execute tool → Result return → Call API again → Loop │
+├─────────────────────────────────────────────────────────┤
+│ 5. Tool execution (BashTool.call / FileEditTool.call / ...) │
+│ Actual execution: read files, run commands, search code... │
+├─────────────────────────────────────────────────────────┤
+│ 6. Communication layer (claude.ts → Anthropic API) │
+│ Streaming HTTP, supports Bedrock/Vertex/Azure multiple providers │
+└─────────────────────────────────────────────────────────┘
+```
+
+Specific to this error repair scenario, a typical agentic loop may include multiple rounds of tool calls:
+
+| Turn | AI Decision | Tool Call | Results |
+|------|---------|----------|------|
+| 1 | Look at the error message first | `Bash("bun run dev 2>&1 | head -30")` | TypeScript error output |
+| 2 | Locate the file | `Read("src/utils/foo.ts")` | Source code content |
+| 3 | Search for related type definitions | `Grep("interface Foo", "src/")` | Type definition location |
+| 4 | Fix code | `FileEdit(old, new)` | Code modified |
+| 5 | Verification and repair | `Bash("bun run dev 2>&1 | head -10")` | Compiled and passed |
+
+Each step is made by AI autonomously - it decides which tool to use, what parameters to pass, and when to stop. This is what "agentic" means.
+
+## What it is not
+
+- **Not an IDE plug-in**: no graphical interface, no dependency on VS Code or any IDE
+- **Not an API wrapper**: it has its own tooling system, permission model, context engineering, session management
+- **Not a chatbot**: The output is not plain text, but actual file modifications and command execution
+- **Not a brainless executor**: Every sensitive operation has permission check and user confirmation link
+
+## Start entry dissection
+
+The real code entry is `src/entrypoints/cli.tsx`, which does three key things:
+
+```typescript
+// 1. Inject runtime polyfill - feature() always returns false
+const feature = (_name: string) => false;
+
+// 2. Inject build-time macros
+globalThis.MACRO = { VERSION: "2.1.888", BUILD_TIME: ..., };
+
+// 3. Declare the build target
+globalThis.BUILD_TARGET = "external"; // External build (not internal to Anthropic)
+globalThis.BUILD_ENV = "production";
+globalThis.INTERFACE_TYPE = "stdio"; // Standard I/O interaction
+```
+
+Control flow is then passed to `src/main.tsx`:
+1. Commander.js parses command line parameters
+2. Initial authentication, telemetry, policy restrictions
+3. Load tool list (`getTools()`)
+4. Launch REPL (`launchRepl()`) or pipeline mode (`-p`)
+
+## Why choose terminal
+
+Terminals are not limitations, but choices. It brings unique capabilities:
+
+- **Full shell access**: can run any command line tool without writing plugins for each capability
+- **Project Native**: Work directly in the project directory, understand the file system structure and git status
+- **Composability**: Pipeline mode (`echo "..." | claude -p`) allows embedding CI/CD and automation processes
+- **Low Latency**: No Electron overhead, React/Ink rendered TUI is extremely responsive
+
+The price is that users need to adapt to the command line interface - but because of this, it attracts developers who need **real control of the development environment**.

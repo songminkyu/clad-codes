@@ -146,9 +146,43 @@ impl Tool for AgentTool {
             .unwrap_or_else(|| cc_core::constants::DEFAULT_MODEL.to_string());
 
         let system_prompt = params.system_prompt.unwrap_or_else(|| {
-            "You are a specialized AI agent helping with a specific sub-task. \
+            // Build the default system prompt, optionally augmented with
+            // agent definitions contributed by installed plugins.
+            let mut prompt = "You are a specialized AI agent helping with a specific sub-task. \
              Complete the task thoroughly and return your findings."
-                .to_string()
+                .to_string();
+
+            // Append plugin-contributed agent definitions so the sub-agent
+            // is aware of any specialised agents declared by plugins.
+            if let Some(registry) = cc_plugins::global_plugin_registry() {
+                let mut agent_defs = String::new();
+                for agent_dir in registry.all_agent_paths() {
+                    if let Ok(entries) = std::fs::read_dir(&agent_dir) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.extension().map_or(false, |e| e == "md") {
+                                if let Ok(content) = std::fs::read_to_string(&p) {
+                                    let name = p
+                                        .file_stem()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("agent");
+                                    agent_defs.push_str(&format!(
+                                        "\n\n## Agent: {}\n{}",
+                                        name,
+                                        content.trim()
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                if !agent_defs.is_empty() {
+                    prompt.push_str("\n\nThe following specialized agents are available:");
+                    prompt.push_str(&agent_defs);
+                }
+            }
+
+            prompt
         });
 
         let query_config = QueryConfig {
@@ -162,6 +196,10 @@ impl Tool for AgentTool {
             working_directory: Some(ctx.working_dir.display().to_string()),
             thinking_budget: None,
             temperature: None,
+            tool_result_budget: 50_000,
+            effort_level: None,
+            command_queue: None,
+            skill_index: None,
         };
 
         // Run the sub-agent loop.
@@ -177,6 +215,7 @@ impl Tool for AgentTool {
             ctx.cost_tracker.clone(),
             None, // no event forwarding for sub-agents
             cancel,
+            None, // no pending message queue for sub-agents
         )
         .await;
 

@@ -1,0 +1,151 @@
+---
+title: "Plan Mode - Plan Mode’s safety mechanism of seeing first and acting later"
+description: "Complete implementation of Claude Code Plan Mode based on source code analysis: tool design of EnterPlanModeTool/ExitPlanModeV2Tool, permission context switching mechanism, Prompt-based permission request, plan file persistence, Teammate approval process."
+keywords: ["Plan Mode", "Plan Mode", "EnterPlanMode", "ExitPlanMode", "prepareContextForPlanMode", "allowedPrompts"]
+---
+
+{/* The goal of this chapter: reveal the complete implementation of Plan Mode based on source code */}
+
+## Problem Scenario
+
+You say "refactor this module" and the AI immediately starts changing the code - but you haven't figured out how it plans to change it yet. By the time I realized halfway through the change that the direction was wrong, it was already too late.
+
+## Solution for Plan Mode
+
+Planning mode adds a "read-only phase" to the conversation, closing the loop through two tools:
+
+<Steps>
+  <Step title="EnterPlanMode — Enter plan mode">
+    AI autonomously determines (or user-triggered) tasks need to be planned and calls `EnterPlanModeTool` (`src/tools/EnterPlanModeTool/EnterPlanModeTool.ts:36`). This tool requires **user approval** (`checkPermissions` returns `ask`).
+  </Step>
+  <Step title="Exploration Phase — Read-Only Toolset">
+    When the permission mode is switched to `'plan'`, AI can only use tools (Read, Grep, Glob, Agent, etc.) with `isReadOnly()` set to true. Write operations are automatically rejected.
+  </Step>
+  <Step title="ExitPlanMode — Submit plan for approval">
+    After the AI completes exploration, it calls `ExitPlanModeV2Tool` (`src/tools/ExitPlanModeTool/ExitPlanModeV2Tool.ts:147`) to submit the plan file to the user for review. This is the second node that requires user approval.
+  </Step>
+  <Step title="Resume Execution — All Tool Permissions">
+    After the user approves, the permission mode is restored to its pre-entry state and the AI executes as planned.
+  </Step>
+</Steps>
+
+## Automatic narrowing and recovery of permissions
+
+### Enter: `prepareContextForPlanMode()`
+
+Core logic of `EnterPlanModeTool.call()` (line 77):
+
+```typescript
+// 1. Record the conversion status (save the previous mode)
+handlePlanModeTransition(currentMode, 'plan')
+
+// 2. Switch the permission context to plan mode
+context.setAppState(prev => ({
+  ...prev,
+  toolPermissionContext: applyPermissionUpdate(
+    prepareContextForPlanMode(prev.toolPermissionContext),
+    { type: 'setMode', mode: 'plan', destination: 'session' },
+  ),
+}))
+```
+
+What `prepareContextForPlanMode()` (`src/utils/permissions/permissionSetup.ts`) does:
+- Create a new `ToolPermissionContext` with `mode` set to `'plan'`
+- In plan mode, the tool's `isReadOnly()` check becomes the only admission condition
+- Also activates the classifier side-effect if the user's default mode is `'auto'`
+
+### Exit: permission restoration + Prompt-based permissions
+
+The exit logic of `ExitPlanModeV2Tool` does two key things:
+
+**1. Restore permission mode**
+
+Revert to the previous mode via `handlePlanModeTransition()` and `applyPermissionUpdate()`.
+
+**2. Inject Prompt-based permissions**
+
+This is the most ingenious design of Plan Mode - AI can declare the types of commands it needs to execute in the plan:
+
+```typescript
+// inputSchema of ExitPlanModeV2Tool
+allowedPrompts: z.array(z.object({
+  tool: z.enum(['Bash']),
+  prompt: z.string().describe('Semantic description, e.g. "run tests"'),
+})).optional()
+```
+
+When AI submits a plan, if `allowedPrompts: [{ tool: 'Bash', prompt: 'run tests' }]` is declared, Bash commands such as "run tests" will be automatically allowed after user approval - no need to confirm one by one.
+
+## Persistence of plan files
+
+The plan content is written to the disk file (the path is determined by `getPlanFilePath()`), which is essentially different from a simple "AI says something and then starts execution":
+
+1. `normalizeToolInput` of `ExitPlanModeV2Tool` reads the plan content from disk and injects it into `input.plan` and `input.planFilePath`
+2. The plan document is **editable** by the user - the user can modify the AI plan before approval
+3. The `planWasEdited` field marks whether the user has modified the plan, which affects the subsequent tool_result echo.
+4. `persistFileSnapshotIfRemote()` saves file snapshot in remote scenario
+
+## Plan approval in Teammate scenario
+
+In Agent Swarms (`isAgentSwarmsEnabled()`) mode, there are additional collaboration processes for plan approval:
+
+```typescript
+// If it is a Teammate role
+if (isTeammate()) {
+  //Send the plan to the Team Leader's mailbox for approval
+  const requestId = generateRequestId()
+  writeToMailbox(getTeamName(), {
+    type: 'plan_approval_request',
+    plan, requestId, ...
+  })
+  // Return awaitingLeaderApproval: true
+  // Team Leader notifies Teammate through mailbox after approval
+}
+```
+
+This means that in swarm mode, plans may not be approved by direct users, but by the Team Leader.
+
+## When to use planning mode
+
+`EnterPlanModeTool`'s Prompt (`src/tools/EnterPlanModeTool/prompt.ts`) defines two sets of triggering criteria - the outer version is more aggressive (encourages planning), the inner version is more restrained (used only when really vague):
+
+| Scenario | External version | Internal version |
+|------|---------|---------|
+| Fix typo | Skip | Skip |
+| Add delete button | **Enter** (involving multiple files) | **Skip** (clear path) |
+| Refactoring the authentication system | **Enter** | **Enter** (high impact refactoring) |
+| "Start doing X" | — | **Skip** (start directly) |
+| Architectural Decisions (Redis vs Memcache) | **Go** | **Go** (really vague) |
+
+## Plan mode + task system
+
+Planning mode is often used in conjunction with the task system:
+
+1. In planning mode, AI creates implementation steps as task lists (`TodoWrite`)
+2. User approval plan (including task list)
+3. After exiting the planning mode, the AI executes the task list one by one.
+4. Users can track progress through task lists
+
+## Complete life cycle
+
+```
+User: "Refactor this module"
+  ↓
+AI determines that planning is needed → call EnterPlanModeTool
+  ↓ User Approval (Ask Dialog)
+handlePlanModeTransition(default, 'plan') // save default
+prepareContextForPlanMode() // Create a read-only context
+  ↓
+AI uses Read/Grep/Glob/Agent to explore the code base
+  ↓ (possibly 10+ rounds of read-only tool calls)
+AI formation plan → call ExitPlanModeV2Tool({
+  allowedPrompts: [
+    { tool: 'Bash', prompt: 'run tests' },
+    { tool: 'Bash', prompt: 'install dependencies' }
+  ]
+})
+  ↓ User approval plan (editable plan file)
+Restore permission mode → inject prompt-based permissions
+  ↓
+AI uses all tools to execute the plan, and commands such as "run tests" are automatically released
+```

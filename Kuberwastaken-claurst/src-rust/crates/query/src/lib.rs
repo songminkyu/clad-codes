@@ -10,14 +10,29 @@
 
 pub mod agent_tool;
 pub mod auto_dream;
+pub mod away_summary;
+pub mod command_queue;
 pub mod compact;
+pub mod context_analyzer;
 pub mod coordinator;
 pub mod cron_scheduler;
+pub mod session_memory;
+pub mod skill_prefetch;
 pub use agent_tool::AgentTool;
+pub use command_queue::{CommandPriority, CommandQueue, QueuedCommand, drain_command_queue};
 pub use cron_scheduler::start_cron_scheduler;
+pub use skill_prefetch::{
+    SkillDefinition, SkillIndex, SharedSkillIndex, prefetch_skills, format_skill_listing,
+};
 pub use compact::{
-    AutoCompactState, TokenWarningState, auto_compact_if_needed, calculate_token_warning_state,
-    compact_conversation, context_window_for_model, should_auto_compact,
+    AutoCompactState, CompactResult, CompactTrigger, MicroCompactConfig, MessageGroup, TokenWarningState,
+    auto_compact_if_needed, calculate_messages_to_keep_index, calculate_token_warning_state,
+    compact_conversation, context_collapse, context_window_for_model, format_compact_summary,
+    get_compact_prompt, group_messages_for_compact, micro_compact_if_needed,
+    reactive_compact, should_auto_compact, should_compact, should_context_collapse, snip_compact,
+};
+pub use session_memory::{
+    ExtractedMemory, MemoryCategory, SessionMemoryExtractor, SessionMemoryState,
 };
 
 use cc_api::{
@@ -64,6 +79,28 @@ pub struct QueryConfig {
     pub working_directory: Option<String>,
     pub thinking_budget: Option<u32>,
     pub temperature: Option<f32>,
+    /// Maximum cumulative character count of all tool results in the message
+    /// history before older results are replaced with a truncation notice.
+    /// Mirrors the TS `applyToolResultBudget` mechanism.  Default: 50_000.
+    pub tool_result_budget: usize,
+    /// Optional effort level.  When set and `thinking_budget` is `None`,
+    /// the effort level's `thinking_budget_tokens()` is used as the
+    /// thinking budget.  Also provides a temperature override when the
+    /// level specifies one.
+    pub effort_level: Option<cc_core::effort::EffortLevel>,
+    /// T1-4: Optional shared command queue.
+    ///
+    /// When set, the query loop drains this queue before each API call and
+    /// injects any resulting messages into the conversation.  The queue is
+    /// shared (Arc-backed) so the TUI input thread can push commands while the
+    /// loop is waiting for a model response.
+    pub command_queue: Option<CommandQueue>,
+    /// T1-5: Optional shared skill index.
+    ///
+    /// When set, `prefetch_skills` is spawned once before the loop begins and
+    /// the resulting index is used to inject a skill listing attachment into
+    /// the conversation context.
+    pub skill_index: Option<SharedSkillIndex>,
 }
 
 impl Default for QueryConfig {
@@ -79,6 +116,10 @@ impl Default for QueryConfig {
             working_directory: None,
             thinking_budget: None,
             temperature: None,
+            tool_result_budget: 50_000,
+            effort_level: None,
+            command_queue: None,
+            skill_index: None,
         }
     }
 }
@@ -109,21 +150,249 @@ pub enum QueryEvent {
     /// A tool has finished executing.
     ToolEnd { tool_name: String, tool_id: String, result: String, is_error: bool },
     /// The model finished a turn.
-    TurnComplete { turn: u32, stop_reason: String },
+    TurnComplete { turn: u32, stop_reason: String, usage: Option<UsageInfo> },
     /// An informational status message.
     Status(String),
     /// An error.
     Error(String),
+    /// Token usage has crossed a warning threshold.
+    /// `state` is Warning (≥ 80 %) or Critical (≥ 95 %).
+    /// `pct_used` is the fraction of the context window consumed (0.0–1.0).
+    TokenWarning { state: TokenWarningState, pct_used: f64 },
+}
+
+// ---------------------------------------------------------------------------
+// T1-3: Post-sampling hooks
+// ---------------------------------------------------------------------------
+
+/// Result returned by `fire_post_sampling_hooks`.
+#[derive(Debug, Default)]
+pub struct PostSamplingHookResult {
+    /// Error messages produced by hooks with non-zero exit codes.
+    /// These are injected into the conversation as user messages before the
+    /// next model turn so the model can react to them.
+    pub blocking_errors: Vec<cc_core::types::Message>,
+    /// When `true` the query loop must not continue and should surface the
+    /// error messages to the caller.  Set when any hook exits with code > 1.
+    pub prevent_continuation: bool,
+}
+
+/// Execute all `PostModelTurn` hooks defined in `config.hooks`.
+///
+/// Each hook is run synchronously (blocking via `std::process::Command`).
+/// On a non-zero exit code, the hook's stderr (falling back to stdout) is
+/// wrapped in a user `Message` and appended to `blocking_errors`.
+/// If the exit code is **strictly greater than 1** `prevent_continuation` is
+/// set so the query loop can return early.
+pub fn fire_post_sampling_hooks(
+    _turn_result: &cc_core::types::Message,
+    config: &cc_core::config::Config,
+) -> PostSamplingHookResult {
+    use cc_core::config::HookEvent;
+    use cc_core::types::Message;
+
+    let mut result = PostSamplingHookResult::default();
+
+    let entries = match config.hooks.get(&HookEvent::PostModelTurn) {
+        Some(e) => e,
+        None => return result,
+    };
+
+    for entry in entries {
+        let sh = if cfg!(windows) { "cmd" } else { "sh" };
+        let flag = if cfg!(windows) { "/C" } else { "-c" };
+
+        let output = match std::process::Command::new(sh)
+            .args([flag, &entry.command])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(command = %entry.command, error = %e, "PostModelTurn hook spawn failed");
+                continue;
+            }
+        };
+
+        if output.status.success() {
+            continue;
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let body = if !stderr.trim().is_empty() { stderr } else { stdout };
+
+        tracing::warn!(
+            command = %entry.command,
+            exit_code = ?output.status.code(),
+            "PostModelTurn hook returned non-zero exit"
+        );
+
+        result.blocking_errors.push(Message::user(format!(
+            "[Hook '{}' error]:\n{}",
+            entry.command,
+            body.trim()
+        )));
+
+        // Exit code > 1 → hard veto of continuation.
+        if output.status.code().unwrap_or(1) > 1 {
+            result.prevent_continuation = true;
+        }
+    }
+
+    result
+}
+
+/// Spawn all `Stop` hooks in fire-and-forget background tasks.
+///
+/// Stop hooks are non-blocking by design: the caller does not wait for them.
+/// Returns an empty `Vec` immediately; results (if any) are lost.
+pub fn stop_hooks_with_full_behavior(
+    turn_result: &cc_core::types::Message,
+    config: &cc_core::config::Config,
+    working_dir: std::path::PathBuf,
+) -> Vec<cc_core::types::Message> {
+    use cc_core::config::HookEvent;
+
+    let entries = match config.hooks.get(&HookEvent::Stop) {
+        Some(e) if !e.is_empty() => e.clone(),
+        _ => return Vec::new(),
+    };
+
+    let output_text = turn_result.get_all_text();
+
+    for entry in entries {
+        let cmd = entry.command.clone();
+        let dir = working_dir.clone();
+        let text = output_text.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let sh = if cfg!(windows) { "cmd" } else { "sh" };
+            let flag = if cfg!(windows) { "/C" } else { "-c" };
+
+            let _ = std::process::Command::new(sh)
+                .args([flag, &cmd])
+                .current_dir(&dir)
+                .env("CLAUDE_HOOK_OUTPUT", &text)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        });
+    }
+
+    Vec::new()
+}
+
+// ---------------------------------------------------------------------------
+// Tool-result budgeting
+// ---------------------------------------------------------------------------
+
+/// Return the combined character count of all tool-result content blocks found
+/// in `messages`.  Only user messages are examined (tool results always live
+/// in user turns).
+fn total_tool_result_chars(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .filter(|m| m.role == cc_core::types::Role::User)
+        .flat_map(|m| match &m.content {
+            cc_core::types::MessageContent::Blocks(blocks) => blocks.as_slice(),
+            _ => &[],
+        })
+        .filter_map(|b| {
+            if let ContentBlock::ToolResult { content, .. } = b {
+                Some(match content {
+                    ToolResultContent::Text(t) => t.len(),
+                    ToolResultContent::Blocks(blocks) => blocks.iter().map(|b| {
+                        if let ContentBlock::Text { text } = b { text.len() } else { 0 }
+                    }).sum(),
+                })
+            } else {
+                None
+            }
+        })
+        .sum()
+}
+
+/// When the cumulative tool-result content exceeds `budget` characters, walk
+/// the message list from oldest to newest and replace individual
+/// `ToolResult` content with a placeholder until the running total is back
+/// under budget.  Returns the (possibly modified) message list and the
+/// number of results that were truncated.
+///
+/// Mirrors the spirit of the TypeScript `applyToolResultBudget` /
+/// `enforceToolResultBudget` logic, simplified to a straightforward
+/// oldest-first eviction without the session-persistence layer.
+fn apply_tool_result_budget(messages: Vec<Message>, budget: usize) -> (Vec<Message>, usize) {
+    let total = total_tool_result_chars(&messages);
+    if total <= budget {
+        return (messages, 0);
+    }
+
+    let mut to_shed = total - budget;
+    let mut truncated = 0usize;
+    let mut result = messages;
+
+    'outer: for msg in result.iter_mut() {
+        if msg.role != cc_core::types::Role::User {
+            continue;
+        }
+        let blocks = match &mut msg.content {
+            cc_core::types::MessageContent::Blocks(b) => b,
+            _ => continue,
+        };
+        for block in blocks.iter_mut() {
+            if let ContentBlock::ToolResult { content, .. } = block {
+                let size = match &*content {
+                    ToolResultContent::Text(t) => t.len(),
+                    ToolResultContent::Blocks(inner) => inner.iter().map(|b| {
+                        if let ContentBlock::Text { text } = b { text.len() } else { 0 }
+                    }).sum(),
+                };
+                if size == 0 {
+                    continue;
+                }
+                *content = ToolResultContent::Text(
+                    "[tool result truncated to save context]".to_string(),
+                );
+                truncated += 1;
+                if size > to_shed {
+                    break 'outer;
+                }
+                to_shed -= size;
+            }
+        }
+    }
+
+    (result, truncated)
 }
 
 // ---------------------------------------------------------------------------
 // Query loop
 // ---------------------------------------------------------------------------
 
+/// Maximum number of max_tokens continuation attempts before surfacing the
+/// partial response.  Mirrors `MAX_OUTPUT_TOKENS_RECOVERY_LIMIT` in query.ts.
+const MAX_TOKENS_RECOVERY_LIMIT: u32 = 3;
+
+/// Message injected when the model hits its output-token limit.
+/// Mirrors the TS recovery message in query.ts lines 1224-1228.
+const MAX_TOKENS_RECOVERY_MSG: &str =
+    "Output token limit hit. Resume directly — no apology, no recap of what \
+     you were doing. Pick up mid-thought if that is where the cut happened. \
+     Break remaining work into smaller pieces.";
+
 /// Run the agentic query loop.
 ///
 /// This sends the conversation to the API, handles tool calls in a loop, and
 /// returns when the model issues an end_turn or an error/limit is hit.
+///
+/// `pending_messages` is an optional queue of user messages that were enqueued
+/// during tool execution (e.g. by the UI or a command queue).  Each string is
+/// appended as a plain user message between turns.  Callers that do not need
+/// command queuing may pass `None` or an empty `Vec`.
 pub async fn run_query_loop(
     client: &cc_api::AnthropicClient,
     messages: &mut Vec<Message>,
@@ -133,12 +402,19 @@ pub async fn run_query_loop(
     cost_tracker: Arc<CostTracker>,
     event_tx: Option<mpsc::UnboundedSender<QueryEvent>>,
     cancel_token: tokio_util::sync::CancellationToken,
+    mut pending_messages: Option<&mut Vec<String>>,
 ) -> QueryOutcome {
     let mut turn = 0u32;
     let mut compact_state = compact::AutoCompactState::default();
+    // Tracks how many consecutive max_tokens recoveries we've attempted so
+    // we don't loop forever on a model that can't finish within any budget.
+    let mut max_tokens_recovery_count: u32 = 0;
 
     loop {
         turn += 1;
+        tool_ctx
+            .current_turn
+            .store(turn as usize, std::sync::atomic::Ordering::Relaxed);
         if turn > config.max_turns {
             info!(turns = turn, "Max turns reached");
             if let Some(ref tx) = event_tx {
@@ -163,6 +439,56 @@ pub async fn run_query_loop(
             return QueryOutcome::Cancelled;
         }
 
+        // Drain any pending user messages that were queued during the previous
+        // tool-execution phase (e.g. commands entered while tools ran).
+        // Mirrors the TS `messageQueueManager` drain between turns.
+        if let Some(queue) = pending_messages.as_deref_mut() {
+            for text in queue.drain(..) {
+                debug!("Injecting pending message: {}", &text);
+                messages.push(Message::user(text));
+            }
+        }
+
+        // T1-4: Drain the priority command queue (if wired up) and prepend any
+        // resulting messages to the conversation before the API call.
+        // Mirrors the TS `messageQueueManager` priority-queue drain.
+        if let Some(ref cq) = config.command_queue {
+            if !cq.is_empty() {
+                let injected = drain_command_queue(cq);
+                if !injected.is_empty() {
+                    debug!(count = injected.len(), "Injecting command-queue messages");
+                    // Prepend so that higher-priority commands appear first.
+                    let tail = std::mem::take(messages);
+                    messages.extend(injected);
+                    messages.extend(tail);
+                }
+            }
+        }
+
+        // Apply tool-result budget: if the cumulative size of all tool results
+        // in the conversation exceeds the configured threshold, replace the
+        // oldest results with a placeholder until we're back under budget.
+        // This mirrors the TS `applyToolResultBudget` call in query.ts.
+        if config.tool_result_budget > 0 {
+            let (budgeted, truncated) =
+                apply_tool_result_budget(std::mem::take(messages), config.tool_result_budget);
+            *messages = budgeted;
+            if truncated > 0 {
+                info!(
+                    truncated,
+                    budget = config.tool_result_budget,
+                    "Tool-result budget exceeded: truncated {} result(s)",
+                    truncated
+                );
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(QueryEvent::Status(format!(
+                        "[{} older tool result(s) truncated to save context]",
+                        truncated
+                    )));
+                }
+            }
+        }
+
         // Build API request
         let api_messages: Vec<ApiMessage> = messages.iter().map(ApiMessage::from).collect();
         let api_tools: Vec<ApiToolDefinition> = tools
@@ -177,8 +503,16 @@ pub async fn run_query_loop(
             .system(system)
             .tools(api_tools);
 
-        // Only enable extended thinking if an explicit budget was provided.
-        if let Some(budget) = config.thinking_budget {
+        // Resolve effective thinking budget:
+        //   1. Explicit `thinking_budget` in config takes precedence.
+        //   2. Fall back to the effort level's budget when no explicit budget is set.
+        let effective_thinking_budget = config.thinking_budget.or_else(|| {
+            config
+                .effort_level
+                .and_then(|el| el.thinking_budget_tokens())
+        });
+
+        if let Some(budget) = effective_thinking_budget {
             req_builder = req_builder.thinking(ThinkingConfig::enabled(budget));
         }
 
@@ -246,9 +580,125 @@ pub async fn run_query_loop(
 
         let stop = stop_reason.as_deref().unwrap_or("end_turn");
 
+        // T1-3: Fire PostModelTurn hooks after the model samples a response.
+        // Hooks can inject blocking errors or veto continuation entirely.
+        {
+            let hook_result = fire_post_sampling_hooks(&assistant_msg, &tool_ctx.config);
+            if !hook_result.blocking_errors.is_empty() {
+                if hook_result.prevent_continuation {
+                    // Hard veto: push the errors into the conversation and abort.
+                    for err_msg in hook_result.blocking_errors {
+                        messages.push(err_msg);
+                    }
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::Status(
+                            "PostModelTurn hook vetoed continuation.".to_string(),
+                        ));
+                    }
+                    let last = messages
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| Message::assistant("Hook blocked continuation."));
+                    return QueryOutcome::EndTurn {
+                        message: last,
+                        usage,
+                    };
+                }
+                // Soft errors: inject them so the model can react next turn.
+                for err_msg in hook_result.blocking_errors {
+                    debug!("PostModelTurn hook injecting error message");
+                    messages.push(err_msg);
+                }
+            }
+        }
+
+        // Emit token warning events when approaching context limits.
+        // Thresholds mirror TypeScript autoCompact.ts: 80% → Warning, 95% → Critical.
+        {
+            let warning_state =
+                compact::calculate_token_warning_state(usage.input_tokens, &config.model);
+            if warning_state != compact::TokenWarningState::Ok {
+                if let Some(ref tx) = event_tx {
+                    let window = compact::context_window_for_model(&config.model);
+                    let pct_used = usage.input_tokens as f64 / window as f64;
+                    let _ = tx.send(QueryEvent::TokenWarning {
+                        state: warning_state,
+                        pct_used,
+                    });
+                }
+            }
+        }
+
         // Auto-compact: if context is near-full, summarise older messages now
         // (before the next turn's API call would fail with prompt-too-long).
-        if stop == "end_turn" || stop == "tool_use" {
+        //
+        // Reactive compact (T1-1): when the CLAUDE_REACTIVE_COMPACT feature gate
+        // is enabled, we replace the proactive auto-compact path with reactive
+        // compact / context-collapse instead. This fires on every streaming turn
+        // so it can act before a prompt-too-long error is returned by the API.
+        //
+        // Feature gate check: CLAUDE_CODE_FEATURE_REACTIVE_COMPACT=1
+        let reactive_compact_enabled =
+            cc_core::feature_gates::is_feature_enabled("reactive_compact");
+
+        if reactive_compact_enabled {
+            // Reactive path: emergency collapse takes priority over normal compact.
+            let context_limit = compact::context_window_for_model(&config.model);
+            if compact::should_context_collapse(usage.input_tokens, context_limit) {
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(QueryEvent::Status(
+                        "Compacting context... (emergency collapse)".to_string(),
+                    ));
+                }
+                match compact::context_collapse(
+                    std::mem::take(messages),
+                    client,
+                    config,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        *messages = result.messages;
+                        info!(
+                            tokens_freed = result.tokens_freed,
+                            "Context-collapse complete"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Context-collapse failed");
+                        // Put messages back on failure (mem::take drained them).
+                        // We can't recover them here — re-run auto-compact as fallback.
+                    }
+                }
+            } else if compact::should_compact(usage.input_tokens, context_limit) {
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(QueryEvent::Status("Compacting context...".to_string()));
+                }
+                match compact::reactive_compact(
+                    std::mem::take(messages),
+                    client,
+                    config,
+                    cancel_token.clone(),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        *messages = result.messages;
+                        info!(
+                            tokens_freed = result.tokens_freed,
+                            "Reactive compact complete"
+                        );
+                    }
+                    Err(cc_core::error::ClaudeError::Cancelled) => {
+                        warn!("Reactive compact was cancelled");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Reactive compact failed");
+                    }
+                }
+            }
+        } else if stop == "end_turn" || stop == "tool_use" {
+            // Proactive auto-compact (original path, used when reactive compact is off).
             if let Some(new_msgs) = compact::auto_compact_if_needed(
                 client,
                 messages,
@@ -271,6 +721,7 @@ pub async fn run_query_loop(
             let _ = tx.send(QueryEvent::TurnComplete {
                 turn,
                 stop_reason: stop.to_string(),
+                usage: Some(usage.clone()),
             });
         }
 
@@ -298,18 +749,114 @@ pub async fn run_query_loop(
         match stop {
             "end_turn" => {
                 fire_stop_hook!(assistant_msg);
+
+                // T1-3: Fire Stop hooks in background (fire-and-forget).
+                // `stop_hooks_with_full_behavior` spawns blocking tasks internally
+                // and returns immediately with an empty Vec.
+                let _bg = stop_hooks_with_full_behavior(
+                    &assistant_msg,
+                    &tool_ctx.config,
+                    tool_ctx.working_dir.clone(),
+                );
+
+                // Asynchronously extract and persist session memories if warranted.
+                // Runs in a detached Tokio task so it doesn't block the query loop.
+                if session_memory::SessionMemoryExtractor::should_extract(messages) {
+                    let model_clone = config.model.clone();
+                    let messages_clone = messages.clone();
+                    let working_dir_clone = tool_ctx.working_dir.clone();
+
+                    // Build a fresh client using the same API key.  This avoids
+                    // requiring an Arc in the existing run_query_loop signature.
+                    if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
+                        if !api_key.is_empty() {
+                            if let Ok(sm_client) = cc_api::AnthropicClient::new(
+                                cc_api::client::ClientConfig {
+                                    api_key,
+                                    ..Default::default()
+                                },
+                            ) {
+                                let sm_client = std::sync::Arc::new(sm_client);
+                                tokio::spawn(async move {
+                                    let extractor =
+                                        session_memory::SessionMemoryExtractor::new(&model_clone);
+                                    match extractor
+                                        .extract(&messages_clone, &working_dir_clone, &sm_client)
+                                        .await
+                                    {
+                                        Ok(memories) if !memories.is_empty() => {
+                                            let target = working_dir_clone
+                                                .join(".claude")
+                                                .join("CLAUDE.md");
+                                            if let Err(e) =
+                                                session_memory::SessionMemoryExtractor::persist(
+                                                    &memories, &target,
+                                                )
+                                                .await
+                                            {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "Failed to persist session memories"
+                                                );
+                                            }
+                                        }
+                                        Ok(_) => {} // no memories extracted
+                                        Err(e) => {
+                                            tracing::debug!(
+                                                error = %e,
+                                                "Session memory extraction failed (non-fatal)"
+                                            );
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+
                 return QueryOutcome::EndTurn {
                     message: assistant_msg,
                     usage,
                 };
             }
             "max_tokens" => {
+                // Mirror the TS recovery loop: inject a continuation nudge and
+                // retry up to MAX_TOKENS_RECOVERY_LIMIT times before surfacing
+                // the partial response as QueryOutcome::MaxTokens.
+                if max_tokens_recovery_count < MAX_TOKENS_RECOVERY_LIMIT {
+                    max_tokens_recovery_count += 1;
+                    warn!(
+                        attempt = max_tokens_recovery_count,
+                        limit = MAX_TOKENS_RECOVERY_LIMIT,
+                        "max_tokens hit — injecting continuation message (attempt {}/{})",
+                        max_tokens_recovery_count,
+                        MAX_TOKENS_RECOVERY_LIMIT,
+                    );
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::Status(format!(
+                            "Output token limit hit — continuing (attempt {}/{})",
+                            max_tokens_recovery_count, MAX_TOKENS_RECOVERY_LIMIT
+                        )));
+                    }
+                    // The partial assistant message must be in the history so
+                    // the continuation makes sense to the model.
+                    messages.push(Message::user(MAX_TOKENS_RECOVERY_MSG));
+                    continue;
+                }
+                // Recovery exhausted — surface the partial response.
+                warn!(
+                    "max_tokens recovery exhausted after {} attempts",
+                    MAX_TOKENS_RECOVERY_LIMIT
+                );
                 return QueryOutcome::MaxTokens {
                     partial_message: assistant_msg,
                     usage,
                 };
             }
             "tool_use" => {
+                // A completed tool-use turn counts as a successful recovery
+                // boundary; reset the max_tokens retry counter.
+                max_tokens_recovery_count = 0;
                 // Extract tool calls and execute them
                 let tool_blocks = assistant_msg.get_tool_use_blocks();
                 if tool_blocks.is_empty() {
@@ -349,9 +896,16 @@ pub async fn run_query_loop(
                         )
                         .await;
 
+                        // Also run plugin PreToolUse hooks (stored in global static).
+                        let plugin_pre_outcome =
+                            cc_plugins::run_global_pre_tool_hook(&name, &input);
+
                         let result = if let cc_core::hooks::HookOutcome::Blocked(reason) = pre_outcome {
                             warn!(tool = name, reason = %reason, "PreToolUse hook blocked execution");
                             cc_tools::ToolResult::error(format!("Blocked by hook: {}", reason))
+                        } else if let cc_plugins::HookOutcome::Deny(reason) = plugin_pre_outcome {
+                            warn!(tool = name, reason = %reason, "Plugin PreToolUse hook blocked execution");
+                            cc_tools::ToolResult::error(format!("Blocked by plugin hook: {}", reason))
                         } else {
                             execute_tool(&name, &input, tools, tool_ctx).await
                         };
@@ -372,6 +926,14 @@ pub async fn run_query_loop(
                             &tool_ctx.working_dir,
                         )
                         .await;
+
+                        // Also run plugin PostToolUse hooks.
+                        cc_plugins::run_global_post_tool_hook(
+                            &name,
+                            &input,
+                            &result.content,
+                            result.is_error,
+                        );
 
                         if let Some(ref tx) = event_tx {
                             let _ = tx.send(QueryEvent::ToolEnd {
@@ -398,6 +960,11 @@ pub async fn run_query_loop(
             }
             "stop_sequence" => {
                 fire_stop_hook!(assistant_msg);
+                let _bg = stop_hooks_with_full_behavior(
+                    &assistant_msg,
+                    &tool_ctx.config,
+                    tool_ctx.working_dir.clone(),
+                );
                 return QueryOutcome::EndTurn {
                     message: assistant_msg,
                     usage,
@@ -406,6 +973,11 @@ pub async fn run_query_loop(
             other => {
                 warn!(stop_reason = other, "Unknown stop reason, treating as end_turn");
                 fire_stop_hook!(assistant_msg);
+                let _bg = stop_hooks_with_full_behavior(
+                    &assistant_msg,
+                    &tool_ctx.config,
+                    tool_ctx.working_dir.clone(),
+                );
                 return QueryOutcome::EndTurn {
                     message: assistant_msg,
                     usage,
@@ -487,6 +1059,10 @@ mod tests {
             working_directory: None,
             thinking_budget: None,
             temperature: None,
+            tool_result_budget: 50_000,
+            effort_level: None,
+            command_queue: None,
+            skill_index: None,
         }
     }
 

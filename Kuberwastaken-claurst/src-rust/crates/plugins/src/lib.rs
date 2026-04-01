@@ -9,6 +9,7 @@
 pub mod hooks;
 pub mod loader;
 pub mod manifest;
+pub mod marketplace;
 pub mod plugin;
 pub mod registry;
 
@@ -25,6 +26,120 @@ pub use plugin::{
 pub use registry::PluginRegistry;
 
 use std::path::Path;
+use std::sync::OnceLock;
+
+// ---------------------------------------------------------------------------
+// Global hook registry (set once at startup, read during tool execution)
+// ---------------------------------------------------------------------------
+
+static GLOBAL_HOOK_REGISTRY: OnceLock<HookRegistry> = OnceLock::new();
+
+// ---------------------------------------------------------------------------
+// Global plugin registry (set once at startup, read by commands / tools)
+// ---------------------------------------------------------------------------
+
+static GLOBAL_PLUGIN_REGISTRY: OnceLock<PluginRegistry> = OnceLock::new();
+
+/// Store the fully-loaded `PluginRegistry` into a process-global static so
+/// that slash commands and tools can query it without carrying the registry
+/// through every call frame.
+pub fn set_global_registry(registry: PluginRegistry) {
+    // OnceLock::set fails silently if already initialised (e.g. during tests).
+    let _ = GLOBAL_PLUGIN_REGISTRY.set(registry);
+}
+
+/// Access the global `PluginRegistry`, if it has been set.
+pub fn global_plugin_registry() -> Option<&'static PluginRegistry> {
+    GLOBAL_PLUGIN_REGISTRY.get()
+}
+
+/// Store the hook registry built from loaded plugins into a process-global
+/// static so that `run_global_pre_tool_hook` / `run_global_post_tool_hook`
+/// can access it from anywhere without passing the registry around.
+pub fn set_global_hooks(registry: HookRegistry) {
+    // OnceLock::set fails silently if already initialised (e.g. during tests).
+    let _ = GLOBAL_HOOK_REGISTRY.set(registry);
+}
+
+/// Run all `PreToolUse` hooks registered by plugins for the given tool.
+///
+/// Returns `HookOutcome::Deny` if any blocking hook returns a non-zero exit
+/// code, otherwise `HookOutcome::Allow`.
+pub fn run_global_pre_tool_hook(
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) -> hooks::HookOutcome {
+    let registry = match GLOBAL_HOOK_REGISTRY.get() {
+        Some(r) => r,
+        None => return hooks::HookOutcome::Allow,
+    };
+
+    let event_key = HookEventKind::PreToolUse.to_string();
+    let hooks_for_event = match registry.get(&event_key) {
+        Some(h) => h,
+        None => return hooks::HookOutcome::Allow,
+    };
+
+    let event_json = serde_json::json!({
+        "event": "PreToolUse",
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+    })
+    .to_string();
+
+    for hook in hooks_for_event {
+        // Apply matcher filter if present
+        if let Some(ref matcher) = hook.matcher {
+            if !matcher.is_empty() && matcher != tool_name && matcher != "*" {
+                continue;
+            }
+        }
+        match hooks::run_hook_sync(hook, &event_json) {
+            hooks::HookOutcome::Deny(reason) => return hooks::HookOutcome::Deny(reason),
+            hooks::HookOutcome::Allow | hooks::HookOutcome::Error(_) => {}
+        }
+    }
+
+    hooks::HookOutcome::Allow
+}
+
+/// Run all `PostToolUse` hooks registered by plugins for the given tool.
+/// Post-tool hooks are informational; the return value is not used to block.
+pub fn run_global_post_tool_hook(
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    tool_output: &str,
+    is_error: bool,
+) {
+    let registry = match GLOBAL_HOOK_REGISTRY.get() {
+        Some(r) => r,
+        None => return,
+    };
+
+    let event_key = HookEventKind::PostToolUse.to_string();
+    let hooks_for_event = match registry.get(&event_key) {
+        Some(h) => h,
+        None => return,
+    };
+
+    let event_json = serde_json::json!({
+        "event": "PostToolUse",
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+        "tool_output": tool_output,
+        "is_error": is_error,
+    })
+    .to_string();
+
+    for hook in hooks_for_event {
+        if let Some(ref matcher) = hook.matcher {
+            if !matcher.is_empty() && matcher != tool_name && matcher != "*" {
+                continue;
+            }
+        }
+        hooks::run_hook_sync(hook, &event_json);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Top-level async API (called from cc-commands / cc-cli)
