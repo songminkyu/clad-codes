@@ -1,4 +1,4 @@
-해당본은 유출된 코드 저장 모음집입니다.
+해당본은 유출된 코드 저장 모음집입니다. 아래링크를 통해 수동적으로 추적하여 repo를 업데이트 합니다.
 
 beita6969-claude-code
  - https://github.com/beita6969/claude-code
