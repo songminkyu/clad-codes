@@ -11,3 +11,9 @@ Kuberwastaken
 
 instructkr
  - https://github.com/instructkr/claw-code
+
+777genius
+ - https://github.com/777genius/claude-code-source-code
+
+AprilNEA
+ - https://github.com/AprilNEA/claude-code-source
