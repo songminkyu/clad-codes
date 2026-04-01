@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Code Settings</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+
+:root {
+  --bg: #f2f2f7; --white: #fff; --card: #fff; --hover: #f9f9fb;
+  --sep: rgba(0,0,0,.06); --sep2: rgba(0,0,0,.1);
+  --t1: #1d1d1f; --t2: #6e6e73; --t3: #aeaeb2;
+  --blue: #0071e3; --green: #34c759; --red: #ff3b30; --orange: #ff9500;
+  --purple: #af52de; --indigo: #5856d6; --teal: #5ac8fa;
+  --blue-bg: rgba(0,113,227,.06); --green-bg: rgba(52,199,89,.08);
+  --red-bg: rgba(255,59,48,.06); --purple-bg: rgba(175,82,222,.06);
+  --r: 16px; --r2: 12px; --r3: 8px;
+  --shadow: 0 1px 3px rgba(0,0,0,.04), 0 4px 12px rgba(0,0,0,.04);
+  --shadow-hover: 0 2px 8px rgba(0,0,0,.06), 0 8px 24px rgba(0,0,0,.06);
+  --font: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --mono: 'JetBrains Mono', 'SF Mono', ui-monospace, monospace;
+}
+
+body { font-family: var(--font); background: var(--bg); color: var(--t1); font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased; }
+
+/* ===== Top Bar ===== */
+.topbar {
+  position: sticky; top: 0; z-index: 50; height: 52px;
+  background: rgba(242,242,247,.75); backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border-bottom: 1px solid var(--sep); padding: 0 24px;
+  display: flex; align-items: center; gap: 20px;
+}
+.topbar-brand { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+.topbar-icon {
+  width: 30px; height: 30px; border-radius: 8px;
+  background: linear-gradient(135deg, var(--indigo), var(--blue));
+  display: flex; align-items: center; justify-content: center;
+}
+.topbar-icon svg { width: 16px; height: 16px; fill: #fff; }
+.topbar-title { font-size: 15px; font-weight: 700; letter-spacing: -.02em; }
+
+.tabs { display: flex; gap: 1px; overflow-x: auto; flex: 1; scrollbar-width: none; }
+.tabs::-webkit-scrollbar { display: none; }
+.tab {
+  padding: 6px 12px; border-radius: 7px; font-size: 13px; font-weight: 500;
+  color: var(--t2); cursor: pointer; white-space: nowrap; transition: all 120ms; user-select: none;
+}
+.tab:hover { color: var(--t1); background: rgba(0,0,0,.04); }
+.tab.on { color: var(--blue); background: var(--blue-bg); font-weight: 600; }
+
+.topbar-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.lang-btn {
+  padding: 5px 10px; border-radius: 6px; border: 1px solid var(--sep2);
+  background: var(--white); color: var(--t2); font-size: 12px; font-weight: 600;
+  cursor: pointer; transition: all 120ms; font-family: var(--font);
+}
+.lang-btn:hover { border-color: var(--blue); color: var(--blue); }
+
+/* ===== Layout ===== */
+.container { max-width: 1080px; margin: 0 auto; padding: 28px 20px 80px; }
+.panel { display: none; animation: fadeUp .22s ease; }
+.panel.on { display: block; }
+@keyframes fadeUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+/* ===== Page Header ===== */
+.pg-h { margin-bottom: 24px; }
+.pg-h h1 { font-size: 28px; font-weight: 800; letter-spacing: -.04em; color: var(--t1); }
+.pg-h p { color: var(--t3); font-size: 13px; margin-top: 2px; }
+
+/* ===== Bento Grid ===== */
+.grid { display: grid; gap: 14px; }
+.g2 { grid-template-columns: repeat(2, 1fr); }
+.g3 { grid-template-columns: repeat(3, 1fr); }
+.g4 { grid-template-columns: repeat(4, 1fr); }
+.span2 { grid-column: span 2; }
+.span-full { grid-column: 1 / -1; }
+
+/* ===== Cards ===== */
+.card {
+  background: var(--card); border-radius: var(--r); padding: 22px;
+  box-shadow: var(--shadow); border: 1px solid var(--sep);
+  transition: box-shadow .2s, transform .2s, border-color .2s;
+}
+.card:hover { box-shadow: var(--shadow-hover); border-color: var(--sep2); }
+.card-t { font-size: 13px; font-weight: 600; color: var(--t2); margin-bottom: 4px; display: flex; align-items: center; gap: 6px; }
+.card-t svg { width: 14px; height: 14px; opacity: .5; }
+.card-v { font-size: 22px; font-weight: 800; letter-spacing: -.02em; margin-top: 6px; }
+.card-desc { font-size: 12px; color: var(--t3); margin-top: 2px; }
+
+/* ===== Stat Cards ===== */
+.stat-card { text-align: center; padding: 28px 16px; }
+.stat-n { font-size: 42px; font-weight: 800; letter-spacing: -.04em; }
+.stat-n.blue { color: var(--blue); }
+.stat-n.green { color: var(--green); }
+.stat-n.purple { color: var(--purple); }
+.stat-l { font-size: 11px; font-weight: 600; color: var(--t3); text-transform: uppercase; letter-spacing: .06em; margin-top: 4px; }
+
+/* ===== Grouped Section ===== */
+.section-t { font-size: 12px; font-weight: 600; color: var(--t3); text-transform: uppercase; letter-spacing: .04em; padding: 20px 0 8px; }
+.group { background: var(--white); border-radius: var(--r); box-shadow: var(--shadow); border: 1px solid var(--sep); overflow: hidden; margin-bottom: 16px; }
+.row { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; min-height: 52px; }
+.row + .row { border-top: 1px solid var(--sep); }
+.row:hover { background: var(--hover); }
+.row-l { flex: 1; min-width: 0; }
+.row-l b { font-size: 14px; font-weight: 500; display: block; }
+.row-l small { font-size: 12px; color: var(--t3); }
+.row-r { flex-shrink: 0; display: flex; align-items: center; gap: 8px; }
+
+/* ===== iOS Toggle ===== */
+.sw { position: relative; width: 51px; height: 31px; cursor: pointer; flex-shrink: 0; }
+.sw input { position: absolute; opacity: 0; }
+.sw i {
+  position: absolute; inset: 0; background: #e5e5ea; border-radius: 31px;
+  transition: background .3s;
+}
+.sw i::after {
+  content: ''; position: absolute; width: 27px; height: 27px; left: 2px; top: 2px;
+  background: #fff; border-radius: 50%; box-shadow: 0 2px 5px rgba(0,0,0,.15), 0 0 1px rgba(0,0,0,.1);
+  transition: transform .3s cubic-bezier(.4,0,.2,1);
+}
+.sw input:checked + i { background: var(--green); }
+.sw input:checked + i::after { transform: translateX(20px); }
+
+/* ===== Inputs ===== */
+.inp {
+  width: 100%; padding: 10px 14px; background: var(--bg); border: 1px solid var(--sep2);
+  border-radius: var(--r3); color: var(--t1); font-size: 13px; font-family: var(--font);
+  outline: none; transition: border-color .15s, box-shadow .15s;
+}
+.inp:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(0,113,227,.1); }
+.inp::placeholder { color: var(--t3); }
+.inp-mono { font-family: var(--mono); }
+textarea.inp { min-height: 160px; resize: vertical; font-family: var(--mono); line-height: 1.6; }
+select.inp {
+  appearance: none; cursor: pointer; padding-right: 36px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23aeaeb2' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 12px center;
+}
+.field { margin-bottom: 14px; }
+.field-l { font-size: 12px; font-weight: 600; color: var(--t2); margin-bottom: 5px; }
+.field-h { font-size: 11px; color: var(--t3); margin-top: 4px; }
+.row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+/* ===== Item Grid ===== */
+.items { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 16px; }
+.it {
+  background: var(--white); border-radius: var(--r2); padding: 18px;
+  box-shadow: var(--shadow); border: 1px solid var(--sep);
+  transition: all .18s; cursor: default;
+}
+.it:hover { transform: translateY(-2px); box-shadow: var(--shadow-hover); border-color: var(--sep2); }
+.it-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.it-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 6px rgba(52,199,89,.3); }
+.it-name { font-size: 15px; font-weight: 600; }
+.it-path { font-size: 11px; color: var(--t3); font-family: var(--mono); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.it-acts { display: flex; gap: 6px; margin-top: 12px; }
+.it-btn {
+  padding: 5px 12px; border-radius: 6px; border: 1px solid var(--sep2);
+  background: var(--white); color: var(--t2); font-size: 12px; font-weight: 500;
+  font-family: var(--font); cursor: pointer; transition: all .12s;
+}
+.it-btn:hover { background: var(--bg); color: var(--t1); }
+.it-btn.del { color: var(--red); border-color: rgba(255,59,48,.2); }
+.it-btn.del:hover { background: var(--red-bg); }
+
+/* ===== Empty ===== */
+.empty { grid-column: 1/-1; text-align: center; padding: 48px 20px; color: var(--t3); background: var(--white); border-radius: var(--r); border: 1px dashed var(--sep2); }
+.empty p { font-size: 15px; color: var(--t2); }
+.empty small { font-size: 12px; }
+
+/* ===== Buttons ===== */
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 10px 22px; border-radius: var(--r3); border: none;
+  font-size: 14px; font-weight: 600; font-family: var(--font);
+  cursor: pointer; transition: all .15s; user-select: none;
+}
+.btn-p { background: var(--blue); color: #fff; }
+.btn-p:hover { filter: brightness(1.05); transform: translateY(-1px); box-shadow: 0 4px 14px rgba(0,113,227,.2); }
+.btn-p:active { transform: none; filter: brightness(.95); }
+.btn-s { background: var(--white); color: var(--t1); border: 1px solid var(--sep2); }
+.btn-s:hover { background: var(--bg); }
+.acts { display: flex; gap: 8px; margin-top: 20px; }
+
+/* ===== Toast ===== */
+.toast {
+  position: fixed; bottom: 28px; left: 50%;
+  transform: translateX(-50%) translateY(16px) scale(.95);
+  padding: 11px 22px; background: var(--t1); color: #fff; border-radius: 100px;
+  font-size: 13px; font-weight: 500; box-shadow: 0 8px 30px rgba(0,0,0,.12);
+  opacity: 0; transition: all .35s cubic-bezier(.4,0,.2,1);
+  pointer-events: none; z-index: 100; white-space: nowrap;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
+
+/* ===== Memory ===== */
+.mem-grid { display: grid; grid-template-columns: repeat(2,1fr); gap: 12px; }
+.mem-c { background: var(--white); border-radius: var(--r2); padding: 18px; box-shadow: var(--shadow); border: 1px solid var(--sep); }
+.mem-c h4 { font-size: 13px; font-weight: 600; color: var(--t2); margin-bottom: 8px; }
+.mem-c pre { font-family: var(--mono); font-size: 12px; color: var(--t2); white-space: pre-wrap; word-break: break-word; max-height: 160px; overflow-y: auto; line-height: 1.5; background: var(--bg); padding: 12px; border-radius: var(--r3); }
+
+/* ===== Scrollbar ===== */
+::-webkit-scrollbar { width: 5px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: rgba(0,0,0,.12); border-radius: 3px; }
+
+@media (max-width: 768px) { .g2,.g3,.g4,.items,.mem-grid,.row-2 { grid-template-columns: 1fr; } .container { padding: 16px 12px 60px; } .topbar { padding: 0 12px; } }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-brand">
+    <div class="topbar-icon"><svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg></div>
+    <span class="topbar-title">Claude Code</span>
+  </div>
+  <div class="tabs" id="tabs"></div>
+  <div class="topbar-right">
+    <button class="lang-btn" onclick="toggleLang()" id="lang-btn">EN / ZH</button>
+  </div>
+</div>
+
+<div class="container" id="app"></div>
+<div class="toast" id="toast"></div>
+
+<script>
+// ===== i18n =====
+let lang = localStorage.getItem('cc-lang') || 'en'
+const T = {
+  en: {
+    overview:'Overview',features:'Features',model:'Model',agents:'Agents',skills:'Skills',mcp:'MCP',perms:'Permissions',hooks:'Hooks',claudemd:'CLAUDE.md',memory:'Memory',raw:'JSON',
+    dash:'Dashboard',dashD:'Configuration overview',
+    featEnabled:'Features Enabled',extensions:'Extensions',memories:'Memories',
+    curModel:'Current Model',authMethod:'Auth Method',oauth:'OAuth',apikey:'API Key',
+    featTitle:'Feature Flags',featD:'Toggle hidden capabilities. Restart to apply.',save:'Save',reset:'Reset',
+    modelTitle:'Model & API',modelD:'Provider, model, and authentication.',provider:'Provider',modelSel:'Model',effort:'Effort',auto:'Auto',default_:'Default',low:'Low',medium:'Medium',high:'High',
+    auth:'Authentication',apiKeyL:'API Key',apiKeyH:'Leave empty to use OAuth',baseUrl:'Base URL',baseUrlH:'Custom endpoint (optional)',langL:'Language',langH:'e.g. Chinese, Japanese',
+    agentTitle:'Agents',agentD:'Custom personas with specialized tools and prompts.',createAgent:'Create Agent',agentName:'Name',agentDef:'Definition',edit:'Edit',delete:'Delete',noAgents:'No agents configured',noAgentsH:'Create one below to get started',
+    skillTitle:'Skills',skillD:'Reusable workflows invoked via /skill-name.',createSkill:'Create Skill',skillName:'Name',skillDef:'SKILL.md Content',noSkills:'No skills configured',noSkillsH:'Create a workflow template below',
+    mcpTitle:'MCP Servers',mcpD:'External tool servers via Model Context Protocol.',addServer:'Add Server',serverName:'Server Name',transport:'Transport',command:'Command',url:'URL',remove:'Remove',noMcp:'No MCP servers',noMcpH:'Connect an external tool server',
+    permTitle:'Permissions',permD:'Control which operations are allowed or denied.',allowRules:'Allow Rules',allowH:'Auto-approved operations',denyRules:'Deny Rules',denyH:'Blocked operations',
+    hookTitle:'Hooks',hookD:'Event-driven automation triggers.',hookConfig:'Configuration (JSON)',
+    cmdTitle:'CLAUDE.md',cmdD:'Project instructions Claude always follows.',editor:'Editor',
+    memTitle:'Memory',memD:'Persistent knowledge across sessions.',noMem:'No memories yet',noMemH:'Extracted automatically from conversations',
+    rawTitle:'Raw Settings',rawD:'Direct JSON editing. Be careful with syntax.',userSettings:'User Settings',projSettings:'Project Settings',
+    saved:'Saved',created:'Created',deleted:'Deleted',removed:'Removed',added:'Added',invalidJson:'Invalid JSON',enterName:'Enter a name',
+    create:'Create',add:'Add',
+  },
+  zh: {
+    overview:'概览',features:'功能开关',model:'模型配置',agents:'智能体',skills:'技能',mcp:'MCP 服务',perms:'权限',hooks:'钩子',claudemd:'CLAUDE.md',memory:'记忆',raw:'JSON',
+    dash:'控制面板',dashD:'Claude Code 配置概览',
+    featEnabled:'已启用功能',extensions:'扩展数量',memories:'记忆条数',
+    curModel:'当前模型',authMethod:'认证方式',oauth:'OAuth 认证',apikey:'API 密钥',
+    featTitle:'功能开关',featD:'开启或关闭隐藏功能，重启后生效。',save:'保存',reset:'重置',
+    modelTitle:'模型与 API',modelD:'配置模型提供商、模型选择和认证方式。',provider:'提供商',modelSel:'模型',effort:'推理深度',auto:'自动',default_:'默认',low:'低',medium:'中',high:'高',
+    auth:'认证信息',apiKeyL:'API 密钥',apiKeyH:'留空使用 OAuth 认证',baseUrl:'API 地址',baseUrlH:'自定义端点（可选）',langL:'语言',langH:'例如 Chinese, Japanese',
+    agentTitle:'自定义智能体',agentD:'定义拥有专属工具和提示词的 Agent 角色。',createAgent:'创建智能体',agentName:'名称',agentDef:'定义内容',edit:'编辑',delete:'删除',noAgents:'暂无智能体',noAgentsH:'在下方创建你的第一个智能体',
+    skillTitle:'自定义技能',skillD:'可复用的工作流模板，通过 /skill-name 调用。',createSkill:'创建技能',skillName:'名称',skillDef:'SKILL.md 内容',noSkills:'暂无技能',noSkillsH:'在下方创建工作流模板',
+    mcpTitle:'MCP 服务器',mcpD:'通过 Model Context Protocol 连接外部工具服务器。',addServer:'添加服务器',serverName:'名称',transport:'传输方式',command:'命令',url:'地址',remove:'移除',noMcp:'暂无 MCP 服务器',noMcpH:'添加外部工具服务器',
+    permTitle:'权限管理',permD:'控制工具操作的允许和拒绝规则。',allowRules:'允许规则',allowH:'自动批准的操作',denyRules:'拒绝规则',denyH:'被阻止的操作',
+    hookTitle:'自动化钩子',hookD:'事件驱动的自动化操作。',hookConfig:'配置（JSON 格式）',
+    cmdTitle:'CLAUDE.md',cmdD:'Claude 每次对话都会遵循的项目级指令。',editor:'编辑器',
+    memTitle:'自动记忆',memD:'跨会话的持久化知识存储。',noMem:'暂无记忆',noMemH:'会自动从对话中提取',
+    rawTitle:'原始设置',rawD:'直接编辑 JSON 文件，注意语法正确性。',userSettings:'用户设置',projSettings:'项目设置',
+    saved:'已保存',created:'已创建',deleted:'已删除',removed:'已移除',added:'已添加',invalidJson:'JSON 格式错误',enterName:'请输入名称',
+    create:'创建',add:'添加',
+  }
+}
+const t = k => T[lang][k] || k
+function toggleLang() { lang = lang === 'en' ? 'zh' : 'en'; localStorage.setItem('cc-lang', lang); render(); loadAll(); }
+
+// ===== Feature Descriptions =====
+const FD_EN = {KAIROS:'Assistant & daily log',PROACTIVE:'Proactive autonomous mode',BRIDGE_MODE:'VS Code & JetBrains bridge',VOICE_MODE:'Voice input',COORDINATOR_MODE:'Multi-agent swarms',TRANSCRIPT_CLASSIFIER:'Auto-mode classifier',BASH_CLASSIFIER:'Bash safety classifier',BUDDY:'Companion sprite',WEB_BROWSER_TOOL:'Web browser tool',CHICAGO_MCP:'Computer Use',AGENT_TRIGGERS:'Scheduled agents',ULTRAPLAN:'Ultra planning',MONITOR_TOOL:'MCP monitoring',TEAMMEM:'Team memory',EXTRACT_MEMORIES:'Memory extraction',MCP_SKILLS:'MCP skills',REVIEW_ARTIFACT:'Review artifacts',CONNECTOR_TEXT:'Connector text',DOWNLOAD_USER_SETTINGS:'Remote settings',MESSAGE_ACTIONS:'Message actions',KAIROS_CHANNELS:'Channels',KAIROS_GITHUB_WEBHOOKS:'GitHub webhooks'}
+const FD_ZH = {KAIROS:'助手和日志模式',PROACTIVE:'自主运行模式',BRIDGE_MODE:'VS Code / JetBrains 集成',VOICE_MODE:'语音输入',COORDINATOR_MODE:'多 Agent 协调',TRANSCRIPT_CLASSIFIER:'自动权限分类',BASH_CLASSIFIER:'Bash 安全分类',BUDDY:'伙伴精灵',WEB_BROWSER_TOOL:'网页浏览器',CHICAGO_MCP:'电脑控制',AGENT_TRIGGERS:'定时 Agent',ULTRAPLAN:'超级规划',MONITOR_TOOL:'MCP 监控',TEAMMEM:'团队记忆',EXTRACT_MEMORIES:'记忆提取',MCP_SKILLS:'MCP 技能',REVIEW_ARTIFACT:'审核工件',CONNECTOR_TEXT:'连接文本',DOWNLOAD_USER_SETTINGS:'远程设置',MESSAGE_ACTIONS:'消息操作',KAIROS_CHANNELS:'频道通知',KAIROS_GITHUB_WEBHOOKS:'GitHub Webhooks'}
+const fd = k => (lang === 'zh' ? FD_ZH : FD_EN)[k] || k
+
+// ===== State =====
+let F={}, S={user:{},project:{},local:{}}, MC={}
+const $ = id => document.getElementById(id)
+const api = async(p,m,b)=>{const o={method:m||'GET'};if(b){o.headers={'Content-Type':'application/json'};o.body=JSON.stringify(b)};return(await fetch('/api/'+p,o)).json()}
+function toast(m){const el=$('toast');el.textContent=m;el.classList.add('show');setTimeout(()=>el.classList.remove('show'),2200)}
+
+// ===== Tabs =====
+const TABS = ['home','features','model','agents','skills','mcp','perms','hooks','claudemd','memory','raw']
+function renderTabs() {
+  $('tabs').innerHTML = TABS.map(id => {
+    const k = id === 'home' ? 'overview' : id === 'perms' ? 'perms' : id
+    return `<div class="tab${id==='home'?' on':''}" data-p="${id}">${t(k)}</div>`
+  }).join('')
+  document.querySelectorAll('.tab').forEach(el => el.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('on'))
+    document.querySelectorAll('.panel').forEach(x => x.classList.remove('on'))
+    el.classList.add('on'); $('p-'+el.dataset.p).classList.add('on')
+  }))
+}
+
+// ===== Render All Panels =====
+function render() {
+  $('lang-btn').textContent = lang === 'en' ? '中文' : 'English'
+  renderTabs()
+  $('app').innerHTML = `
+<!-- HOME -->
+<div class="panel on" id="p-home">
+  <div class="pg-h"><h1>${t('dash')}</h1><p>${t('dashD')}</p></div>
+  <div class="grid g3" style="margin-bottom:14px">
+    <div class="card stat-card"><div class="stat-n blue" id="s-f">0</div><div class="stat-l">${t('featEnabled')}</div></div>
+    <div class="card stat-card"><div class="stat-n purple" id="s-e">0</div><div class="stat-l">${t('extensions')}</div></div>
+    <div class="card stat-card"><div class="stat-n green" id="s-m">0</div><div class="stat-l">${t('memories')}</div></div>
+  </div>
+  <div class="grid g4">
+    <div class="card"><div class="card-t">${t('curModel')}</div><div class="card-v" id="h-mod">Auto</div></div>
+    <div class="card"><div class="card-t">${t('authMethod')}</div><div class="card-v" id="h-auth" style="color:var(--green)">OAuth</div></div>
+    <div class="card"><div class="card-t">${t('agents')}</div><div class="card-v" id="h-ag">0</div></div>
+    <div class="card"><div class="card-t">MCP</div><div class="card-v" id="h-mcp">0</div></div>
+  </div>
+</div>
+
+<!-- FEATURES -->
+<div class="panel" id="p-features">
+  <div class="pg-h"><h1>${t('featTitle')}</h1><p>${t('featD')}</p></div>
+  <div class="grid g2" id="fg"></div>
+  <div class="acts"><button class="btn btn-p" onclick="saveF()">${t('save')}</button><button class="btn btn-s" onclick="loadF()">${t('reset')}</button></div>
+</div>
+
+<!-- MODEL -->
+<div class="panel" id="p-model">
+  <div class="pg-h"><h1>${t('modelTitle')}</h1><p>${t('modelD')}</p></div>
+  <div class="grid g2">
+    <div class="card">
+      <div class="card-t">${t('provider')} & ${t('modelSel')}</div>
+      <div style="margin-top:14px">
+        <div class="field"><div class="field-l">${t('provider')}</div><select class="inp" id="f-prov"><option value="anthropic">Anthropic</option><option value="bedrock">AWS Bedrock</option><option value="vertex">Google Vertex</option><option value="foundry">Foundry</option></select></div>
+        <div class="field"><div class="field-l">${t('modelSel')}</div><select class="inp" id="f-mod"><option value="">${t('auto')}</option><option value="claude-opus-4-20250514">Opus 4</option><option value="claude-sonnet-4-20250514">Sonnet 4</option><option value="claude-haiku-4-5-20251001">Haiku 4.5</option></select></div>
+        <div class="field"><div class="field-l">${t('effort')}</div><select class="inp" id="f-eff"><option value="">${t('default_')}</option><option value="low">${t('low')}</option><option value="medium">${t('medium')}</option><option value="high">${t('high')}</option></select></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-t">${t('auth')}</div>
+      <div style="margin-top:14px">
+        <div class="field"><div class="field-l">${t('apiKeyL')}</div><input class="inp inp-mono" id="f-key" placeholder="sk-ant-..."><div class="field-h">${t('apiKeyH')}</div></div>
+        <div class="field"><div class="field-l">${t('baseUrl')}</div><input class="inp inp-mono" id="f-url" placeholder="https://api.anthropic.com"><div class="field-h">${t('baseUrlH')}</div></div>
+        <div class="field"><div class="field-l">${t('langL')}</div><input class="inp" id="f-lang" placeholder="${t('langH')}"></div>
+      </div>
+    </div>
+  </div>
+  <div class="acts"><button class="btn btn-p" onclick="saveM()">${t('save')}</button></div>
+</div>
+
+<!-- AGENTS -->
+<div class="panel" id="p-agents">
+  <div class="pg-h"><h1>${t('agentTitle')}</h1><p>${t('agentD')}</p></div>
+  <div class="items" id="a-list"></div>
+  <div class="card"><div class="card-t">${t('createAgent')}</div>
+    <div style="margin-top:14px">
+      <div class="field"><div class="field-l">${t('agentName')}</div><input class="inp" id="f-an" placeholder="paper-reviewer"></div>
+      <div class="field"><div class="field-l">${t('agentDef')}</div><textarea class="inp" id="f-ac">---\nname: my-agent\ndescription: What this agent does\ntools: [Bash, Read, Write]\nmodel: sonnet\n---\nYou are a specialized agent...</textarea></div>
+      <button class="btn btn-p" onclick="mkA()">${t('create')}</button>
+    </div>
+  </div>
+</div>
+
+<!-- SKILLS -->
+<div class="panel" id="p-skills">
+  <div class="pg-h"><h1>${t('skillTitle')}</h1><p>${t('skillD')}</p></div>
+  <div class="items" id="s-list"></div>
+  <div class="card"><div class="card-t">${t('createSkill')}</div>
+    <div style="margin-top:14px">
+      <div class="field"><div class="field-l">${t('skillName')}</div><input class="inp" id="f-sn" placeholder="literature-review"></div>
+      <div class="field"><div class="field-l">${t('skillDef')}</div><textarea class="inp" id="f-sc">---\nname: my-skill\ndescription: What this skill does\nwhen_to_use: When the user asks for X\nallowed-tools: [Bash, Read, Write, WebSearch]\n---\n## Steps\n1. First step\n2. Second step</textarea></div>
+      <button class="btn btn-p" onclick="mkS()">${t('create')}</button>
+    </div>
+  </div>
+</div>
+
+<!-- MCP -->
+<div class="panel" id="p-mcp">
+  <div class="pg-h"><h1>${t('mcpTitle')}</h1><p>${t('mcpD')}</p></div>
+  <div class="items" id="m-list"></div>
+  <div class="card"><div class="card-t">${t('addServer')}</div>
+    <div style="margin-top:14px">
+      <div class="row-2"><div class="field"><div class="field-l">${t('serverName')}</div><input class="inp" id="f-mn" placeholder="my-server"></div><div class="field"><div class="field-l">${t('transport')}</div><select class="inp" id="f-mt" onchange="document.getElementById('mfs').style.display=this.value==='stdio'?'':'none';document.getElementById('mfu').style.display=this.value!=='stdio'?'':'none'"><option value="stdio">stdio</option><option value="http">HTTP</option><option value="sse">SSE</option><option value="ws">WebSocket</option></select></div></div>
+      <div id="mfs"><div class="field"><div class="field-l">${t('command')}</div><input class="inp inp-mono" id="f-mc" placeholder="python server.py --port 8080"></div></div>
+      <div id="mfu" style="display:none"><div class="field"><div class="field-l">${t('url')}</div><input class="inp inp-mono" id="f-mu" placeholder="https://api.example.com/mcp"></div></div>
+      <button class="btn btn-p" onclick="mkMcp()">${t('add')}</button>
+    </div>
+  </div>
+</div>
+
+<!-- PERMS -->
+<div class="panel" id="p-perms">
+  <div class="pg-h"><h1>${t('permTitle')}</h1><p>${t('permD')}</p></div>
+  <div class="grid g2">
+    <div class="card"><div class="card-t" style="color:var(--green)">${t('allowRules')}</div><div class="card-desc">${t('allowH')}</div><textarea class="inp" id="f-pa" style="margin-top:12px;min-height:140px" placeholder='["Bash(git *)", "Read", "Glob"]'></textarea></div>
+    <div class="card"><div class="card-t" style="color:var(--red)">${t('denyRules')}</div><div class="card-desc">${t('denyH')}</div><textarea class="inp" id="f-pd" style="margin-top:12px;min-height:140px" placeholder='["Bash(rm -rf *)"]'></textarea></div>
+  </div>
+  <div class="acts"><button class="btn btn-p" onclick="saveP()">${t('save')}</button></div>
+</div>
+
+<!-- HOOKS -->
+<div class="panel" id="p-hooks">
+  <div class="pg-h"><h1>${t('hookTitle')}</h1><p>${t('hookD')}</p></div>
+  <div class="card"><div class="card-t">${t('hookConfig')}</div><textarea class="inp" id="f-hk" style="margin-top:12px;min-height:260px" placeholder='{\n  "PostToolUse": [{\n    "matcher": "Write",\n    "hooks": [{ "type": "command", "command": "git add ." }]\n  }]\n}'></textarea></div>
+  <div class="acts"><button class="btn btn-p" onclick="saveH()">${t('save')}</button></div>
+</div>
+
+<!-- CLAUDE.md -->
+<div class="panel" id="p-claudemd">
+  <div class="pg-h"><h1>${t('cmdTitle')}</h1><p>${t('cmdD')}</p></div>
+  <div class="card"><div class="card-t">${t('editor')}</div><div class="card-desc" id="cm-path"></div><textarea class="inp" id="f-cm" style="margin-top:12px;min-height:340px" placeholder="# Project Instructions"></textarea></div>
+  <div class="acts"><button class="btn btn-p" onclick="saveCm()">${t('save')}</button></div>
+</div>
+
+<!-- MEMORY -->
+<div class="panel" id="p-memory">
+  <div class="pg-h"><h1>${t('memTitle')}</h1><p>${t('memD')}</p></div>
+  <div class="mem-grid" id="mem-g"></div>
+</div>
+
+<!-- RAW -->
+<div class="panel" id="p-raw">
+  <div class="pg-h"><h1>${t('rawTitle')}</h1><p>${t('rawD')}</p></div>
+  <div class="grid g2">
+    <div class="card"><div class="card-t">${t('userSettings')}</div><div class="card-desc">~/.claude/settings.json</div><textarea class="inp" id="f-ru" style="margin-top:12px;min-height:280px"></textarea><div class="acts" style="margin-top:10px"><button class="btn btn-p" onclick="saveR('user')">${t('save')}</button></div></div>
+    <div class="card"><div class="card-t">${t('projSettings')}</div><div class="card-desc">.claude/settings.json</div><textarea class="inp" id="f-rp" style="margin-top:12px;min-height:280px"></textarea><div class="acts" style="margin-top:10px"><button class="btn btn-p" onclick="saveR('project')">${t('save')}</button></div></div>
+  </div>
+</div>`
+}
+
+// ===== Data Loaders =====
+async function loadF(){F=await api('features');let c=0,h='';const e=Object.entries(F);for(let i=0;i<e.length;i+=2){const[k1,v1]=e[i],p2=e[i+1];if(v1)c++;if(p2&&p2[1])c++;h+=`<div class="group"><div class="row"><div class="row-l"><b>${k1}</b><small>${fd(k1)}</small></div><label class="sw"><input type="checkbox" data-f="${k1}" ${v1?'checked':''}><i></i></label></div>${p2?`<div class="row"><div class="row-l"><b>${p2[0]}</b><small>${fd(p2[0])}</small></div><label class="sw"><input type="checkbox" data-f="${p2[0]}" ${p2[1]?'checked':''}><i></i></label></div>`:''}</div>`}if($('fg'))$('fg').innerHTML=h;if($('s-f'))$('s-f').textContent=c}
+async function saveF(){const f={};document.querySelectorAll('#fg input').forEach(i=>f[i.dataset.f]=i.checked);await api('features','POST',f);toast(t('saved'));loadF()}
+async function loadS(){S=await api('settings');if($('f-ru'))$('f-ru').value=JSON.stringify(S.user,null,2);if($('f-rp'))$('f-rp').value=JSON.stringify(S.project,null,2);const e=S.user.env||{};if($('f-key'))$('f-key').value=e.ANTHROPIC_API_KEY||'';if($('f-url'))$('f-url').value=e.ANTHROPIC_BASE_URL||'';if($('f-mod'))$('f-mod').value=S.user.model||'';if($('f-eff'))$('f-eff').value=S.user.effortLevel||'';if($('f-lang'))$('f-lang').value=S.user.language||'';if($('f-pa'))$('f-pa').value=JSON.stringify((S.user.permissions||{}).allow||[],null,2);if($('f-pd'))$('f-pd').value=JSON.stringify((S.user.permissions||{}).deny||[],null,2);if($('f-hk'))$('f-hk').value=JSON.stringify(S.user.hooks||{},null,2);if($('h-mod'))$('h-mod').textContent=S.user.model||'Auto';if($('h-auth'))$('h-auth').textContent=e.ANTHROPIC_API_KEY?t('apikey'):t('oauth')}
+async function saveR(s){try{await api('settings','POST',{scope:s,settings:JSON.parse($(s==='user'?'f-ru':'f-rp').value)});toast(t('saved'));loadS()}catch{toast(t('invalidJson'))}}
+async function saveM(){const s={...S.user};for(const[k,id]of[['model','f-mod'],['effortLevel','f-eff'],['language','f-lang']]){const v=$(id)?.value;v?s[k]=v:delete s[k]};if(!s.env)s.env={};const k=$('f-key')?.value,u=$('f-url')?.value;k?s.env.ANTHROPIC_API_KEY=k:delete s.env.ANTHROPIC_API_KEY;u?s.env.ANTHROPIC_BASE_URL=u:delete s.env.ANTHROPIC_BASE_URL;if(!Object.keys(s.env).length)delete s.env;await api('settings','POST',{scope:'user',settings:s});toast(t('saved'));loadS()}
+async function saveP(){try{const s={...S.user};s.permissions={...(s.permissions||{}),allow:JSON.parse($('f-pa')?.value||'[]'),deny:JSON.parse($('f-pd')?.value||'[]')};await api('settings','POST',{scope:'user',settings:s});toast(t('saved'));loadS()}catch{toast(t('invalidJson'))}}
+async function saveH(){try{const s={...S.user};s.hooks=JSON.parse($('f-hk')?.value||'{}');await api('settings','POST',{scope:'user',settings:s});toast(t('saved'));loadS()}catch{toast(t('invalidJson'))}}
+
+async function loadA(){const a=await api('agents');if($('h-ag'))$('h-ag').textContent=a.length;if($('s-e')){const sk=await api('skills');$('s-e').textContent=a.length+sk.length}const el=$('a-list');if(!el)return;if(!a.length){el.innerHTML=`<div class="empty"><p>${t('noAgents')}</p><small>${t('noAgentsH')}</small></div>`;return}el.innerHTML=a.map(x=>`<div class="it"><div class="it-head"><div class="it-dot"></div><div class="it-name">${x.name.replace('.md','')}</div></div><div class="it-path">${x.path}</div><div class="it-acts"><button class="it-btn" onclick="edA('${x.name}')">${t('edit')}</button><button class="it-btn del" onclick="dlA('${x.name}')">${t('delete')}</button></div></div>`).join('')}
+async function mkA(){const n=$('f-an')?.value.trim();if(!n)return toast(t('enterName'));await api('agents','POST',{name:n,content:$('f-ac').value});toast(t('created'));$('f-an').value='';loadA()}
+async function dlA(n){if(!confirm(t('delete')+'?'))return;await api('agents','DELETE',{name:n});toast(t('deleted'));loadA()}
+async function edA(n){const a=await api('agents');const x=a.find(i=>i.name===n);if(x&&$('f-an')){$('f-an').value=n.replace('.md','');$('f-ac').value=x.content}}
+
+async function loadSk(){const s=await api('skills');const el=$('s-list');if(!el)return;if(!s.length){el.innerHTML=`<div class="empty"><p>${t('noSkills')}</p><small>${t('noSkillsH')}</small></div>`;return}el.innerHTML=s.map(x=>`<div class="it"><div class="it-head"><div class="it-dot"></div><div class="it-name">${x.name}</div></div><div class="it-path">${x.path}</div><div class="it-acts"><button class="it-btn" onclick="edS('${x.name}')">${t('edit')}</button><button class="it-btn del" onclick="dlS('${x.name}')">${t('delete')}</button></div></div>`).join('')}
+async function mkS(){const n=$('f-sn')?.value.trim();if(!n)return toast(t('enterName'));await api('skills','POST',{name:n,content:$('f-sc').value});toast(t('created'));$('f-sn').value='';loadSk()}
+async function dlS(n){if(!confirm(t('delete')+'?'))return;await api('skills','DELETE',{name:n});toast(t('deleted'));loadSk()}
+async function edS(n){const s=await api('skills');const x=s.find(i=>i.name===n);if(x&&$('f-sn')){$('f-sn').value=n;$('f-sc').value=x.content}}
+
+async function loadMc(){MC=await api('mcp');const sv=Object.entries(MC.mcpServers||{});if($('h-mcp'))$('h-mcp').textContent=sv.length;const el=$('m-list');if(!el)return;if(!sv.length){el.innerHTML=`<div class="empty"><p>${t('noMcp')}</p><small>${t('noMcpH')}</small></div>`;return}el.innerHTML=sv.map(([n,c])=>`<div class="it"><div class="it-head"><div class="it-dot"></div><div class="it-name">${n}</div></div><div class="it-path">${c.type||'stdio'} · ${c.command||c.url||''}</div><div class="it-acts"><button class="it-btn del" onclick="dlMcp('${n}')">${t('remove')}</button></div></div>`).join('')}
+async function mkMcp(){const n=$('f-mn')?.value.trim(),tp=$('f-mt')?.value;if(!n)return toast(t('enterName'));const c={...MC};if(!c.mcpServers)c.mcpServers={};if(tp==='stdio'){const p=$('f-mc').value.trim().split(/\s+/);c.mcpServers[n]={type:'stdio',command:p[0],args:p.slice(1)}}else c.mcpServers[n]={type:tp,url:$('f-mu').value.trim()};await api('mcp','POST',c);toast(t('added'));$('f-mn').value='';loadMc()}
+async function dlMcp(n){if(!confirm(t('remove')+'?'))return;const c={...MC};delete c.mcpServers[n];await api('mcp','POST',c);toast(t('removed'));loadMc()}
+
+async function loadCm(){const d=await api('claudemd');if($('f-cm'))$('f-cm').value=d.claudeMd;if($('cm-path'))$('cm-path').textContent=d.path}
+async function saveCm(){await api('claudemd','POST',{content:$('f-cm').value});toast(t('saved'))}
+
+async function loadMem(){const m=await api('memory');if($('s-m'))$('s-m').textContent=m.length;const el=$('mem-g');if(!el)return;if(!m.length){el.innerHTML=`<div class="empty" style="grid-column:1/-1"><p>${t('noMem')}</p><small>${t('noMemH')}</small></div>`;return}el.innerHTML=m.map(x=>`<div class="mem-c"><h4>${x.name}</h4><pre>${x.content.replace(/</g,'&lt;')}</pre></div>`).join('')}
+
+async function loadAll(){await Promise.all([loadF(),loadS(),loadA(),loadSk(),loadMc(),loadCm(),loadMem()])}
+
+// Boot
+render(); loadAll()
+</script>
+</body>
+</html>
