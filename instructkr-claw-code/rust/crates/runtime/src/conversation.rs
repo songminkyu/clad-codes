@@ -4,9 +4,14 @@ use std::fmt::{Display, Formatter};
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
+use crate::config::RuntimeFeatureConfig;
+use crate::hooks::{HookRunResult, HookRunner};
 use crate::permissions::{PermissionOutcome, PermissionPolicy, PermissionPrompter};
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
+
+const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 200_000;
+const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
@@ -84,6 +89,12 @@ pub struct TurnSummary {
     pub tool_results: Vec<ConversationMessage>,
     pub iterations: usize,
     pub usage: TokenUsage,
+    pub auto_compaction: Option<AutoCompactionEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoCompactionEvent {
+    pub removed_message_count: usize,
 }
 
 pub struct ConversationRuntime<C, T> {
@@ -94,6 +105,8 @@ pub struct ConversationRuntime<C, T> {
     system_prompt: Vec<String>,
     max_iterations: usize,
     usage_tracker: UsageTracker,
+    hook_runner: HookRunner,
+    auto_compaction_input_tokens_threshold: u32,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -109,6 +122,25 @@ where
         permission_policy: PermissionPolicy,
         system_prompt: Vec<String>,
     ) -> Self {
+        Self::new_with_features(
+            session,
+            api_client,
+            tool_executor,
+            permission_policy,
+            system_prompt,
+            RuntimeFeatureConfig::default(),
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_features(
+        session: Session,
+        api_client: C,
+        tool_executor: T,
+        permission_policy: PermissionPolicy,
+        system_prompt: Vec<String>,
+        feature_config: RuntimeFeatureConfig,
+    ) -> Self {
         let usage_tracker = UsageTracker::from_session(&session);
         Self {
             session,
@@ -116,14 +148,22 @@ where
             tool_executor,
             permission_policy,
             system_prompt,
-            max_iterations: 16,
+            max_iterations: usize::MAX,
             usage_tracker,
+            hook_runner: HookRunner::from_feature_config(&feature_config),
+            auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
         }
     }
 
     #[must_use]
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;
+        self
+    }
+
+    #[must_use]
+    pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
+        self.auto_compaction_input_tokens_threshold = threshold;
         self
     }
 
@@ -185,19 +225,41 @@ where
 
                 let result_message = match permission_outcome {
                     PermissionOutcome::Allow => {
-                        match self.tool_executor.execute(&tool_name, &input) {
-                            Ok(output) => ConversationMessage::tool_result(
+                        let pre_hook_result = self.hook_runner.run_pre_tool_use(&tool_name, &input);
+                        if pre_hook_result.is_denied() {
+                            let deny_message = format!("PreToolUse hook denied tool `{tool_name}`");
+                            ConversationMessage::tool_result(
+                                tool_use_id,
+                                tool_name,
+                                format_hook_message(&pre_hook_result, &deny_message),
+                                true,
+                            )
+                        } else {
+                            let (mut output, mut is_error) =
+                                match self.tool_executor.execute(&tool_name, &input) {
+                                    Ok(output) => (output, false),
+                                    Err(error) => (error.to_string(), true),
+                                };
+                            output = merge_hook_feedback(pre_hook_result.messages(), output, false);
+
+                            let post_hook_result = self
+                                .hook_runner
+                                .run_post_tool_use(&tool_name, &input, &output, is_error);
+                            if post_hook_result.is_denied() {
+                                is_error = true;
+                            }
+                            output = merge_hook_feedback(
+                                post_hook_result.messages(),
+                                output,
+                                post_hook_result.is_denied(),
+                            );
+
+                            ConversationMessage::tool_result(
                                 tool_use_id,
                                 tool_name,
                                 output,
-                                false,
-                            ),
-                            Err(error) => ConversationMessage::tool_result(
-                                tool_use_id,
-                                tool_name,
-                                error.to_string(),
-                                true,
-                            ),
+                                is_error,
+                            )
                         }
                     }
                     PermissionOutcome::Deny { reason } => {
@@ -209,11 +271,14 @@ where
             }
         }
 
+        let auto_compaction = self.maybe_auto_compact();
+
         Ok(TurnSummary {
             assistant_messages,
             tool_results,
             iterations,
             usage: self.usage_tracker.cumulative_usage(),
+            auto_compaction,
         })
     }
 
@@ -241,6 +306,48 @@ where
     pub fn into_session(self) -> Session {
         self.session
     }
+
+    fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
+        if self.usage_tracker.cumulative_usage().input_tokens
+            < self.auto_compaction_input_tokens_threshold
+        {
+            return None;
+        }
+
+        let result = compact_session(
+            &self.session,
+            CompactionConfig {
+                max_estimated_tokens: 0,
+                ..CompactionConfig::default()
+            },
+        );
+
+        if result.removed_message_count == 0 {
+            return None;
+        }
+
+        self.session = result.compacted_session;
+        Some(AutoCompactionEvent {
+            removed_message_count: result.removed_message_count,
+        })
+    }
+}
+
+#[must_use]
+pub fn auto_compaction_threshold_from_env() -> u32 {
+    parse_auto_compaction_threshold(
+        std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR)
+            .ok()
+            .as_deref(),
+    )
+}
+
+#[must_use]
+fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
+    value
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|threshold| *threshold > 0)
+        .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
 }
 
 fn build_assistant_message(
@@ -290,6 +397,32 @@ fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
     }
 }
 
+fn format_hook_message(result: &HookRunResult, fallback: &str) -> String {
+    if result.messages().is_empty() {
+        fallback.to_string()
+    } else {
+        result.messages().join("\n")
+    }
+}
+
+fn merge_hook_feedback(messages: &[String], output: String, denied: bool) -> String {
+    if messages.is_empty() {
+        return output;
+    }
+
+    let mut sections = Vec::new();
+    if !output.trim().is_empty() {
+        sections.push(output);
+    }
+    let label = if denied {
+        "Hook feedback (denied)"
+    } else {
+        "Hook feedback"
+    };
+    sections.push(format!("{label}:\n{}", messages.join("\n")));
+    sections.join("\n\n")
+}
+
 type ToolHandler = Box<dyn FnMut(&str) -> Result<String, ToolError>>;
 
 #[derive(Default)]
@@ -325,10 +458,12 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiClient, ApiRequest, AssistantEvent, ConversationRuntime, RuntimeError,
-        StaticToolExecutor,
+        parse_auto_compaction_threshold, ApiClient, ApiRequest, AssistantEvent,
+        AutoCompactionEvent, ConversationRuntime, RuntimeError, StaticToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
+    use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest,
@@ -408,12 +543,13 @@ mod tests {
                 .sum::<i32>();
             Ok(total.to_string())
         });
-        let permission_policy = PermissionPolicy::new(PermissionMode::Prompt);
+        let permission_policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite);
         let system_prompt = SystemPromptBuilder::new()
             .with_project_context(ProjectContext {
                 cwd: PathBuf::from("/tmp/project"),
                 current_date: "2026-03-31".to_string(),
                 git_status: None,
+                git_diff: None,
                 instruction_files: Vec::new(),
             })
             .with_os("linux", "6.8")
@@ -435,6 +571,7 @@ mod tests {
         assert_eq!(summary.tool_results.len(), 1);
         assert_eq!(runtime.session().messages.len(), 4);
         assert_eq!(summary.usage.output_tokens, 10);
+        assert_eq!(summary.auto_compaction, None);
         assert!(matches!(
             runtime.session().messages[1].blocks[1],
             ContentBlock::ToolUse { .. }
@@ -487,7 +624,7 @@ mod tests {
             Session::new(),
             SingleCallApiClient,
             StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::Prompt),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system".to_string()],
         );
 
@@ -500,6 +637,141 @@ mod tests {
             &summary.tool_results[0].blocks[0],
             ContentBlock::ToolResult { is_error: true, output, .. } if output == "not now"
         ));
+    }
+
+    #[test]
+    fn denies_tool_use_when_pre_tool_hook_blocks() {
+        struct SingleCallApiClient;
+        impl ApiClient for SingleCallApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                if request
+                    .messages
+                    .iter()
+                    .any(|message| message.role == MessageRole::Tool)
+                {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta("blocked".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "blocked".to_string(),
+                        input: r#"{"path":"secret.txt"}"#.to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            SingleCallApiClient,
+            StaticToolExecutor::new().register("blocked", |_input| {
+                panic!("tool should not execute when hook denies")
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
+                vec![shell_snippet("printf 'blocked by hook'; exit 2")],
+                Vec::new(),
+            )),
+        );
+
+        let summary = runtime
+            .run_turn("use the tool", None)
+            .expect("conversation should continue after hook denial");
+
+        assert_eq!(summary.tool_results.len(), 1);
+        let ContentBlock::ToolResult {
+            is_error, output, ..
+        } = &summary.tool_results[0].blocks[0]
+        else {
+            panic!("expected tool result block");
+        };
+        assert!(
+            *is_error,
+            "hook denial should produce an error result: {output}"
+        );
+        assert!(
+            output.contains("denied tool") || output.contains("blocked by hook"),
+            "unexpected hook denial output: {output:?}"
+        );
+    }
+
+    #[test]
+    fn appends_post_tool_hook_feedback_to_tool_result() {
+        struct TwoCallApiClient {
+            calls: usize,
+        }
+
+        impl ApiClient for TwoCallApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "add".to_string(),
+                            input: r#"{"lhs":2,"rhs":2}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        assert!(request
+                            .messages
+                            .iter()
+                            .any(|message| message.role == MessageRole::Tool));
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => Err(RuntimeError::new("unexpected extra API call")),
+                }
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            TwoCallApiClient { calls: 0 },
+            StaticToolExecutor::new().register("add", |_input| Ok("4".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
+                vec![shell_snippet("printf 'pre hook ran'")],
+                vec![shell_snippet("printf 'post hook ran'")],
+            )),
+        );
+
+        let summary = runtime
+            .run_turn("use add", None)
+            .expect("tool loop succeeds");
+
+        assert_eq!(summary.tool_results.len(), 1);
+        let ContentBlock::ToolResult {
+            is_error, output, ..
+        } = &summary.tool_results[0].blocks[0]
+        else {
+            panic!("expected tool result block");
+        };
+        assert!(
+            !*is_error,
+            "post hook should preserve non-error result: {output:?}"
+        );
+        assert!(
+            output.contains("4"),
+            "tool output missing value: {output:?}"
+        );
+        assert!(
+            output.contains("pre hook ran"),
+            "tool output missing pre hook feedback: {output:?}"
+        );
+        assert!(
+            output.contains("post hook ran"),
+            "tool output missing post hook feedback: {output:?}"
+        );
     }
 
     #[test]
@@ -536,7 +808,7 @@ mod tests {
             session,
             SimpleApi,
             StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::Allow),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         );
 
@@ -563,7 +835,7 @@ mod tests {
             Session::new(),
             SimpleApi,
             StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::Allow),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         );
         runtime.run_turn("a", None).expect("turn a");
@@ -578,6 +850,123 @@ mod tests {
         assert_eq!(
             result.compacted_session.messages[0].role,
             MessageRole::System
+        );
+    }
+
+    #[cfg(windows)]
+    fn shell_snippet(script: &str) -> String {
+        script.replace('\'', "\"")
+    }
+
+    #[cfg(not(windows))]
+    fn shell_snippet(script: &str) -> String {
+        script.to_string()
+    }
+
+    #[test]
+    fn auto_compacts_when_cumulative_input_threshold_is_crossed() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::Usage(TokenUsage {
+                        input_tokens: 120_000,
+                        output_tokens: 4,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let session = Session {
+            version: 1,
+            messages: vec![
+                crate::session::ConversationMessage::user_text("one"),
+                crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "two".to_string(),
+                }]),
+                crate::session::ConversationMessage::user_text("three"),
+                crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "four".to_string(),
+                }]),
+            ],
+        };
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100_000);
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed");
+
+        assert_eq!(
+            summary.auto_compaction,
+            Some(AutoCompactionEvent {
+                removed_message_count: 2,
+            })
+        );
+        assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+    }
+
+    #[test]
+    fn skips_auto_compaction_below_threshold() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::Usage(TokenUsage {
+                        input_tokens: 99_999,
+                        output_tokens: 4,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100_000);
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed");
+        assert_eq!(summary.auto_compaction, None);
+        assert_eq!(runtime.session().messages.len(), 2);
+    }
+
+    #[test]
+    fn auto_compaction_threshold_defaults_and_parses_values() {
+        assert_eq!(
+            parse_auto_compaction_threshold(None),
+            DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
+        );
+        assert_eq!(parse_auto_compaction_threshold(Some("4321")), 4321);
+        assert_eq!(
+            parse_auto_compaction_threshold(Some("not-a-number")),
+            DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
         );
     }
 }

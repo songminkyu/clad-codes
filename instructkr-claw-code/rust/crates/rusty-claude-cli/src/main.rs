@@ -1,3 +1,4 @@
+mod init;
 mod input;
 mod render;
 
@@ -20,20 +21,27 @@ use commands::{
     render_slash_command_help, resume_supported_slash_commands, slash_command_specs, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
-use render::{Spinner, TerminalRenderer};
+use init::initialize_repo;
+use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     clear_oauth_credentials, generate_pkce_pair, generate_state, load_system_prompt,
     parse_oauth_callback_request_target, save_oauth_credentials, ApiClient, ApiRequest,
     AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
-    ConversationMessage, ConversationRuntime, MessageRole, OAuthAuthorizationRequest,
+    ConversationMessage, ConversationRuntime, MessageRole, OAuthAuthorizationRequest, OAuthConfig,
     OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, RuntimeError,
     Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde_json::json;
 use tools::{execute_tool, mvp_tool_specs, ToolSpec};
 
-const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
-const DEFAULT_MAX_TOKENS: u32 = 32;
+const DEFAULT_MODEL: &str = "claude-opus-4-6";
+fn max_tokens_for_model(model: &str) -> u32 {
+    if model.contains("opus") {
+        32_000
+    } else {
+        64_000
+    }
+}
 const DEFAULT_DATE: &str = "2026-03-31";
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -47,7 +55,7 @@ fn main() {
         eprintln!(
             "error: {error}
 
-Run `rusty-claude-cli --help` for usage."
+Run `claw --help` for usage."
         );
         std::process::exit(1);
     }
@@ -70,10 +78,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             allowed_tools,
             permission_mode,
-        } => LiveCli::new(model, false, allowed_tools, permission_mode)?
+        } => LiveCli::new(model, true, allowed_tools, permission_mode)?
             .run_turn_with_output(&prompt, output_format)?,
         CliAction::Login => run_login()?,
         CliAction::Logout => run_logout()?,
+        CliAction::Init => run_init()?,
         CliAction::Repl {
             model,
             allowed_tools,
@@ -106,6 +115,7 @@ enum CliAction {
     },
     Login,
     Logout,
+    Init,
     Repl {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
@@ -153,11 +163,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --model".to_string())?;
-                model.clone_from(value);
+                model = resolve_model_alias(value).to_string();
                 index += 2;
             }
             flag if flag.starts_with("--model=") => {
-                model = flag[8..].to_string();
+                model = resolve_model_alias(&flag[8..]).to_string();
                 index += 1;
             }
             "--output-format" => {
@@ -180,6 +190,29 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             flag if flag.starts_with("--permission-mode=") => {
                 permission_mode = parse_permission_mode_arg(&flag[18..])?;
+                index += 1;
+            }
+            "--dangerously-skip-permissions" => {
+                permission_mode = PermissionMode::DangerFullAccess;
+                index += 1;
+            }
+            "-p" => {
+                // Claw Code compat: -p "prompt" = one-shot prompt
+                let prompt = args[index + 1..].join(" ");
+                if prompt.trim().is_empty() {
+                    return Err("-p requires a prompt string".to_string());
+                }
+                return Ok(CliAction::Prompt {
+                    prompt,
+                    model: resolve_model_alias(&model).to_string(),
+                    output_format,
+                    allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
+                    permission_mode,
+                });
+            }
+            "--print" => {
+                // Claw Code compat: --print makes output non-interactive
+                output_format = CliOutputFormat::Text;
                 index += 1;
             }
             "--allowedTools" | "--allowed-tools" => {
@@ -230,6 +263,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "system-prompt" => parse_system_prompt_args(&rest[1..]),
         "login" => Ok(CliAction::Login),
         "logout" => Ok(CliAction::Logout),
+        "init" => Ok(CliAction::Init),
         "prompt" => {
             let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
@@ -251,6 +285,15 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             permission_mode,
         }),
         other => Err(format!("unknown subcommand: {other}")),
+    }
+}
+
+fn resolve_model_alias(model: &str) -> &str {
+    match model {
+        "opus" => "claude-opus-4-6",
+        "sonnet" => "claude-sonnet-4-6",
+        "haiku" => "claude-haiku-4-5-20251213",
+        _ => model,
     }
 }
 
@@ -326,7 +369,7 @@ fn default_permission_mode() -> PermissionMode {
         .ok()
         .as_deref()
         .and_then(normalize_permission_mode)
-        .map_or(PermissionMode::WorkspaceWrite, permission_mode_from_label)
+        .map_or(PermissionMode::DangerFullAccess, permission_mode_from_label)
 }
 
 fn filter_tool_specs(allowed_tools: Option<&AllowedToolSet>) -> Vec<tools::ToolSpec> {
@@ -404,15 +447,26 @@ fn print_bootstrap_plan() {
     }
 }
 
+fn default_oauth_config() -> OAuthConfig {
+    OAuthConfig {
+        client_id: String::from("9d1c250a-e61b-44d9-88ed-5944d1962f5e"),
+        authorize_url: String::from("https://platform.claude.com/oauth/authorize"),
+        token_url: String::from("https://platform.claude.com/v1/oauth/token"),
+        callback_port: None,
+        manual_redirect_url: None,
+        scopes: vec![
+            String::from("user:profile"),
+            String::from("user:inference"),
+            String::from("user:sessions:claude_code"),
+        ],
+    }
+}
+
 fn run_login() -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let config = ConfigLoader::default_for(&cwd).load()?;
-    let oauth = config.oauth().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "OAuth config is missing. Add settings.oauth.clientId/authorizeUrl/tokenUrl first.",
-        )
-    })?;
+    let default_oauth = default_oauth_config();
+    let oauth = config.oauth().unwrap_or(&default_oauth);
     let callback_port = oauth.callback_port.unwrap_or(DEFAULT_OAUTH_CALLBACK_PORT);
     let redirect_uri = runtime::loopback_redirect_uri(callback_port);
     let pkce = generate_pkce_pair()?;
@@ -445,7 +499,7 @@ fn run_login() -> Result<(), Box<dyn std::error::Error>> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "oauth state mismatch").into());
     }
 
-    let client = AnthropicClient::from_auth(AuthSource::None);
+    let client = AnthropicClient::from_auth(AuthSource::None).with_base_url(api::read_base_url());
     let exchange_request =
         OAuthTokenExchangeRequest::from_config(oauth, code, state, pkce.verifier, redirect_uri);
     let runtime = tokio::runtime::Runtime::new()?;
@@ -703,26 +757,6 @@ fn format_resume_report(session_path: &str, message_count: usize, turns: u32) ->
     )
 }
 
-fn format_init_report(path: &Path, created: bool) -> String {
-    if created {
-        format!(
-            "Init
-  CLAUDE.md        {}
-  Result           created
-  Next step        Review and tailor the generated guidance",
-            path.display()
-        )
-    } else {
-        format!(
-            "Init
-  CLAUDE.md        {}
-  Result           skipped (already exists)
-  Next step        Edit the existing file intentionally if workflows changed",
-            path.display()
-        )
-    }
-}
-
 fn format_compact_report(removed: usize, resulting_messages: usize, skipped: bool) -> String {
     if skipped {
         format!(
@@ -739,6 +773,10 @@ fn format_compact_report(removed: usize, resulting_messages: usize, skipped: boo
   Messages kept    {resulting_messages}"
         )
     }
+}
+
+fn format_auto_compaction_notice(removed: usize) -> String {
+    format!("[auto-compacted: removed {removed} messages]")
 }
 
 fn parse_git_status_metadata(status: Option<&str>) -> (Option<PathBuf>, Option<String>) {
@@ -879,7 +917,14 @@ fn run_resume_command(
                 )),
             })
         }
-        SlashCommand::Resume { .. }
+        SlashCommand::Bughunter { .. }
+        | SlashCommand::Commit
+        | SlashCommand::Pr { .. }
+        | SlashCommand::Issue { .. }
+        | SlashCommand::Ultraplan { .. }
+        | SlashCommand::Teleport { .. }
+        | SlashCommand::DebugToolCall
+        | SlashCommand::Resume { .. }
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
@@ -893,7 +938,7 @@ fn run_repl(
     permission_mode: PermissionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
-    let mut editor = input::LineEditor::new("› ", slash_command_completion_candidates());
+    let mut editor = input::LineEditor::new("> ", slash_command_completion_candidates());
     println!("{}", cli.startup_banner());
 
     loop {
@@ -964,6 +1009,7 @@ impl LiveCli {
             model.clone(),
             system_prompt.clone(),
             enable_tools,
+            true,
             allowed_tools.clone(),
             permission_mode,
         )?;
@@ -980,14 +1026,26 @@ impl LiveCli {
     }
 
     fn startup_banner(&self) -> String {
+        let cwd = env::current_dir().map_or_else(
+            |_| "<unknown>".to_string(),
+            |path| path.display().to_string(),
+        );
         format!(
-            "Rusty Claude CLI\n  Model            {}\n  Permission mode  {}\n  Working directory {}\n  Session          {}\n\nType /help for commands. Shift+Enter or Ctrl+J inserts a newline.",
+            "\x1b[38;5;196m\
+ ██████╗██╗      █████╗ ██╗    ██╗\n\
+██╔════╝██║     ██╔══██╗██║    ██║\n\
+██║     ██║     ███████║██║ █╗ ██║\n\
+██║     ██║     ██╔══██║██║███╗██║\n\
+╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
+ ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞\n\n\
+  \x1b[2mModel\x1b[0m            {}\n\
+  \x1b[2mPermissions\x1b[0m      {}\n\
+  \x1b[2mDirectory\x1b[0m        {}\n\
+  \x1b[2mSession\x1b[0m          {}\n\n\
+  Type \x1b[1m/help\x1b[0m for commands · \x1b[2mShift+Enter\x1b[0m for newline",
             self.model,
             self.permission_mode.as_str(),
-            env::current_dir().map_or_else(
-                |_| "<unknown>".to_string(),
-                |path| path.display().to_string(),
-            ),
+            cwd,
             self.session.id,
         )
     }
@@ -996,26 +1054,32 @@ impl LiveCli {
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         spinner.tick(
-            "Waiting for Claude",
+            "🦀 Thinking...",
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = self.runtime.run_turn(input, Some(&mut permission_prompter));
         match result {
-            Ok(_) => {
+            Ok(summary) => {
                 spinner.finish(
-                    "Claude response complete",
+                    "✨ Done",
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
                 println!();
+                if let Some(event) = summary.auto_compaction {
+                    println!(
+                        "{}",
+                        format_auto_compaction_notice(event.removed_message_count)
+                    );
+                }
                 self.persist_session()?;
                 Ok(())
             }
             Err(error) => {
                 spinner.fail(
-                    "Claude request failed",
+                    "❌ Request failed",
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
@@ -1036,42 +1100,37 @@ impl LiveCli {
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let client = AnthropicClient::from_auth(resolve_cli_auth_source()?);
-        let request = MessageRequest {
-            model: self.model.clone(),
-            max_tokens: DEFAULT_MAX_TOKENS,
-            messages: vec![InputMessage {
-                role: "user".to_string(),
-                content: vec![InputContentBlock::Text {
-                    text: input.to_string(),
-                }],
-            }],
-            system: (!self.system_prompt.is_empty()).then(|| self.system_prompt.join("\n\n")),
-            tools: None,
-            tool_choice: None,
-            stream: false,
-        };
-        let runtime = tokio::runtime::Runtime::new()?;
-        let response = runtime.block_on(client.send_message(&request))?;
-        let text = response
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                OutputContentBlock::Text { text } => Some(text.as_str()),
-                OutputContentBlock::ToolUse { .. } => None,
-            })
-            .collect::<Vec<_>>()
-            .join("");
+        let session = self.runtime.session().clone();
+        let mut runtime = build_runtime(
+            session,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            false,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+        )?;
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let summary = runtime.run_turn(input, Some(&mut permission_prompter))?;
+        self.runtime = runtime;
+        self.persist_session()?;
         println!(
             "{}",
             json!({
-                "message": text,
+                "message": final_assistant_text(&summary),
                 "model": self.model,
+                "iterations": summary.iterations,
+                "auto_compaction": summary.auto_compaction.map(|event| json!({
+                    "removed_messages": event.removed_message_count,
+                    "notice": format_auto_compaction_notice(event.removed_message_count),
+                })),
+                "tool_uses": collect_tool_uses(&summary),
+                "tool_results": collect_tool_results(&summary),
                 "usage": {
-                    "input_tokens": response.usage.input_tokens,
-                    "output_tokens": response.usage.output_tokens,
-                    "cache_creation_input_tokens": response.usage.cache_creation_input_tokens,
-                    "cache_read_input_tokens": response.usage.cache_read_input_tokens,
+                    "input_tokens": summary.usage.input_tokens,
+                    "output_tokens": summary.usage.output_tokens,
+                    "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
                 }
             })
         );
@@ -1089,6 +1148,34 @@ impl LiveCli {
             }
             SlashCommand::Status => {
                 self.print_status();
+                false
+            }
+            SlashCommand::Bughunter { scope } => {
+                self.run_bughunter(scope.as_deref())?;
+                false
+            }
+            SlashCommand::Commit => {
+                self.run_commit()?;
+                true
+            }
+            SlashCommand::Pr { context } => {
+                self.run_pr(context.as_deref())?;
+                false
+            }
+            SlashCommand::Issue { context } => {
+                self.run_issue(context.as_deref())?;
+                false
+            }
+            SlashCommand::Ultraplan { task } => {
+                self.run_ultraplan(task.as_deref())?;
+                false
+            }
+            SlashCommand::Teleport { target } => {
+                self.run_teleport(target.as_deref())?;
+                false
+            }
+            SlashCommand::DebugToolCall => {
+                self.run_debug_tool_call()?;
                 false
             }
             SlashCommand::Compact => {
@@ -1112,7 +1199,7 @@ impl LiveCli {
                 false
             }
             SlashCommand::Init => {
-                Self::run_init()?;
+                run_init()?;
                 false
             }
             SlashCommand::Diff => {
@@ -1175,6 +1262,8 @@ impl LiveCli {
             return Ok(false);
         };
 
+        let model = resolve_model_alias(&model).to_string();
+
         if model == self.model {
             println!(
                 "{}",
@@ -1194,6 +1283,7 @@ impl LiveCli {
             session,
             model.clone(),
             self.system_prompt.clone(),
+            true,
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
@@ -1237,6 +1327,7 @@ impl LiveCli {
             self.model.clone(),
             self.system_prompt.clone(),
             true,
+            true,
             self.allowed_tools.clone(),
             self.permission_mode,
         )?;
@@ -1260,6 +1351,7 @@ impl LiveCli {
             Session::new(),
             self.model.clone(),
             self.system_prompt.clone(),
+            true,
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
@@ -1295,6 +1387,7 @@ impl LiveCli {
             self.model.clone(),
             self.system_prompt.clone(),
             true,
+            true,
             self.allowed_tools.clone(),
             self.permission_mode,
         )?;
@@ -1317,11 +1410,6 @@ impl LiveCli {
 
     fn print_memory() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", render_memory_report()?);
-        Ok(())
-    }
-
-    fn run_init() -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", init_claude_md()?);
         Ok(())
     }
 
@@ -1371,6 +1459,7 @@ impl LiveCli {
                     self.model.clone(),
                     self.system_prompt.clone(),
                     true,
+                    true,
                     self.allowed_tools.clone(),
                     self.permission_mode,
                 )?;
@@ -1400,11 +1489,166 @@ impl LiveCli {
             self.model.clone(),
             self.system_prompt.clone(),
             true,
+            true,
             self.allowed_tools.clone(),
             self.permission_mode,
         )?;
         self.persist_session()?;
         println!("{}", format_compact_report(removed, kept, skipped));
+        Ok(())
+    }
+
+    fn run_internal_prompt_text(
+        &self,
+        prompt: &str,
+        enable_tools: bool,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let session = self.runtime.session().clone();
+        let mut runtime = build_runtime(
+            session,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            enable_tools,
+            false,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+        )?;
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let summary = runtime.run_turn(prompt, Some(&mut permission_prompter))?;
+        Ok(final_assistant_text(&summary).trim().to_string())
+    }
+
+    fn run_bughunter(&self, scope: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        let scope = scope.unwrap_or("the current repository");
+        let prompt = format!(
+            "You are /bughunter. Inspect {scope} and identify the most likely bugs or correctness issues. Prioritize concrete findings with file paths, severity, and suggested fixes. Use tools if needed."
+        );
+        println!("{}", self.run_internal_prompt_text(&prompt, true)?);
+        Ok(())
+    }
+
+    fn run_ultraplan(&self, task: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        let task = task.unwrap_or("the current repo work");
+        let prompt = format!(
+            "You are /ultraplan. Produce a deep multi-step execution plan for {task}. Include goals, risks, implementation sequence, verification steps, and rollback considerations. Use tools if needed."
+        );
+        println!("{}", self.run_internal_prompt_text(&prompt, true)?);
+        Ok(())
+    }
+
+    fn run_teleport(&self, target: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(target) = target.map(str::trim).filter(|value| !value.is_empty()) else {
+            println!("Usage: /teleport <symbol-or-path>");
+            return Ok(());
+        };
+
+        println!("{}", render_teleport_report(target)?);
+        Ok(())
+    }
+
+    fn run_debug_tool_call(&self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("{}", render_last_tool_debug_report(self.runtime.session())?);
+        Ok(())
+    }
+
+    fn run_commit(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let status = git_output(&["status", "--short"])?;
+        if status.trim().is_empty() {
+            println!("Commit\n  Result           skipped\n  Reason           no workspace changes");
+            return Ok(());
+        }
+
+        git_status_ok(&["add", "-A"])?;
+        let staged_stat = git_output(&["diff", "--cached", "--stat"])?;
+        let prompt = format!(
+            "Generate a git commit message in plain text Lore format only. Base it on this staged diff summary:\n\n{}\n\nRecent conversation context:\n{}",
+            truncate_for_prompt(&staged_stat, 8_000),
+            recent_user_context(self.runtime.session(), 6)
+        );
+        let message = sanitize_generated_message(&self.run_internal_prompt_text(&prompt, false)?);
+        if message.trim().is_empty() {
+            return Err("generated commit message was empty".into());
+        }
+
+        let path = write_temp_text_file("claw-commit-message.txt", &message)?;
+        let output = Command::new("git")
+            .args(["commit", "--file"])
+            .arg(&path)
+            .current_dir(env::current_dir()?)
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(format!("git commit failed: {stderr}").into());
+        }
+
+        println!(
+            "Commit\n  Result           created\n  Message file     {}\n\n{}",
+            path.display(),
+            message.trim()
+        );
+        Ok(())
+    }
+
+    fn run_pr(&self, context: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        let staged = git_output(&["diff", "--stat"])?;
+        let prompt = format!(
+            "Generate a pull request title and body from this conversation and diff summary. Output plain text in this format exactly:\nTITLE: <title>\nBODY:\n<body markdown>\n\nContext hint: {}\n\nDiff summary:\n{}",
+            context.unwrap_or("none"),
+            truncate_for_prompt(&staged, 10_000)
+        );
+        let draft = sanitize_generated_message(&self.run_internal_prompt_text(&prompt, false)?);
+        let (title, body) = parse_titled_body(&draft)
+            .ok_or_else(|| "failed to parse generated PR title/body".to_string())?;
+
+        if command_exists("gh") {
+            let body_path = write_temp_text_file("claw-pr-body.md", &body)?;
+            let output = Command::new("gh")
+                .args(["pr", "create", "--title", &title, "--body-file"])
+                .arg(&body_path)
+                .current_dir(env::current_dir()?)
+                .output()?;
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                println!(
+                    "PR\n  Result           created\n  Title            {title}\n  URL              {}",
+                    if stdout.is_empty() { "<unknown>" } else { &stdout }
+                );
+                return Ok(());
+            }
+        }
+
+        println!("PR draft\n  Title            {title}\n\n{body}");
+        Ok(())
+    }
+
+    fn run_issue(&self, context: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        let prompt = format!(
+            "Generate a GitHub issue title and body from this conversation. Output plain text in this format exactly:\nTITLE: <title>\nBODY:\n<body markdown>\n\nContext hint: {}\n\nConversation context:\n{}",
+            context.unwrap_or("none"),
+            truncate_for_prompt(&recent_user_context(self.runtime.session(), 10), 10_000)
+        );
+        let draft = sanitize_generated_message(&self.run_internal_prompt_text(&prompt, false)?);
+        let (title, body) = parse_titled_body(&draft)
+            .ok_or_else(|| "failed to parse generated issue title/body".to_string())?;
+
+        if command_exists("gh") {
+            let body_path = write_temp_text_file("claw-issue-body.md", &body)?;
+            let output = Command::new("gh")
+                .args(["issue", "create", "--title", &title, "--body-file"])
+                .arg(&body_path)
+                .current_dir(env::current_dir()?)
+                .output()?;
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                println!(
+                    "Issue\n  Result           created\n  Title            {title}\n  URL              {}",
+                    if stdout.is_empty() { "<unknown>" } else { &stdout }
+                );
+                return Ok(());
+            }
+        }
+
+        println!("Issue draft\n  Title            {title}\n\n{body}");
         Ok(())
     }
 }
@@ -1722,67 +1966,12 @@ fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
 
 fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let claude_md = cwd.join("CLAUDE.md");
-    if claude_md.exists() {
-        return Ok(format_init_report(&claude_md, false));
-    }
-
-    let content = render_init_claude_md(&cwd);
-    fs::write(&claude_md, content)?;
-    Ok(format_init_report(&claude_md, true))
+    Ok(initialize_repo(&cwd)?.render())
 }
 
-fn render_init_claude_md(cwd: &Path) -> String {
-    let mut lines = vec![
-        "# CLAUDE.md".to_string(),
-        String::new(),
-        "This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.".to_string(),
-        String::new(),
-    ];
-
-    let mut command_lines = Vec::new();
-    if cwd.join("rust").join("Cargo.toml").is_file() {
-        command_lines.push("- Run Rust verification from `rust/`: `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`".to_string());
-    } else if cwd.join("Cargo.toml").is_file() {
-        command_lines.push("- Run Rust verification from the repo root: `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`".to_string());
-    }
-    if cwd.join("tests").is_dir() && cwd.join("src").is_dir() {
-        command_lines.push("- `src/` and `tests/` are also present; check those surfaces before removing or renaming Python-era compatibility assets.".to_string());
-    }
-    if !command_lines.is_empty() {
-        lines.push("## Verification".to_string());
-        lines.extend(command_lines);
-        lines.push(String::new());
-    }
-
-    let mut structure_lines = Vec::new();
-    if cwd.join("rust").is_dir() {
-        structure_lines.push(
-            "- `rust/` contains the Rust workspace and the active CLI/runtime implementation."
-                .to_string(),
-        );
-    }
-    if cwd.join("src").is_dir() {
-        structure_lines.push("- `src/` contains the older Python-first workspace artifacts referenced by the repo history and tests.".to_string());
-    }
-    if cwd.join("tests").is_dir() {
-        structure_lines.push("- `tests/` exercises compatibility and porting behavior across the repository surfaces.".to_string());
-    }
-    if !structure_lines.is_empty() {
-        lines.push("## Repository shape".to_string());
-        lines.extend(structure_lines);
-        lines.push(String::new());
-    }
-
-    lines.push("## Working agreement".to_string());
-    lines.push("- Prefer small, reviewable Rust changes and keep slash-command behavior aligned between the shared command registry and the CLI entrypoints.".to_string());
-    lines.push("- Do not overwrite existing CLAUDE.md content automatically; update it intentionally when repo workflows change.".to_string());
-    lines.push(String::new());
-
-    lines.join(
-        "
-",
-    )
+fn run_init() -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", init_claude_md()?);
+    Ok(())
 }
 
 fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
@@ -1813,11 +2002,211 @@ fn render_diff_report() -> Result<String, Box<dyn std::error::Error>> {
     Ok(format!("Diff\n\n{}", diff.trim_end()))
 }
 
+fn render_teleport_report(target: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+
+    let file_list = Command::new("rg")
+        .args(["--files"])
+        .current_dir(&cwd)
+        .output()?;
+    let file_matches = if file_list.status.success() {
+        String::from_utf8(file_list.stdout)?
+            .lines()
+            .filter(|line| line.contains(target))
+            .take(10)
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    let content_output = Command::new("rg")
+        .args(["-n", "-S", "--color", "never", target, "."])
+        .current_dir(&cwd)
+        .output()?;
+
+    let mut lines = vec![format!("Teleport\n  Target           {target}")];
+    if !file_matches.is_empty() {
+        lines.push(String::new());
+        lines.push("File matches".to_string());
+        lines.extend(file_matches.into_iter().map(|path| format!("  {path}")));
+    }
+
+    if content_output.status.success() {
+        let matches = String::from_utf8(content_output.stdout)?;
+        if !matches.trim().is_empty() {
+            lines.push(String::new());
+            lines.push("Content matches".to_string());
+            lines.push(truncate_for_prompt(&matches, 4_000));
+        }
+    }
+
+    if lines.len() == 1 {
+        lines.push("  Result           no matches found".to_string());
+    }
+
+    Ok(lines.join("\n"))
+}
+
+fn render_last_tool_debug_report(session: &Session) -> Result<String, Box<dyn std::error::Error>> {
+    let last_tool_use = session
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| {
+            message.blocks.iter().rev().find_map(|block| match block {
+                ContentBlock::ToolUse { id, name, input } => {
+                    Some((id.clone(), name.clone(), input.clone()))
+                }
+                _ => None,
+            })
+        })
+        .ok_or_else(|| "no prior tool call found in session".to_string())?;
+
+    let tool_result = session.messages.iter().rev().find_map(|message| {
+        message.blocks.iter().rev().find_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name,
+                output,
+                is_error,
+            } if tool_use_id == &last_tool_use.0 => {
+                Some((tool_name.clone(), output.clone(), *is_error))
+            }
+            _ => None,
+        })
+    });
+
+    let mut lines = vec![
+        "Debug tool call".to_string(),
+        format!("  Tool id          {}", last_tool_use.0),
+        format!("  Tool name        {}", last_tool_use.1),
+        "  Input".to_string(),
+        indent_block(&last_tool_use.2, 4),
+    ];
+
+    match tool_result {
+        Some((tool_name, output, is_error)) => {
+            lines.push("  Result".to_string());
+            lines.push(format!("    name           {tool_name}"));
+            lines.push(format!(
+                "    status         {}",
+                if is_error { "error" } else { "ok" }
+            ));
+            lines.push(indent_block(&output, 4));
+        }
+        None => lines.push("  Result           missing tool result".to_string()),
+    }
+
+    Ok(lines.join("\n"))
+}
+
+fn indent_block(value: &str, spaces: usize) -> String {
+    let indent = " ".repeat(spaces);
+    value
+        .lines()
+        .map(|line| format!("{indent}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn git_output(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(env::current_dir()?)
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("git {} failed: {stderr}", args.join(" ")).into());
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+fn git_status_ok(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(env::current_dir()?)
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("git {} failed: {stderr}", args.join(" ")).into());
+    }
+    Ok(())
+}
+
+fn command_exists(name: &str) -> bool {
+    Command::new("which")
+        .arg(name)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn write_temp_text_file(
+    filename: &str,
+    contents: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let path = env::temp_dir().join(filename);
+    fs::write(&path, contents)?;
+    Ok(path)
+}
+
+fn recent_user_context(session: &Session, limit: usize) -> String {
+    let requests = session
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User)
+        .filter_map(|message| {
+            message.blocks.iter().find_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.trim().to_string()),
+                _ => None,
+            })
+        })
+        .rev()
+        .take(limit)
+        .collect::<Vec<_>>();
+
+    if requests.is_empty() {
+        "<no prior user messages>".to_string()
+    } else {
+        requests
+            .into_iter()
+            .rev()
+            .enumerate()
+            .map(|(index, text)| format!("{}. {}", index + 1, text))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn truncate_for_prompt(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        value.trim().to_string()
+    } else {
+        let truncated = value.chars().take(limit).collect::<String>();
+        format!("{}\n…[truncated]", truncated.trim_end())
+    }
+}
+
+fn sanitize_generated_message(value: &str) -> String {
+    value.trim().trim_matches('`').trim().replace("\r\n", "\n")
+}
+
+fn parse_titled_body(value: &str) -> Option<(String, String)> {
+    let normalized = sanitize_generated_message(value);
+    let title = normalized
+        .lines()
+        .find_map(|line| line.strip_prefix("TITLE:").map(str::trim))?;
+    let body_start = normalized.find("BODY:")?;
+    let body = normalized[body_start + "BODY:".len()..].trim();
+    Some((title.to_string(), body.to_string()))
+}
+
 fn render_version_report() -> String {
     let git_sha = GIT_SHA.unwrap_or("unknown");
     let target = BUILD_TARGET.unwrap_or("unknown");
     format!(
-        "Version\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
+        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
     )
 }
 
@@ -1917,21 +2306,32 @@ fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     )?)
 }
 
+fn build_runtime_feature_config(
+) -> Result<runtime::RuntimeFeatureConfig, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    Ok(ConfigLoader::default_for(cwd)
+        .load()?
+        .feature_config()
+        .clone())
+}
+
 fn build_runtime(
     session: Session,
     model: String,
     system_prompt: Vec<String>,
     enable_tools: bool,
+    emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
 ) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
-    Ok(ConversationRuntime::new(
+    Ok(ConversationRuntime::new_with_features(
         session,
-        AnthropicRuntimeClient::new(model, enable_tools, allowed_tools.clone())?,
-        CliToolExecutor::new(allowed_tools),
+        AnthropicRuntimeClient::new(model, enable_tools, emit_output, allowed_tools.clone())?,
+        CliToolExecutor::new(allowed_tools, emit_output),
         permission_policy(permission_mode),
         system_prompt,
+        build_runtime_feature_config()?,
     ))
 }
 
@@ -1986,6 +2386,7 @@ struct AnthropicRuntimeClient {
     client: AnthropicClient,
     model: String,
     enable_tools: bool,
+    emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
 }
 
@@ -1993,13 +2394,16 @@ impl AnthropicRuntimeClient {
     fn new(
         model: String,
         enable_tools: bool,
+        emit_output: bool,
         allowed_tools: Option<AllowedToolSet>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?),
+            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
+                .with_base_url(api::read_base_url()),
             model,
             enable_tools,
+            emit_output,
             allowed_tools,
         })
     }
@@ -2020,7 +2424,7 @@ impl ApiClient for AnthropicRuntimeClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let message_request = MessageRequest {
             model: self.model.clone(),
-            max_tokens: DEFAULT_MAX_TOKENS,
+            max_tokens: max_tokens_for_model(&self.model),
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: self.enable_tools.then(|| {
@@ -2044,6 +2448,14 @@ impl ApiClient for AnthropicRuntimeClient {
                 .await
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             let mut stdout = io::stdout();
+            let mut sink = io::sink();
+            let out: &mut dyn Write = if self.emit_output {
+                &mut stdout
+            } else {
+                &mut sink
+            };
+            let renderer = TerminalRenderer::new();
+            let mut markdown_stream = MarkdownStreamState::default();
             let mut events = Vec::new();
             let mut pending_tool: Option<(String, String, String)> = None;
             let mut saw_stop = false;
@@ -2056,23 +2468,26 @@ impl ApiClient for AnthropicRuntimeClient {
                 match event {
                     ApiStreamEvent::MessageStart(start) => {
                         for block in start.message.content {
-                            push_output_block(block, &mut stdout, &mut events, &mut pending_tool)?;
+                            push_output_block(block, out, &mut events, &mut pending_tool, true)?;
                         }
                     }
                     ApiStreamEvent::ContentBlockStart(start) => {
                         push_output_block(
                             start.content_block,
-                            &mut stdout,
+                            out,
                             &mut events,
                             &mut pending_tool,
+                            true,
                         )?;
                     }
                     ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                         ContentBlockDelta::TextDelta { text } => {
                             if !text.is_empty() {
-                                write!(stdout, "{text}")
-                                    .and_then(|()| stdout.flush())
-                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                if let Some(rendered) = markdown_stream.push(&renderer, &text) {
+                                    write!(out, "{rendered}")
+                                        .and_then(|()| out.flush())
+                                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                }
                                 events.push(AssistantEvent::TextDelta(text));
                             }
                         }
@@ -2083,7 +2498,16 @@ impl ApiClient for AnthropicRuntimeClient {
                         }
                     },
                     ApiStreamEvent::ContentBlockStop(_) => {
+                        if let Some(rendered) = markdown_stream.flush(&renderer) {
+                            write!(out, "{rendered}")
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
                         if let Some((id, name, input)) = pending_tool.take() {
+                            // Display tool call now that input is fully accumulated
+                            writeln!(out, "\n{}", format_tool_call_start(&name, &input))
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
                             events.push(AssistantEvent::ToolUse { id, name, input });
                         }
                     }
@@ -2097,6 +2521,11 @@ impl ApiClient for AnthropicRuntimeClient {
                     }
                     ApiStreamEvent::MessageStop(_) => {
                         saw_stop = true;
+                        if let Some(rendered) = markdown_stream.flush(&renderer) {
+                            write!(out, "{rendered}")
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
                         events.push(AssistantEvent::MessageStop);
                     }
                 }
@@ -2126,9 +2555,65 @@ impl ApiClient for AnthropicRuntimeClient {
                 })
                 .await
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
-            response_to_events(response, &mut stdout)
+            response_to_events(response, out)
         })
     }
+}
+
+fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
+    summary
+        .assistant_messages
+        .last()
+        .map(|message| {
+            message
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
+fn collect_tool_uses(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {
+    summary
+        .assistant_messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, name, input } => Some(json!({
+                "id": id,
+                "name": name,
+                "input": input,
+            })),
+            _ => None,
+        })
+        .collect()
+}
+
+fn collect_tool_results(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {
+    summary
+        .tool_results
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name,
+                output,
+                is_error,
+            } => Some(json!({
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "output": output,
+                "is_error": is_error,
+            })),
+            _ => None,
+        })
+        .collect()
 }
 
 fn slash_command_completion_candidates() -> Vec<String> {
@@ -2139,28 +2624,327 @@ fn slash_command_completion_candidates() -> Vec<String> {
 }
 
 fn format_tool_call_start(name: &str, input: &str) -> String {
+    let parsed: serde_json::Value =
+        serde_json::from_str(input).unwrap_or(serde_json::Value::String(input.to_string()));
+
+    let detail = match name {
+        "bash" | "Bash" => format_bash_call(&parsed),
+        "read_file" | "Read" => {
+            let path = extract_tool_path(&parsed);
+            format!("\x1b[2m📄 Reading {path}…\x1b[0m")
+        }
+        "write_file" | "Write" => {
+            let path = extract_tool_path(&parsed);
+            let lines = parsed
+                .get("content")
+                .and_then(|value| value.as_str())
+                .map_or(0, |content| content.lines().count());
+            format!("\x1b[1;32m✏️ Writing {path}\x1b[0m \x1b[2m({lines} lines)\x1b[0m")
+        }
+        "edit_file" | "Edit" => {
+            let path = extract_tool_path(&parsed);
+            let old_value = parsed
+                .get("old_string")
+                .or_else(|| parsed.get("oldString"))
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let new_value = parsed
+                .get("new_string")
+                .or_else(|| parsed.get("newString"))
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            format!(
+                "\x1b[1;33m📝 Editing {path}\x1b[0m{}",
+                format_patch_preview(old_value, new_value)
+                    .map(|preview| format!("\n{preview}"))
+                    .unwrap_or_default()
+            )
+        }
+        "glob_search" | "Glob" => format_search_start("🔎 Glob", &parsed),
+        "grep_search" | "Grep" => format_search_start("🔎 Grep", &parsed),
+        "web_search" | "WebSearch" => parsed
+            .get("query")
+            .and_then(|value| value.as_str())
+            .unwrap_or("?")
+            .to_string(),
+        _ => summarize_tool_payload(input),
+    };
+
+    let border = "─".repeat(name.len() + 8);
     format!(
-        "Tool call
-  Name             {name}
-  Input            {}",
-        summarize_tool_payload(input)
+        "\x1b[38;5;245m╭─ \x1b[1;36m{name}\x1b[0;38;5;245m ─╮\x1b[0m\n\x1b[38;5;245m│\x1b[0m {detail}\n\x1b[38;5;245m╰{border}╯\x1b[0m"
     )
 }
 
 fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
-    let status = if is_error { "error" } else { "ok" };
+    let icon = if is_error {
+        "\x1b[1;31m✗\x1b[0m"
+    } else {
+        "\x1b[1;32m✓\x1b[0m"
+    };
+    if is_error {
+        let summary = truncate_for_summary(output.trim(), 160);
+        return if summary.is_empty() {
+            format!("{icon} \x1b[38;5;245m{name}\x1b[0m")
+        } else {
+            format!("{icon} \x1b[38;5;245m{name}\x1b[0m\n\x1b[38;5;203m{summary}\x1b[0m")
+        };
+    }
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(output).unwrap_or(serde_json::Value::String(output.to_string()));
+    match name {
+        "bash" | "Bash" => format_bash_result(icon, &parsed),
+        "read_file" | "Read" => format_read_result(icon, &parsed),
+        "write_file" | "Write" => format_write_result(icon, &parsed),
+        "edit_file" | "Edit" => format_edit_result(icon, &parsed),
+        "glob_search" | "Glob" => format_glob_result(icon, &parsed),
+        "grep_search" | "Grep" => format_grep_result(icon, &parsed),
+        _ => {
+            let summary = truncate_for_summary(output.trim(), 200);
+            format!("{icon} \x1b[38;5;245m{name}:\x1b[0m {summary}")
+        }
+    }
+}
+
+fn extract_tool_path(parsed: &serde_json::Value) -> String {
+    parsed
+        .get("file_path")
+        .or_else(|| parsed.get("filePath"))
+        .or_else(|| parsed.get("path"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("?")
+        .to_string()
+}
+
+fn format_search_start(label: &str, parsed: &serde_json::Value) -> String {
+    let pattern = parsed
+        .get("pattern")
+        .and_then(|value| value.as_str())
+        .unwrap_or("?");
+    let scope = parsed
+        .get("path")
+        .and_then(|value| value.as_str())
+        .unwrap_or(".");
+    format!("{label} {pattern}\n\x1b[2min {scope}\x1b[0m")
+}
+
+fn format_patch_preview(old_value: &str, new_value: &str) -> Option<String> {
+    if old_value.is_empty() && new_value.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "\x1b[38;5;203m- {}\x1b[0m\n\x1b[38;5;70m+ {}\x1b[0m",
+        truncate_for_summary(first_visible_line(old_value), 72),
+        truncate_for_summary(first_visible_line(new_value), 72)
+    ))
+}
+
+fn format_bash_call(parsed: &serde_json::Value) -> String {
+    let command = parsed
+        .get("command")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if command.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\x1b[48;5;236;38;5;255m $ {} \x1b[0m",
+            truncate_for_summary(command, 160)
+        )
+    }
+}
+
+fn first_visible_line(text: &str) -> &str {
+    text.lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(text)
+}
+
+fn format_bash_result(icon: &str, parsed: &serde_json::Value) -> String {
+    let mut lines = vec![format!("{icon} \x1b[38;5;245mbash\x1b[0m")];
+    if let Some(task_id) = parsed
+        .get("backgroundTaskId")
+        .and_then(|value| value.as_str())
+    {
+        lines[0].push_str(&format!(" backgrounded ({task_id})"));
+    } else if let Some(status) = parsed
+        .get("returnCodeInterpretation")
+        .and_then(|value| value.as_str())
+        .filter(|status| !status.is_empty())
+    {
+        lines[0].push_str(&format!(" {status}"));
+    }
+
+    if let Some(stdout) = parsed.get("stdout").and_then(|value| value.as_str()) {
+        if !stdout.trim().is_empty() {
+            lines.push(stdout.trim_end().to_string());
+        }
+    }
+    if let Some(stderr) = parsed.get("stderr").and_then(|value| value.as_str()) {
+        if !stderr.trim().is_empty() {
+            lines.push(format!("\x1b[38;5;203m{}\x1b[0m", stderr.trim_end()));
+        }
+    }
+
+    lines.join("\n\n")
+}
+
+fn format_read_result(icon: &str, parsed: &serde_json::Value) -> String {
+    let file = parsed.get("file").unwrap_or(parsed);
+    let path = extract_tool_path(file);
+    let start_line = file
+        .get("startLine")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(1);
+    let num_lines = file
+        .get("numLines")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let total_lines = file
+        .get("totalLines")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(num_lines);
+    let content = file
+        .get("content")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let end_line = start_line.saturating_add(num_lines.saturating_sub(1));
+
     format!(
-        "### Tool `{name}`
-
-- Status: {status}
-- Output:
-
-```json
-{}
-```
-",
-        prettify_tool_payload(output)
+        "{icon} \x1b[2m📄 Read {path} (lines {}-{} of {})\x1b[0m\n{}",
+        start_line,
+        end_line.max(start_line),
+        total_lines,
+        content
     )
+}
+
+fn format_write_result(icon: &str, parsed: &serde_json::Value) -> String {
+    let path = extract_tool_path(parsed);
+    let kind = parsed
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("write");
+    let line_count = parsed
+        .get("content")
+        .and_then(|value| value.as_str())
+        .map(|content| content.lines().count())
+        .unwrap_or(0);
+    format!(
+        "{icon} \x1b[1;32m✏️ {} {path}\x1b[0m \x1b[2m({line_count} lines)\x1b[0m",
+        if kind == "create" { "Wrote" } else { "Updated" },
+    )
+}
+
+fn format_structured_patch_preview(parsed: &serde_json::Value) -> Option<String> {
+    let hunks = parsed.get("structuredPatch")?.as_array()?;
+    let mut preview = Vec::new();
+    for hunk in hunks.iter().take(2) {
+        let lines = hunk.get("lines")?.as_array()?;
+        for line in lines.iter().filter_map(|value| value.as_str()).take(6) {
+            match line.chars().next() {
+                Some('+') => preview.push(format!("\x1b[38;5;70m{line}\x1b[0m")),
+                Some('-') => preview.push(format!("\x1b[38;5;203m{line}\x1b[0m")),
+                _ => preview.push(line.to_string()),
+            }
+        }
+    }
+    if preview.is_empty() {
+        None
+    } else {
+        Some(preview.join("\n"))
+    }
+}
+
+fn format_edit_result(icon: &str, parsed: &serde_json::Value) -> String {
+    let path = extract_tool_path(parsed);
+    let suffix = if parsed
+        .get("replaceAll")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        " (replace all)"
+    } else {
+        ""
+    };
+    let preview = format_structured_patch_preview(parsed).or_else(|| {
+        let old_value = parsed
+            .get("oldString")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let new_value = parsed
+            .get("newString")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        format_patch_preview(old_value, new_value)
+    });
+
+    match preview {
+        Some(preview) => format!("{icon} \x1b[1;33m📝 Edited {path}{suffix}\x1b[0m\n{preview}"),
+        None => format!("{icon} \x1b[1;33m📝 Edited {path}{suffix}\x1b[0m"),
+    }
+}
+
+fn format_glob_result(icon: &str, parsed: &serde_json::Value) -> String {
+    let num_files = parsed
+        .get("numFiles")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let filenames = parsed
+        .get("filenames")
+        .and_then(|value| value.as_array())
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|value| value.as_str())
+                .take(8)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    if filenames.is_empty() {
+        format!("{icon} \x1b[38;5;245mglob_search\x1b[0m matched {num_files} files")
+    } else {
+        format!("{icon} \x1b[38;5;245mglob_search\x1b[0m matched {num_files} files\n{filenames}")
+    }
+}
+
+fn format_grep_result(icon: &str, parsed: &serde_json::Value) -> String {
+    let num_matches = parsed
+        .get("numMatches")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let num_files = parsed
+        .get("numFiles")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let content = parsed
+        .get("content")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let filenames = parsed
+        .get("filenames")
+        .and_then(|value| value.as_array())
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|value| value.as_str())
+                .take(8)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let summary = format!(
+        "{icon} \x1b[38;5;245mgrep_search\x1b[0m {num_matches} matches across {num_files} files"
+    );
+    if !content.trim().is_empty() {
+        format!("{summary}\n{}", content.trim_end())
+    } else if !filenames.is_empty() {
+        format!("{summary}\n{filenames}")
+    } else {
+        summary
+    }
 }
 
 fn summarize_tool_payload(payload: &str) -> String {
@@ -2169,13 +2953,6 @@ fn summarize_tool_payload(payload: &str) -> String {
         Err(_) => payload.trim().to_string(),
     };
     truncate_for_summary(&compact, 96)
-}
-
-fn prettify_tool_payload(payload: &str) -> String {
-    match serde_json::from_str::<serde_json::Value>(payload) {
-        Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|_| payload.to_string()),
-        Err(_) => payload.to_string(),
-    }
 }
 
 fn truncate_for_summary(value: &str, limit: usize) -> String {
@@ -2190,29 +2967,34 @@ fn truncate_for_summary(value: &str, limit: usize) -> String {
 
 fn push_output_block(
     block: OutputContentBlock,
-    out: &mut impl Write,
+    out: &mut (impl Write + ?Sized),
     events: &mut Vec<AssistantEvent>,
     pending_tool: &mut Option<(String, String, String)>,
+    streaming_tool_input: bool,
 ) -> Result<(), RuntimeError> {
     match block {
         OutputContentBlock::Text { text } => {
             if !text.is_empty() {
-                write!(out, "{text}")
+                let rendered = TerminalRenderer::new().markdown_to_ansi(&text);
+                write!(out, "{rendered}")
                     .and_then(|()| out.flush())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 events.push(AssistantEvent::TextDelta(text));
             }
         }
         OutputContentBlock::ToolUse { id, name, input } => {
-            writeln!(
-                out,
-                "
-{}",
-                format_tool_call_start(&name, &input.to_string())
-            )
-            .and_then(|()| out.flush())
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
-            *pending_tool = Some((id, name, input.to_string()));
+            // During streaming, the initial content_block_start has an empty input ({}).
+            // The real input arrives via input_json_delta events. In
+            // non-streaming responses, preserve a legitimate empty object.
+            let initial_input = if streaming_tool_input
+                && input.is_object()
+                && input.as_object().is_some_and(serde_json::Map::is_empty)
+            {
+                String::new()
+            } else {
+                input.to_string()
+            };
+            *pending_tool = Some((id, name, initial_input));
         }
     }
     Ok(())
@@ -2220,13 +3002,13 @@ fn push_output_block(
 
 fn response_to_events(
     response: MessageResponse,
-    out: &mut impl Write,
+    out: &mut (impl Write + ?Sized),
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     let mut pending_tool = None;
 
     for block in response.content {
-        push_output_block(block, out, &mut events, &mut pending_tool)?;
+        push_output_block(block, out, &mut events, &mut pending_tool, false)?;
         if let Some((id, name, input)) = pending_tool.take() {
             events.push(AssistantEvent::ToolUse { id, name, input });
         }
@@ -2244,13 +3026,15 @@ fn response_to_events(
 
 struct CliToolExecutor {
     renderer: TerminalRenderer,
+    emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
 }
 
 impl CliToolExecutor {
-    fn new(allowed_tools: Option<AllowedToolSet>) -> Self {
+    fn new(allowed_tools: Option<AllowedToolSet>, emit_output: bool) -> Self {
         Self {
             renderer: TerminalRenderer::new(),
+            emit_output,
             allowed_tools,
         }
     }
@@ -2271,17 +3055,21 @@ impl ToolExecutor for CliToolExecutor {
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
         match execute_tool(tool_name, &value) {
             Ok(output) => {
-                let markdown = format_tool_result(tool_name, &output, false);
-                self.renderer
-                    .stream_markdown(&markdown, &mut io::stdout())
-                    .map_err(|error| ToolError::new(error.to_string()))?;
+                if self.emit_output {
+                    let markdown = format_tool_result(tool_name, &output, false);
+                    self.renderer
+                        .stream_markdown(&markdown, &mut io::stdout())
+                        .map_err(|error| ToolError::new(error.to_string()))?;
+                }
                 Ok(output)
             }
             Err(error) => {
-                let markdown = format_tool_result(tool_name, &error, true);
-                self.renderer
-                    .stream_markdown(&markdown, &mut io::stdout())
-                    .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
+                if self.emit_output {
+                    let markdown = format_tool_result(tool_name, &error, true);
+                    self.renderer
+                        .stream_markdown(&markdown, &mut io::stdout())
+                        .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
+                }
                 Err(ToolError::new(error))
             }
         }
@@ -2341,34 +3129,66 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
         .collect()
 }
 
-fn print_help() {
-    println!("rusty-claude-cli v{VERSION}");
-    println!();
-    println!("Usage:");
-    println!("  rusty-claude-cli [--model MODEL] [--allowedTools TOOL[,TOOL...]]");
-    println!("      Start the interactive REPL");
-    println!("  rusty-claude-cli [--model MODEL] [--output-format text|json] prompt TEXT");
-    println!("      Send one prompt and exit");
-    println!("  rusty-claude-cli [--model MODEL] [--output-format text|json] TEXT");
-    println!("      Shorthand non-interactive prompt mode");
-    println!("  rusty-claude-cli --resume SESSION.json [/status] [/compact] [...]");
-    println!("      Inspect or maintain a saved session without entering the REPL");
-    println!("  rusty-claude-cli dump-manifests");
-    println!("  rusty-claude-cli bootstrap-plan");
-    println!("  rusty-claude-cli system-prompt [--cwd PATH] [--date YYYY-MM-DD]");
-    println!("  rusty-claude-cli login");
-    println!("  rusty-claude-cli logout");
-    println!();
-    println!("Flags:");
-    println!("  --model MODEL              Override the active model");
-    println!("  --output-format FORMAT     Non-interactive output format: text or json");
-    println!("  --permission-mode MODE     Set read-only, workspace-write, or danger-full-access");
-    println!("  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)");
-    println!("  --version, -V              Print version and build information locally");
-    println!();
-    println!("Interactive slash commands:");
-    println!("{}", render_slash_command_help());
-    println!();
+fn print_help_to(out: &mut impl Write) -> io::Result<()> {
+    writeln!(out, "claw v{VERSION}")?;
+    writeln!(out)?;
+    writeln!(out, "Usage:")?;
+    writeln!(
+        out,
+        "  claw [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
+    )?;
+    writeln!(out, "      Start the interactive REPL")?;
+    writeln!(
+        out,
+        "  claw [--model MODEL] [--output-format text|json] prompt TEXT"
+    )?;
+    writeln!(out, "      Send one prompt and exit")?;
+    writeln!(
+        out,
+        "  claw [--model MODEL] [--output-format text|json] TEXT"
+    )?;
+    writeln!(out, "      Shorthand non-interactive prompt mode")?;
+    writeln!(
+        out,
+        "  claw --resume SESSION.json [/status] [/compact] [...]"
+    )?;
+    writeln!(
+        out,
+        "      Inspect or maintain a saved session without entering the REPL"
+    )?;
+    writeln!(out, "  claw dump-manifests")?;
+    writeln!(out, "  claw bootstrap-plan")?;
+    writeln!(out, "  claw system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
+    writeln!(out, "  claw login")?;
+    writeln!(out, "  claw logout")?;
+    writeln!(out, "  claw init")?;
+    writeln!(out)?;
+    writeln!(out, "Flags:")?;
+    writeln!(
+        out,
+        "  --model MODEL              Override the active model"
+    )?;
+    writeln!(
+        out,
+        "  --output-format FORMAT     Non-interactive output format: text or json"
+    )?;
+    writeln!(
+        out,
+        "  --permission-mode MODE     Set read-only, workspace-write, or danger-full-access"
+    )?;
+    writeln!(
+        out,
+        "  --dangerously-skip-permissions  Skip all permission checks"
+    )?;
+    writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
+    writeln!(
+        out,
+        "  --version, -V              Print version and build information locally"
+    )?;
+    writeln!(out)?;
+    writeln!(out, "Interactive slash commands:")?;
+    writeln!(out, "{}", render_slash_command_help())?;
+    writeln!(out)?;
     let resume_commands = resume_supported_slash_commands()
         .into_iter()
         .map(|spec| match spec.argument_hint {
@@ -2377,28 +3197,45 @@ fn print_help() {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    println!("Resume-safe commands: {resume_commands}");
-    println!("Examples:");
-    println!("  rusty-claude-cli --model claude-opus \"summarize this repo\"");
-    println!("  rusty-claude-cli --output-format json prompt \"explain src/main.rs\"");
-    println!("  rusty-claude-cli --allowedTools read,glob \"summarize Cargo.toml\"");
-    println!("  rusty-claude-cli --resume session.json /status /diff /export notes.txt");
-    println!("  rusty-claude-cli login");
+    writeln!(out, "Resume-safe commands: {resume_commands}")?;
+    writeln!(out, "Examples:")?;
+    writeln!(out, "  claw --model claude-opus \"summarize this repo\"")?;
+    writeln!(
+        out,
+        "  claw --output-format json prompt \"explain src/main.rs\""
+    )?;
+    writeln!(
+        out,
+        "  claw --allowedTools read,glob \"summarize Cargo.toml\""
+    )?;
+    writeln!(
+        out,
+        "  claw --resume session.json /status /diff /export notes.txt"
+    )?;
+    writeln!(out, "  claw login")?;
+    writeln!(out, "  claw init")?;
+    Ok(())
+}
+
+fn print_help() {
+    let _ = print_help_to(&mut io::stdout());
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_tool_specs, format_compact_report, format_cost_report, format_init_report,
-        format_model_report, format_model_switch_report, format_permissions_report,
-        format_permissions_switch_report, format_resume_report, format_status_report,
-        format_tool_call_start, format_tool_result, normalize_permission_mode, parse_args,
-        parse_git_status_metadata, render_config_report, render_init_claude_md,
-        render_memory_report, render_repl_help, resume_supported_slash_commands, status_context,
+        filter_tool_specs, format_compact_report, format_cost_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
+        normalize_permission_mode, parse_args, parse_git_status_metadata, print_help_to,
+        push_output_block, render_config_report, render_memory_report, render_repl_help,
+        resolve_model_alias, response_to_events, resume_supported_slash_commands, status_context,
         CliAction, CliOutputFormat, SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
-    use runtime::{ContentBlock, ConversationMessage, MessageRole, PermissionMode};
-    use std::path::{Path, PathBuf};
+    use api::{MessageResponse, OutputContentBlock, Usage};
+    use runtime::{AssistantEvent, ContentBlock, ConversationMessage, MessageRole, PermissionMode};
+    use serde_json::json;
+    use std::path::PathBuf;
 
     #[test]
     fn defaults_to_repl_when_no_args() {
@@ -2407,7 +3244,7 @@ mod tests {
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
             }
         );
     }
@@ -2426,7 +3263,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
             }
         );
     }
@@ -2447,9 +3284,37 @@ mod tests {
                 model: "claude-opus".to_string(),
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
             }
         );
+    }
+
+    #[test]
+    fn resolves_model_aliases_in_args() {
+        let args = vec![
+            "--model".to_string(),
+            "opus".to_string(),
+            "explain".to_string(),
+            "this".to_string(),
+        ];
+        assert_eq!(
+            parse_args(&args).expect("args should parse"),
+            CliAction::Prompt {
+                prompt: "explain this".to_string(),
+                model: "claude-opus-4-6".to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+            }
+        );
+    }
+
+    #[test]
+    fn resolves_known_model_aliases() {
+        assert_eq!(resolve_model_alias("opus"), "claude-opus-4-6");
+        assert_eq!(resolve_model_alias("sonnet"), "claude-sonnet-4-6");
+        assert_eq!(resolve_model_alias("haiku"), "claude-haiku-4-5-20251213");
+        assert_eq!(resolve_model_alias("claude-opus"), "claude-opus");
     }
 
     #[test]
@@ -2494,7 +3359,7 @@ mod tests {
                         .map(str::to_string)
                         .collect()
                 ),
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
             }
         );
     }
@@ -2533,6 +3398,10 @@ mod tests {
         assert_eq!(
             parse_args(&["logout".to_string()]).expect("logout should parse"),
             CliAction::Logout
+        );
+        assert_eq!(
+            parse_args(&["init".to_string()]).expect("init should parse"),
+            CliAction::Init
         );
     }
 
@@ -2688,12 +3557,11 @@ mod tests {
     }
 
     #[test]
-    fn init_report_uses_structured_output() {
-        let created = format_init_report(Path::new("/tmp/CLAUDE.md"), true);
-        assert!(created.contains("Init"));
-        assert!(created.contains("Result           created"));
-        let skipped = format_init_report(Path::new("/tmp/CLAUDE.md"), false);
-        assert!(skipped.contains("skipped (already exists)"));
+    fn init_help_mentions_direct_subcommand() {
+        let mut help = Vec::new();
+        print_help_to(&mut help).expect("help should render");
+        let help = String::from_utf8(help).expect("help should be utf8");
+        assert!(help.contains("claw init"));
     }
 
     #[test]
@@ -2797,7 +3665,7 @@ mod tests {
     fn status_context_reads_real_workspace_metadata() {
         let context = status_context(None).expect("status context should load");
         assert!(context.cwd.is_absolute());
-        assert_eq!(context.discovered_config_files, 3);
+        assert_eq!(context.discovered_config_files, 5);
         assert!(context.loaded_config_files <= context.discovered_config_files);
     }
 
@@ -2855,7 +3723,7 @@ mod tests {
 
     #[test]
     fn init_template_mentions_detected_rust_workspace() {
-        let rendered = render_init_claude_md(Path::new("."));
+        let rendered = crate::init::render_init_claude_md(std::path::Path::new("."));
         assert!(rendered.contains("# CLAUDE.md"));
         assert!(rendered.contains("cargo clippy --workspace --all-targets -- -D warnings"));
     }
@@ -2897,11 +3765,133 @@ mod tests {
     #[test]
     fn tool_rendering_helpers_compact_output() {
         let start = format_tool_call_start("read_file", r#"{"path":"src/main.rs"}"#);
-        assert!(start.contains("Tool call"));
+        assert!(start.contains("read_file"));
         assert!(start.contains("src/main.rs"));
 
-        let done = format_tool_result("read_file", r#"{"contents":"hello"}"#, false);
-        assert!(done.contains("Tool `read_file`"));
-        assert!(done.contains("contents"));
+        let done = format_tool_result(
+            "read_file",
+            r#"{"file":{"filePath":"src/main.rs","content":"hello","numLines":1,"startLine":1,"totalLines":1}}"#,
+            false,
+        );
+        assert!(done.contains("📄 Read src/main.rs"));
+        assert!(done.contains("hello"));
+    }
+
+    #[test]
+    fn push_output_block_renders_markdown_text() {
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        let mut pending_tool = None;
+
+        push_output_block(
+            OutputContentBlock::Text {
+                text: "# Heading".to_string(),
+            },
+            &mut out,
+            &mut events,
+            &mut pending_tool,
+            false,
+        )
+        .expect("text block should render");
+
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(rendered.contains("Heading"));
+        assert!(rendered.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn push_output_block_skips_empty_object_prefix_for_tool_streams() {
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        let mut pending_tool = None;
+
+        push_output_block(
+            OutputContentBlock::ToolUse {
+                id: "tool-1".to_string(),
+                name: "read_file".to_string(),
+                input: json!({}),
+            },
+            &mut out,
+            &mut events,
+            &mut pending_tool,
+            true,
+        )
+        .expect("tool block should accumulate");
+
+        assert!(events.is_empty());
+        assert_eq!(
+            pending_tool,
+            Some(("tool-1".to_string(), "read_file".to_string(), String::new(),))
+        );
+    }
+
+    #[test]
+    fn response_to_events_preserves_empty_object_json_input_outside_streaming() {
+        let mut out = Vec::new();
+        let events = response_to_events(
+            MessageResponse {
+                id: "msg-1".to_string(),
+                kind: "message".to_string(),
+                model: "claude-opus-4-6".to_string(),
+                role: "assistant".to_string(),
+                content: vec![OutputContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "read_file".to_string(),
+                    input: json!({}),
+                }],
+                stop_reason: Some("tool_use".to_string()),
+                stop_sequence: None,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                request_id: None,
+            },
+            &mut out,
+        )
+        .expect("response conversion should succeed");
+
+        assert!(matches!(
+            &events[0],
+            AssistantEvent::ToolUse { name, input, .. }
+                if name == "read_file" && input == "{}"
+        ));
+    }
+
+    #[test]
+    fn response_to_events_preserves_non_empty_json_input_outside_streaming() {
+        let mut out = Vec::new();
+        let events = response_to_events(
+            MessageResponse {
+                id: "msg-2".to_string(),
+                kind: "message".to_string(),
+                model: "claude-opus-4-6".to_string(),
+                role: "assistant".to_string(),
+                content: vec![OutputContentBlock::ToolUse {
+                    id: "tool-2".to_string(),
+                    name: "read_file".to_string(),
+                    input: json!({ "path": "rust/Cargo.toml" }),
+                }],
+                stop_reason: Some("tool_use".to_string()),
+                stop_sequence: None,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                request_id: None,
+            },
+            &mut out,
+        )
+        .expect("response conversion should succeed");
+
+        assert!(matches!(
+            &events[0],
+            AssistantEvent::ToolUse { name, input, .. }
+                if name == "read_file" && input == "{\"path\":\"rust/Cargo.toml\"}"
+        ));
     }
 }

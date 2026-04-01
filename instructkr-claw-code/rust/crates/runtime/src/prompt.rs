@@ -50,6 +50,7 @@ pub struct ProjectContext {
     pub cwd: PathBuf,
     pub current_date: String,
     pub git_status: Option<String>,
+    pub git_diff: Option<String>,
     pub instruction_files: Vec<ContextFile>,
 }
 
@@ -64,6 +65,7 @@ impl ProjectContext {
             cwd,
             current_date: current_date.into(),
             git_status: None,
+            git_diff: None,
             instruction_files,
         })
     }
@@ -74,6 +76,7 @@ impl ProjectContext {
     ) -> std::io::Result<Self> {
         let mut context = Self::discover(cwd, current_date)?;
         context.git_status = read_git_status(&context.cwd);
+        context.git_diff = read_git_diff(&context.cwd);
         Ok(context)
     }
 }
@@ -239,6 +242,38 @@ fn read_git_status(cwd: &Path) -> Option<String> {
     }
 }
 
+fn read_git_diff(cwd: &Path) -> Option<String> {
+    let mut sections = Vec::new();
+
+    let staged = read_git_output(cwd, &["diff", "--cached"])?;
+    if !staged.trim().is_empty() {
+        sections.push(format!("Staged changes:\n{}", staged.trim_end()));
+    }
+
+    let unstaged = read_git_output(cwd, &["diff"])?;
+    if !unstaged.trim().is_empty() {
+        sections.push(format!("Unstaged changes:\n{}", unstaged.trim_end()));
+    }
+
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n\n"))
+    }
+}
+
+fn read_git_output(cwd: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
 fn render_project_context(project_context: &ProjectContext) -> String {
     let mut lines = vec!["# Project context".to_string()];
     let mut bullets = vec![
@@ -256,6 +291,11 @@ fn render_project_context(project_context: &ProjectContext) -> String {
         lines.push(String::new());
         lines.push("Git status snapshot:".to_string());
         lines.push(status.clone());
+    }
+    if let Some(diff) = &project_context.git_diff {
+        lines.push(String::new());
+        lines.push("Git diff snapshot:".to_string());
+        lines.push(diff.clone());
     }
     lines.join("\n")
 }
@@ -381,7 +421,7 @@ fn render_config_section(config: &RuntimeConfig) -> String {
     let mut lines = vec!["# Runtime config".to_string()];
     if config.loaded_entries().is_empty() {
         lines.extend(prepend_bullets(vec![
-            "No Claude Code settings files loaded.".to_string(),
+            "No Claw Code settings files loaded.".to_string(),
         ]));
         return lines.join("\n");
     }
@@ -577,6 +617,49 @@ mod tests {
         assert!(status.contains("## No commits yet on") || status.contains("## "));
         assert!(status.contains("?? CLAUDE.md"));
         assert!(status.contains("?? tracked.txt"));
+        assert!(context.git_diff.is_none());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn discover_with_git_includes_diff_snapshot_for_tracked_changes() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&root)
+            .status()
+            .expect("git init should run");
+        std::process::Command::new("git")
+            .args(["config", "user.email", "tests@example.com"])
+            .current_dir(&root)
+            .status()
+            .expect("git config email should run");
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Runtime Prompt Tests"])
+            .current_dir(&root)
+            .status()
+            .expect("git config name should run");
+        fs::write(root.join("tracked.txt"), "hello\n").expect("write tracked file");
+        std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(&root)
+            .status()
+            .expect("git add should run");
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init", "--quiet"])
+            .current_dir(&root)
+            .status()
+            .expect("git commit should run");
+        fs::write(root.join("tracked.txt"), "hello\nworld\n").expect("rewrite tracked file");
+
+        let context =
+            ProjectContext::discover_with_git(&root, "2026-03-31").expect("context should load");
+
+        let diff = context.git_diff.expect("git diff should be present");
+        assert!(diff.contains("Unstaged changes:"));
+        assert!(diff.contains("tracked.txt"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

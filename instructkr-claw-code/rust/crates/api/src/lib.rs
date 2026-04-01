@@ -4,7 +4,7 @@ mod sse;
 mod types;
 
 pub use client::{
-    oauth_token_is_expired, resolve_saved_oauth_token, resolve_startup_auth_source,
+    oauth_token_is_expired, read_base_url, resolve_saved_oauth_token, resolve_startup_auth_source,
     AnthropicClient, AuthSource, MessageStream, OAuthTokenSet,
 };
 pub use error::ApiError;
