@@ -10,7 +10,7 @@ sanbuphy-claude-code
 
 Kuberwastaken
 
-* https://github.com/Kuberwastaken/claude-code
+* https://github.com/Kuberwastaken/claurst
 
 instructkr
 
@@ -27,6 +27,4 @@ AprilNEA
 leaked-claude-code
 
 * https://github.com/Heipiao/leaked-claude-code
-
-
 
