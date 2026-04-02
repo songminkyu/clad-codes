@@ -146,7 +146,7 @@ pub enum QueryEvent {
     /// A stream event from the API.
     Stream(StreamEvent),
     /// A tool is about to be executed.
-    ToolStart { tool_name: String, tool_id: String },
+    ToolStart { tool_name: String, tool_id: String, input_json: String },
     /// A tool has finished executing.
     ToolEnd { tool_name: String, tool_id: String, result: String, is_error: bool },
     /// The model finished a turn.
@@ -875,6 +875,7 @@ pub async fn run_query_loop(
                             let _ = tx.send(QueryEvent::ToolStart {
                                 tool_name: name.clone(),
                                 tool_id: id.clone(),
+                                input_json: input.to_string(),
                             });
                         }
 

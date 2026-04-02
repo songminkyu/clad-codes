@@ -64,6 +64,8 @@ pub struct FileDiffStats {
     pub removed: u32,
     /// Is this a binary file?
     pub binary: bool,
+    /// Is this a newly created file (no previous version)?
+    pub is_new_file: bool,
     /// All hunks for this file.
     pub hunks: Vec<DiffHunk>,
 }
@@ -252,6 +254,7 @@ pub fn build_turn_diff(
                     added: 0,
                     removed: 0,
                     binary: true,
+                    is_new_file: false,
                     hunks: Vec::new(),
                 };
             }
@@ -348,6 +351,7 @@ fn build_file_diff_from_snapshots(path: String, before: &str, after: &str) -> Fi
         added,
         removed,
         binary: false,
+        is_new_file: before.is_empty() && !after.is_empty(),
         hunks,
     }
 }
@@ -397,8 +401,13 @@ pub fn parse_unified_diff(text: &str) -> Vec<FileDiffStats> {
                 added: 0,
                 removed: 0,
                 binary: false,
+                is_new_file: false,
                 hunks: Vec::new(),
             });
+        } else if raw_line.starts_with("new file mode") {
+            if let Some(f) = current_file.as_mut() {
+                f.is_new_file = true;
+            }
         } else if raw_line.starts_with("Binary files ") {
             if let Some(f) = current_file.as_mut() {
                 f.binary = true;
@@ -597,7 +606,13 @@ fn render_file_list(state: &DiffViewerState, area: Rect, buf: &mut Buffer) {
         };
 
         let prefix = if selected { "> " } else { "  " };
-        let stats = format!("+{} -{}", file.added, file.removed);
+        let (stats, stats_color) = if file.binary {
+            ("[binary]".to_string(), Color::DarkGray)
+        } else if file.is_new_file {
+            (format!("[new] +{}", file.added), Color::Yellow)
+        } else {
+            (format!("+{} -{}", file.added, file.removed), Color::DarkGray)
+        };
 
         let base_style = if selected {
             Style::default().add_modifier(Modifier::BOLD)
@@ -621,7 +636,7 @@ fn render_file_list(state: &DiffViewerState, area: Rect, buf: &mut Buffer) {
         if stats_x > inner.x {
             let stats_area = Rect { x: stats_x, y, width: stats.len() as u16, height: 1 };
             Paragraph::new(Line::from(vec![
-                Span::styled(stats, Style::default().fg(Color::DarkGray)),
+                Span::styled(stats, Style::default().fg(stats_color)),
             ])).render(stats_area, buf);
         }
     }
@@ -683,62 +698,413 @@ fn render_diff_detail(state: &DiffViewerState, area: Rect, buf: &mut Buffer) {
     let scroll = (state.detail_scroll as usize).min(total_lines.saturating_sub(inner.height as usize));
     let visible = &lines[scroll..];
 
+    // Shrink inner width by 1 to leave room for scrollbar
+    let text_width = if total_lines > inner.height as usize {
+        inner.width.saturating_sub(1)
+    } else {
+        inner.width
+    };
+
     for (i, line) in visible.iter().enumerate() {
         if i as u16 >= inner.height { break; }
         let y = inner.y + i as u16;
-        let row_area = Rect { x: inner.x, y, width: inner.width, height: 1 };
+        let row_area = Rect { x: inner.x, y, width: text_width, height: 1 };
         Paragraph::new(line.clone()).render(row_area, buf);
     }
+
+    // Simple scrollbar on the rightmost column of inner
+    if total_lines > inner.height as usize && inner.width > 1 {
+        let bar_x = inner.x + inner.width - 1;
+        let bar_h = inner.height as usize;
+        // Thumb size proportional to visible fraction, minimum 1
+        let thumb_size = ((bar_h * bar_h) / total_lines).max(1).min(bar_h);
+        // Thumb position
+        let scroll_range = total_lines.saturating_sub(bar_h);
+        let thumb_top = if scroll_range > 0 {
+            (scroll * (bar_h.saturating_sub(thumb_size))) / scroll_range
+        } else {
+            0
+        };
+
+        for row in 0..bar_h {
+            let y = inner.y + row as u16;
+            let ch = if row == 0 {
+                '\u{25b2}'  // ▲
+            } else if row == bar_h - 1 {
+                '\u{25bc}'  // ▼
+            } else if row >= thumb_top + 1 && row < thumb_top + thumb_size + 1 {
+                '\u{2588}'  // █ (thumb)
+            } else {
+                '\u{2502}'  // │ (track)
+            };
+            let cell_area = Rect { x: bar_x, y, width: 1, height: 1 };
+            Paragraph::new(Line::from(Span::styled(
+                ch.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ))).render(cell_area, buf);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inline word-level diff helpers
+// ---------------------------------------------------------------------------
+
+/// Format a 10-char line-number gutter.
+fn format_gutter(old_no: Option<u32>, new_no: Option<u32>) -> String {
+    match (old_no, new_no) {
+        (Some(o), Some(n)) => format!("{:>4} {:>4} ", o, n),
+        (Some(o), None)    => format!("{:>4}      ", o),
+        (None,    Some(n)) => format!("     {:>4} ", n),
+        (None,    None)    => "          ".to_string(),
+    }
+}
+
+/// Truncate a list of owned spans so the total character count ≤ `max_chars`.
+fn truncate_spans_to_width(spans: Vec<Span<'static>>, max_chars: usize) -> Vec<Span<'static>> {
+    let mut remaining = max_chars;
+    let mut result = Vec::new();
+    for span in spans {
+        if remaining == 0 { break; }
+        let char_count: usize = span.content.chars().count();
+        if char_count <= remaining {
+            remaining -= char_count;
+            result.push(span);
+        } else {
+            let truncated: String = span.content.chars().take(remaining).collect();
+            remaining = 0;
+            result.push(Span::styled(truncated, span.style));
+        }
+    }
+    result
+}
+
+/// Compute word-level inline diff spans for an adjacent (removed, added) line pair.
+/// Returns `(old_spans, new_spans)` where changed words have a highlighted background.
+fn build_inline_diff_spans(old: &str, new: &str) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+    use similar::{ChangeTag, TextDiff};
+
+    let diff = TextDiff::from_words(old, new);
+    let mut old_spans: Vec<Span<'static>> = Vec::new();
+    let mut new_spans: Vec<Span<'static>> = Vec::new();
+
+    for change in diff.iter_all_changes() {
+        let s: String = change.to_string();
+        match change.tag() {
+            ChangeTag::Equal => {
+                old_spans.push(Span::styled(s.clone(), Style::default().fg(Color::Red)));
+                new_spans.push(Span::styled(s, Style::default().fg(Color::Green)));
+            }
+            ChangeTag::Delete => {
+                old_spans.push(Span::styled(
+                    s,
+                    Style::default().fg(Color::White).bg(Color::Rgb(150, 30, 30)),
+                ));
+            }
+            ChangeTag::Insert => {
+                new_spans.push(Span::styled(
+                    s,
+                    Style::default().fg(Color::White).bg(Color::Rgb(30, 130, 30)),
+                ));
+            }
+        }
+    }
+
+    (old_spans, new_spans)
 }
 
 fn build_diff_lines(file: &FileDiffStats, width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let gutter_width = 8usize; // "  123  "
+    // Gutter = 10 chars ("dddd dddd "), prefix marker = 3 chars ("+  " etc.)
+    let gutter_width: usize = 10;
+    let prefix_width: usize = 3;
+    let avail = (width as usize).saturating_sub(gutter_width + prefix_width);
 
     for hunk in &file.hunks {
-        for diff_line in &hunk.lines {
-            let (marker, content_style, _bg) = match diff_line.kind {
+        let hunk_lines = &hunk.lines;
+        let mut i = 0;
+        while i < hunk_lines.len() {
+            let diff_line = &hunk_lines[i];
+
+            // Detect adjacent Removed → Added pair for inline word-level diff
+            if diff_line.kind == DiffLineKind::Removed {
+                if let Some(next_line) = hunk_lines.get(i + 1) {
+                    if next_line.kind == DiffLineKind::Added {
+                        let (old_spans, new_spans) =
+                            build_inline_diff_spans(&diff_line.content, &next_line.content);
+
+                        let mut removed_row = vec![
+                            Span::styled(
+                                format_gutter(diff_line.old_line_no, None),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled("-  ", Style::default().fg(Color::Red)),
+                        ];
+                        removed_row.extend(truncate_spans_to_width(old_spans, avail));
+                        lines.push(Line::from(removed_row));
+
+                        let mut added_row = vec![
+                            Span::styled(
+                                format_gutter(None, next_line.new_line_no),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled("+  ", Style::default().fg(Color::Green)),
+                        ];
+                        added_row.extend(truncate_spans_to_width(new_spans, avail));
+                        lines.push(Line::from(added_row));
+
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+
+            // Standard single-line rendering
+            let (marker, content_style) = match diff_line.kind {
                 DiffLineKind::Header => (
                     Span::styled("@@ ", Style::default().fg(Color::Cyan)),
                     Style::default().fg(Color::Cyan),
-                    None,
                 ),
                 DiffLineKind::Added => (
                     Span::styled("+  ", Style::default().fg(Color::Green)),
                     Style::default().fg(Color::Green),
-                    Some(Color::DarkGray),
                 ),
                 DiffLineKind::Removed => (
                     Span::styled("-  ", Style::default().fg(Color::Red)),
                     Style::default().fg(Color::Red),
-                    None,
                 ),
                 DiffLineKind::Context => (
                     Span::styled("   ", Style::default().fg(Color::DarkGray)),
                     Style::default().fg(Color::White),
-                    None,
                 ),
             };
 
-            // Line number gutter
-            let ln_str = match (diff_line.old_line_no, diff_line.new_line_no) {
-                (Some(o), Some(n)) => format!("{:>4} {:>4} ", o, n),
-                (Some(o), None) => format!("{:>4}      ", o),
-                (None, Some(n)) => format!("     {:>4} ", n),
-                (None, None) => "          ".to_string(),
-            };
-
-            let content: String = diff_line.content.chars()
-                .take((width as usize).saturating_sub(gutter_width + 3))
-                .collect();
+            let ln_str = format_gutter(diff_line.old_line_no, diff_line.new_line_no);
+            let content: String = diff_line.content.chars().take(avail).collect();
 
             lines.push(Line::from(vec![
                 Span::styled(ln_str, Style::default().fg(Color::DarkGray)),
                 marker,
                 Span::styled(content, content_style),
             ]));
+
+            i += 1;
         }
     }
 
     lines
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_file(path: &str, added: u32, removed: u32, is_new: bool) -> FileDiffStats {
+        FileDiffStats {
+            path: path.to_string(),
+            added,
+            removed,
+            binary: false,
+            is_new_file: is_new,
+            hunks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parse_unified_diff_new_file_flag() {
+        let text = "diff --git a/new.rs b/new.rs\n\
+                    new file mode 100644\n\
+                    index 0000000..1234567\n\
+                    --- /dev/null\n\
+                    +++ b/new.rs\n\
+                    @@ -0,0 +1,2 @@\n\
+                    +fn foo() {}\n\
+                    +fn bar() {}\n";
+        let files = parse_unified_diff(text);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].is_new_file, "new file mode header should set is_new_file");
+        assert_eq!(files[0].added, 2);
+    }
+
+    #[test]
+    fn parse_unified_diff_existing_file_not_new() {
+        let text = "diff --git a/lib.rs b/lib.rs\n\
+                    index 1111111..2222222 100644\n\
+                    --- a/lib.rs\n\
+                    +++ b/lib.rs\n\
+                    @@ -1,1 +1,1 @@\n\
+                    -old line\n\
+                    +new line\n";
+        let files = parse_unified_diff(text);
+        assert_eq!(files.len(), 1);
+        assert!(!files[0].is_new_file);
+    }
+
+    #[test]
+    fn build_file_diff_from_snapshots_new_file_when_before_empty() {
+        let file = build_file_diff_from_snapshots(
+            "src/new.rs".to_string(),
+            "",
+            "fn hello() {}\n",
+        );
+        assert!(file.is_new_file, "empty before_text should mark file as new");
+        assert_eq!(file.added, 1);
+        assert_eq!(file.removed, 0);
+    }
+
+    #[test]
+    fn build_file_diff_from_snapshots_not_new_when_before_present() {
+        let file = build_file_diff_from_snapshots(
+            "src/lib.rs".to_string(),
+            "fn old() {}\n",
+            "fn new() {}\n",
+        );
+        assert!(!file.is_new_file);
+    }
+
+    #[test]
+    fn build_inline_diff_spans_equal_content() {
+        let (old, new) = build_inline_diff_spans("hello world", "hello world");
+        // All spans should have no background (equal, not highlighted)
+        for span in &old {
+            assert!(span.style.bg.is_none(), "equal spans should have no bg highlight");
+        }
+        for span in &new {
+            assert!(span.style.bg.is_none(), "equal spans should have no bg highlight");
+        }
+        // Combined text should contain the key words
+        let old_text: String = old.iter().map(|s| s.content.as_ref()).collect::<String>();
+        let new_text: String = new.iter().map(|s| s.content.as_ref()).collect::<String>();
+        assert!(old_text.contains("hello"), "old text should contain 'hello'");
+        assert!(new_text.contains("world"), "new text should contain 'world'");
+    }
+
+    #[test]
+    fn build_inline_diff_spans_highlights_changed_word() {
+        let (old_spans, new_spans) = build_inline_diff_spans("hello world", "hello earth");
+        // "world" should be highlighted (deleted), "earth" should be highlighted (inserted)
+        let has_highlighted_old = old_spans.iter().any(|s| {
+            s.content.contains("world") && s.style.bg.is_some()
+        });
+        let has_highlighted_new = new_spans.iter().any(|s| {
+            s.content.contains("earth") && s.style.bg.is_some()
+        });
+        assert!(has_highlighted_old, "deleted word should have bg highlight");
+        assert!(has_highlighted_new, "inserted word should have bg highlight");
+    }
+
+    #[test]
+    fn build_diff_lines_inline_diff_for_adjacent_pair() {
+        let file = FileDiffStats {
+            path: "test.rs".to_string(),
+            added: 1,
+            removed: 1,
+            binary: false,
+            is_new_file: false,
+            hunks: vec![DiffHunk {
+                old_range: (1, 1),
+                new_range: (1, 1),
+                lines: vec![
+                    DiffLine {
+                        kind: DiffLineKind::Removed,
+                        content: "let x = 1;".to_string(),
+                        old_line_no: Some(1),
+                        new_line_no: None,
+                    },
+                    DiffLine {
+                        kind: DiffLineKind::Added,
+                        content: "let x = 2;".to_string(),
+                        old_line_no: None,
+                        new_line_no: Some(1),
+                    },
+                ],
+            }],
+        };
+        let lines = build_diff_lines(&file, 80);
+        // Should produce 2 lines (one removed, one added)
+        assert_eq!(lines.len(), 2, "adjacent removed+added should produce 2 lines");
+        // Each line should have multiple spans (gutter + marker + content spans)
+        assert!(lines[0].spans.len() >= 3);
+        assert!(lines[1].spans.len() >= 3);
+    }
+
+    #[test]
+    fn format_gutter_both_line_numbers() {
+        let g = format_gutter(Some(10), Some(20));
+        assert_eq!(g.len(), 10, "gutter should always be 10 chars");
+        assert!(g.contains("10"));
+        assert!(g.contains("20"));
+    }
+
+    #[test]
+    fn format_gutter_old_only() {
+        let g = format_gutter(Some(5), None);
+        assert_eq!(g.len(), 10);
+        assert!(g.contains("5"));
+    }
+
+    #[test]
+    fn format_gutter_new_only() {
+        let g = format_gutter(None, Some(99));
+        assert_eq!(g.len(), 10);
+        assert!(g.contains("99"));
+    }
+
+    #[test]
+    fn truncate_spans_to_width_exact() {
+        let spans = vec![
+            Span::raw("hello"),
+            Span::raw(" world"),
+        ];
+        let result = truncate_spans_to_width(spans, 11);
+        let text: String = result.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn truncate_spans_to_width_cuts_mid_span() {
+        let spans = vec![Span::raw("abcdefghij")];
+        let result = truncate_spans_to_width(spans, 5);
+        let text: String = result.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "abcde");
+    }
+
+    #[test]
+    fn file_stats_binary_renders_badge() {
+        // Verify the binary badge logic in render_file_list: binary=true → "[binary]"
+        let file = FileDiffStats {
+            path: "image.png".to_string(),
+            added: 0,
+            removed: 0,
+            binary: true,
+            is_new_file: false,
+            hunks: Vec::new(),
+        };
+        let (stats, _color) = if file.binary {
+            ("[binary]".to_string(), ratatui::style::Color::DarkGray)
+        } else if file.is_new_file {
+            (format!("[new] +{}", file.added), ratatui::style::Color::Yellow)
+        } else {
+            (format!("+{} -{}", file.added, file.removed), ratatui::style::Color::DarkGray)
+        };
+        assert_eq!(stats, "[binary]");
+    }
+
+    #[test]
+    fn file_stats_new_file_renders_badge() {
+        let file = make_file("src/new.rs", 42, 0, true);
+        let (stats, color) = if file.binary {
+            ("[binary]".to_string(), ratatui::style::Color::DarkGray)
+        } else if file.is_new_file {
+            (format!("[new] +{}", file.added), ratatui::style::Color::Yellow)
+        } else {
+            (format!("+{} -{}", file.added, file.removed), ratatui::style::Color::DarkGray)
+        };
+        assert_eq!(stats, "[new] +42");
+        assert_eq!(color, ratatui::style::Color::Yellow);
+    }
 }

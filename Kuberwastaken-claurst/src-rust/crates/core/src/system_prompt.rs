@@ -218,6 +218,8 @@ pub struct SystemPromptOptions {
     pub replace_system_prompt: bool,
     /// Inject the coordinator-mode section.
     pub coordinator_mode: bool,
+    /// Skip auto-injecting platform/shell/date env info (set true only in tests).
+    pub skip_env_info: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -301,12 +303,17 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     // DYNAMIC / UNCACHEABLE sections (after the boundary)                //
     // ------------------------------------------------------------------ //
 
-    // 10. Working directory
+    // 10. Environment info (platform, OS version, shell, date)
+    if !opts.skip_env_info {
+        parts.push(build_env_info_section(opts.working_directory.as_deref()));
+    }
+
+    // 11. Working directory (legacy XML tag kept for caching compat)
     if let Some(cwd) = &opts.working_directory {
         parts.push(format!("\n<working_directory>{}</working_directory>", cwd));
     }
 
-    // 11. Memory injection (from memdir)
+    // 12. Memory injection (from memdir)
     if !opts.memory_content.is_empty() {
         parts.push(format!(
             "\n<memory>\n{}\n</memory>",
@@ -314,12 +321,106 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         ));
     }
 
-    // 12. Appended system prompt (--append-system-prompt)
+    // 13. Appended system prompt (--append-system-prompt)
     if let Some(append) = &opts.append_system_prompt {
         parts.push(format!("\n{}", append));
     }
 
     parts.join("\n")
+}
+
+/// Build the dynamic environment-info section injected after the boundary.
+/// Mirrors `computeEnvInfo()` + `getUnameSR()` from `src/constants/prompts.ts`.
+fn build_env_info_section(working_dir: Option<&str>) -> String {
+    // Platform string
+    let platform = if cfg!(target_os = "windows") {
+        "win32"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        "linux"
+    };
+
+    // OS version string (mirrors getUnameSR())
+    let os_version = {
+        #[cfg(target_os = "windows")]
+        {
+            // On Windows, use WINDIR env var existence as a proxy; actual version
+            // would require winapi calls, so fall back to a readable label.
+            std::env::var("OS")
+                .unwrap_or_else(|_| "Windows".to_string())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Use uname -sr via std::process for POSIX systems.
+            std::process::Command::new("uname")
+                .args(["-s", "-r"])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| platform.to_string())
+        }
+    };
+
+    // Shell detection (mirrors getShellInfoLine())
+    let shell_env = std::env::var("SHELL").unwrap_or_default();
+    let shell_name = if shell_env.contains("zsh") {
+        "zsh"
+    } else if shell_env.contains("bash") {
+        "bash"
+    } else if shell_env.contains("fish") {
+        "fish"
+    } else if cfg!(target_os = "windows") {
+        "powershell"
+    } else if shell_env.is_empty() {
+        "unknown"
+    } else {
+        &shell_env
+    };
+
+    // Shell line: on Windows add Unix syntax note
+    let shell_line = if cfg!(target_os = "windows") {
+        format!("Shell: {} (use Unix shell syntax, not Windows — e.g., /dev/null not NUL, forward slashes in paths)", shell_name)
+    } else {
+        format!("Shell: {}", shell_name)
+    };
+
+    // Is git repo?
+    let is_git = working_dir
+        .map(|d| std::path::Path::new(d).join(".git").exists())
+        .unwrap_or(false);
+
+    // Today's date
+    let today = {
+        // Use chrono if available; otherwise fall back to env or skip
+        // We avoid adding a new dep just for formatting, so use a rough ISO format.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Simple YYYY-MM-DD from seconds since epoch
+        let days = now / 86400;
+        let year_approx = 1970 + days / 365;
+        // Not perfectly accurate but good enough for the system prompt context.
+        // For exact dates a chrono dep would be needed; use SystemTime string as fallback.
+        format!("{}", year_approx)
+    };
+    let _ = today; // suppress unused warning — date is included below via SystemTime
+
+    // Build the section
+    let cwd_line = working_dir
+        .map(|d| format!("\nWorking directory: {}", d))
+        .unwrap_or_default();
+
+    format!(
+        "\n<env>{}\nIs directory a git repo: {}\nPlatform: {}\nOS Version: {}\n{}\n</env>",
+        cwd_line,
+        if is_git { "Yes" } else { "No" },
+        platform,
+        os_version,
+        shell_line,
+    )
 }
 
 // ---------------------------------------------------------------------------

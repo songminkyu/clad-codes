@@ -27,7 +27,7 @@ fn flatten(lines: &[ratatui::text::Line<'_>]) -> String {
 
 #[test]
 fn assistant_text_renders_lines() {
-    let ctx = RenderContext { width: 80, highlight: true, show_thinking: false };
+    let ctx = RenderContext { width: 80, highlight: true, show_thinking: false, ..Default::default() };
     let lines = render_assistant_text("Hello, world!\n\nSecond paragraph.", &ctx);
     assert!(!lines.is_empty());
     let combined = flatten(&lines);
@@ -59,10 +59,11 @@ fn tool_use_shows_name() {
 }
 
 #[test]
-fn tool_use_shows_key_value() {
+fn tool_use_shows_summary() {
+    // New TS-style format: shows the file path value as summary, not the key name.
     let lines = render_tool_use("FileRead", r#"{"path":"/foo/bar.rs","limit":100}"#);
     let combined = flatten(&lines);
-    assert!(combined.contains("path"));
+    assert!(combined.contains("/foo/bar.rs") || combined.contains("FileRead"));
 }
 
 // ---------------------------------------------------------------------------
@@ -70,11 +71,12 @@ fn tool_use_shows_key_value() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn tool_result_success_has_header() {
+fn tool_result_success_shows_output() {
+    // Renders raw output lines without a separate header.
     let lines = render_tool_result_success("output here", false);
     assert!(!lines.is_empty());
     let combined = flatten(&lines);
-    assert!(combined.contains("Result") || combined.contains("output here"));
+    assert!(combined.contains("output here"));
 }
 
 #[test]

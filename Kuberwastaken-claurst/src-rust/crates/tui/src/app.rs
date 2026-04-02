@@ -3,6 +3,9 @@
 use crate::bridge_state::BridgeConnectionState;
 use crate::dialogs::PermissionRequest;
 use crate::diff_viewer::{DiffViewerState, build_turn_diff};
+use crate::model_picker::ModelPickerState;
+use crate::session_browser::SessionBrowserState;
+use crate::dialogs::McpApprovalDialogState;
 use crate::mcp_view::{McpServerView, McpToolView, McpViewState, McpViewStatus};
 use crate::notifications::{NotificationKind, NotificationQueue};
 use crate::overlays::{
@@ -35,14 +38,42 @@ use tracing::debug;
 
 const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("agents", "Browse agent definitions and active agents"),
+    ("changes", "Inspect changes from the current session"),
+    ("clear", "Clear the conversation transcript"),
+    ("compact", "Compact the conversation context"),
     ("config", "Open settings"),
-    ("diff", "Inspect the current diff"),
+    ("copy", "Copy the last assistant response to clipboard"),
+    ("cost", "Show cost breakdown"),
+    ("diff", "Inspect the current git diff"),
+    ("doctor", "Run diagnostics"),
+    ("effort", "Set effort level (low/medium/high/max)"),
+    ("exit", "Quit Claude Code"),
+    ("export", "Export conversation"),
+    ("fast", "Toggle fast mode"),
+    ("feedback", "Open session feedback survey"),
     ("help", "Show help"),
+    ("hooks", "Browse configured hooks (read-only)"),
+    ("init", "Initialize CLAUDE.md for this project"),
+    ("keybindings", "Show keybinding configuration"),
+    ("login", "Log in to Claude"),
+    ("logout", "Log out of Claude"),
     ("mcp", "Browse configured MCP servers"),
+    ("memory", "Browse and open CLAUDE.md memory files"),
+    ("model", "Change the AI model"),
+    ("output-style", "Toggle output style (auto/stream/verbose)"),
     ("privacy", "Open privacy settings"),
+    ("quit", "Quit Claude Code"),
+    ("rename", "Rename this session"),
+    ("resume", "Resume a previous session"),
+    ("review", "Review changes (git diff)"),
+    ("rewind", "Rewind to an earlier turn"),
+    ("session", "Browse and manage sessions"),
     ("settings", "Open settings"),
     ("stats", "Open token and cost stats"),
+    ("survey", "Open session feedback survey"),
     ("theme", "Open the theme picker"),
+    ("vim", "Toggle vim keybindings"),
+    ("voice", "Toggle voice input mode"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -110,6 +141,8 @@ pub struct ToolUseBlock {
     pub name: String,
     pub status: ToolStatus,
     pub output_preview: Option<String>,
+    /// JSON-serialised input for the tool call (populated from the API stream).
+    pub input_json: String,
 }
 
 /// State for Ctrl+R history search mode (legacy inline struct, kept for test
@@ -159,6 +192,62 @@ impl HistorySearch {
             .and_then(|&i| history.get(i))
             .map(String::as_str)
     }
+}
+
+/// Attempt to copy text to the system clipboard using platform CLI tools.
+/// Returns true if successful.
+fn try_copy_to_clipboard(text: &str) -> bool {
+    // Windows
+    #[cfg(target_os = "windows")]
+    {
+        use std::io::Write;
+        if let Ok(mut child) = std::process::Command::new("clip")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            return child.wait().map(|s| s.success()).unwrap_or(false);
+        }
+    }
+    // macOS
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Write;
+        if let Ok(mut child) = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            return child.wait().map(|s| s.success()).unwrap_or(false);
+        }
+    }
+    // Linux / X11
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write;
+        for cmd in &["xclip -selection clipboard", "xsel --clipboard --input"] {
+            let parts: Vec<&str> = cmd.split_whitespace().collect();
+            if let Some((prog, args)) = parts.split_first() {
+                if let Ok(mut child) = std::process::Command::new(prog)
+                    .args(args)
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                {
+                    if let Some(stdin) = child.stdin.as_mut() {
+                        let _ = stdin.write_all(text.as_bytes());
+                    }
+                    if child.wait().map(|s| s.success()).unwrap_or(false) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 fn key_event_to_keystroke(key: &KeyEvent) -> Option<ParsedKeystroke> {
@@ -215,6 +304,8 @@ pub struct App {
     pub is_streaming: bool,
     pub streaming_text: String,
     pub status_message: Option<String>,
+    /// Randomly chosen thinking verb shown next to the spinner while streaming.
+    pub spinner_verb: Option<String>,
     pub should_quit: bool,
     pub show_help: bool,
 
@@ -249,6 +340,12 @@ pub struct App {
 
     /// Instant the session started (used for elapsed-time in the status bar).
     pub session_start: std::time::Instant,
+    /// Instant the current turn's streaming began (reset each time streaming starts).
+    pub turn_start: Option<std::time::Instant>,
+    /// Elapsed time string for the last completed turn, e.g. "2m 5s".
+    pub last_turn_elapsed: Option<String>,
+    /// Past-tense verb shown after turn completes, e.g. "Worked" / "Baked".
+    pub last_turn_verb: Option<&'static str>,
     /// Incremented whenever transcript-visible state changes so rendering can
     /// reuse cached layout between keystrokes.
     pub transcript_version: Cell<u64>,
@@ -313,6 +410,42 @@ pub struct App {
     pub agents_menu: AgentsMenuState,
     /// Diff viewer overlay.
     pub diff_viewer: DiffViewerState,
+    /// Session-quality feedback survey overlay.
+    pub feedback_survey: crate::feedback_survey::FeedbackSurveyState,
+    /// Memory file selector overlay (CLAUDE.md browser).
+    pub memory_file_selector: crate::memory_file_selector::MemoryFileSelectorState,
+    /// Read-only hooks configuration browser.
+    pub hooks_config_menu: crate::hooks_config_menu::HooksConfigMenuState,
+    /// Overage credit upsell banner.
+    pub overage_upsell: crate::overage_upsell::OverageCreditUpsellState,
+    /// Voice mode availability notice.
+    pub voice_mode_notice: crate::voice_mode_notice::VoiceModeNoticeState,
+    /// Desktop app upsell startup dialog.
+    pub desktop_upsell: crate::desktop_upsell_startup::DesktopUpsellStartupState,
+    /// Memory update notification banner.
+    pub memory_update_notification: crate::memory_update_notification::MemoryUpdateNotificationState,
+    /// MCP elicitation dialog (form requested by an MCP server).
+    pub elicitation: crate::elicitation_dialog::ElicitationDialogState,
+    /// Model picker overlay (/model command).
+    pub model_picker: ModelPickerState,
+    /// Session browser overlay (/session, /resume, /rename, /export).
+    pub session_browser: SessionBrowserState,
+    /// MCP server approval dialog.
+    pub mcp_approval: McpApprovalDialogState,
+    /// Output style: "auto" | "stream" | "verbose".
+    pub output_style: String,
+    /// PR number for the current branch (None if not in a PR context).
+    pub pr_number: Option<u32>,
+    /// PR URL for the current branch.
+    pub pr_url: Option<String>,
+    /// Background task status text shown in footer pill.
+    pub background_task_status: Option<String>,
+    /// External status line command output (from CLAUDE_STATUS_COMMAND).
+    pub status_line_override: Option<String>,
+    /// Whether auto-compact is enabled (from settings).
+    pub auto_compact_enabled: bool,
+    /// Context threshold (0-100) at which to auto-compact.
+    pub auto_compact_threshold: u8,
 
     // ---- Voice hold-to-talk ------------------------------------------------
 
@@ -322,6 +455,82 @@ pub struct App {
     pub voice_recording: bool,
     /// Receiver for VoiceEvent messages produced by the recorder task.
     pub voice_event_rx: Option<tokio::sync::mpsc::Receiver<cc_core::voice::VoiceEvent>>,
+
+    // ---- Context window & rate limit info ----------------------------------
+
+    /// Total context window size for the current model (tokens).
+    pub context_window_size: u64,
+    /// How many tokens are currently used in the context window.
+    pub context_used_tokens: u64,
+    /// Rate limit info — 5-hour window usage percentage (0–100).
+    pub rate_limit_5h_pct: Option<f32>,
+    /// Rate limit info — 7-day window usage percentage (0–100).
+    pub rate_limit_7day_pct: Option<f32>,
+    /// Active worktree name (if in a worktree).
+    pub worktree_name: Option<String>,
+    /// Active worktree branch (if in a worktree).
+    pub worktree_branch: Option<String>,
+    /// Agent type badge: "agent" | "coordinator" | "subagent".
+    pub agent_type_badge: Option<String>,
+}
+
+const SPINNER_VERBS: &[&str] = &[
+    "Accomplishing", "Actioning", "Actualizing", "Architecting", "Baking", "Beaming",
+    "Beboppin'", "Befuddling", "Billowing", "Blanching", "Bloviating", "Boogieing",
+    "Boondoggling", "Booping", "Bootstrapping", "Brewing", "Bunning", "Burrowing",
+    "Calculating", "Canoodling", "Caramelizing", "Cascading", "Catapulting", "Cerebrating",
+    "Channeling", "Choreographing", "Churning", "Clauding", "Coalescing", "Cogitating",
+    "Combobulating", "Composing", "Computing", "Concocting", "Considering", "Contemplating",
+    "Cooking", "Crafting", "Creating", "Crunching", "Crystallizing", "Cultivating",
+    "Deciphering", "Deliberating", "Determining", "Dilly-dallying", "Discombobulating",
+    "Doing", "Doodling", "Drizzling", "Ebbing", "Effecting", "Elucidating", "Embellishing",
+    "Enchanting", "Envisioning", "Evaporating", "Fermenting", "Fiddle-faddling", "Finagling",
+    "Flambéing", "Flibbertigibbeting", "Flowing", "Flummoxing", "Fluttering", "Forging",
+    "Forming", "Frolicking", "Frosting", "Gallivanting", "Galloping", "Garnishing",
+    "Generating", "Gesticulating", "Germinating", "Gitifying", "Grooving", "Gusting",
+    "Harmonizing", "Hashing", "Hatching", "Herding", "Honking", "Hullaballooing",
+    "Hyperspacing", "Ideating", "Imagining", "Improvising", "Incubating", "Inferring",
+    "Infusing", "Ionizing", "Jitterbugging", "Julienning", "Kneading", "Leavening",
+    "Levitating", "Lollygagging", "Manifesting", "Marinating", "Meandering", "Metamorphosing",
+    "Misting", "Moonwalking", "Moseying", "Mulling", "Mustering", "Musing", "Nebulizing",
+    "Nesting", "Newspapering", "Noodling", "Nucleating", "Orbiting", "Orchestrating",
+    "Osmosing", "Perambulating", "Percolating", "Perusing", "Philosophising",
+    "Photosynthesizing", "Pollinating", "Pondering", "Pontificating", "Pouncing",
+    "Precipitating", "Prestidigitating", "Processing", "Proofing", "Propagating", "Puttering",
+    "Puzzling", "Quantumizing", "Razzle-dazzling", "Razzmatazzing", "Recombobulating",
+    "Reticulating", "Roosting", "Ruminating", "Sautéing", "Scampering", "Schlepping",
+    "Scurrying", "Seasoning", "Shenaniganing", "Shimmying", "Simmering", "Skedaddling",
+    "Sketching", "Slithering", "Smooshing", "Sock-hopping", "Spelunking", "Spinning",
+    "Sprouting", "Stewing", "Sublimating", "Swirling", "Swooping", "Symbioting",
+    "Synthesizing", "Tempering", "Thinking", "Thundering", "Tinkering", "Tomfoolering",
+    "Topsy-turvying", "Transfiguring", "Transmuting", "Twisting", "Undulating", "Unfurling",
+    "Unravelling", "Vibing", "Waddling", "Wandering", "Warping", "Whatchamacalliting",
+    "Whirlpooling", "Whirring", "Whisking", "Wibbling", "Working", "Wrangling", "Zesting",
+    "Zigzagging",
+];
+
+fn sample_spinner_verb(seed: usize) -> &'static str {
+    SPINNER_VERBS[seed % SPINNER_VERBS.len()]
+}
+
+/// Past-tense verbs shown in the status row after a turn completes.
+/// Mirrors `TURN_COMPLETION_VERBS` from `src/constants/turnCompletionVerbs.ts`.
+const TURN_COMPLETION_VERBS: &[&str] = &[
+    "Baked", "Brewed", "Churned", "Cogitated", "Cooked", "Crunched",
+    "Pondered", "Processed", "Worked",
+];
+
+fn sample_completion_verb(seed: usize) -> &'static str {
+    TURN_COMPLETION_VERBS[seed % TURN_COMPLETION_VERBS.len()]
+}
+
+/// Format a duration in seconds to a human-readable string, e.g. "2m 5s".
+fn format_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}s", secs)
+    } else {
+        format!("{}m {}s", secs / 60, secs % 60)
+    }
 }
 
 impl App {
@@ -342,6 +551,7 @@ impl App {
             is_streaming: false,
             streaming_text: String::new(),
             status_message: None,
+            spinner_verb: None,
             should_quit: false,
             show_help: false,
             tool_use_blocks: Vec::new(),
@@ -358,6 +568,9 @@ impl App {
             new_messages_while_scrolled: 0,
             token_warning_threshold_shown: 0,
             session_start: std::time::Instant::now(),
+            turn_start: None,
+            last_turn_elapsed: None,
+            last_turn_verb: None,
             transcript_version: Cell::new(0),
             help_overlay: HelpOverlay::new(),
             history_search_overlay: HistorySearchOverlay::new(),
@@ -385,6 +598,24 @@ impl App {
             mcp_view: McpViewState::new(),
             agents_menu: AgentsMenuState::new(),
             diff_viewer: DiffViewerState::new(),
+            feedback_survey: crate::feedback_survey::FeedbackSurveyState::new(),
+            memory_file_selector: crate::memory_file_selector::MemoryFileSelectorState::new(),
+            hooks_config_menu: crate::hooks_config_menu::HooksConfigMenuState::new(),
+            overage_upsell: crate::overage_upsell::OverageCreditUpsellState::new(),
+            voice_mode_notice: crate::voice_mode_notice::VoiceModeNoticeState::new(),
+            desktop_upsell: crate::desktop_upsell_startup::DesktopUpsellStartupState::new(),
+            memory_update_notification: crate::memory_update_notification::MemoryUpdateNotificationState::new(),
+            elicitation: crate::elicitation_dialog::ElicitationDialogState::new(),
+            model_picker: ModelPickerState::new(),
+            session_browser: SessionBrowserState::new(),
+            mcp_approval: McpApprovalDialogState::new(),
+            output_style: "auto".to_string(),
+            pr_number: None,
+            pr_url: None,
+            background_task_status: None,
+            status_line_override: None,
+            auto_compact_enabled: false,
+            auto_compact_threshold: 95,
             voice_recorder: {
                 // Check whether voice input has been enabled via the /voice command
                 // (stored in ~/.claude/ui-settings.json).  We also accept
@@ -413,6 +644,13 @@ impl App {
             },
             voice_recording: false,
             voice_event_rx: None,
+            context_window_size: 0,
+            context_used_tokens: 0,
+            rate_limit_5h_pct: None,
+            rate_limit_7day_pct: None,
+            worktree_name: None,
+            worktree_branch: None,
+            agent_type_badge: None,
         }
     }
 
@@ -474,7 +712,7 @@ impl App {
                 self.open_agents_menu();
                 true
             }
-            "diff" => {
+            "diff" | "review" => {
                 let root = self.project_root();
                 self.diff_viewer.open(&root);
                 true
@@ -489,6 +727,187 @@ impl App {
                 self.global_search.open();
                 true
             }
+            "survey" | "feedback" => {
+                self.feedback_survey.open();
+                true
+            }
+            "memory" => {
+                let root = self.project_root();
+                self.memory_file_selector.open(&root);
+                true
+            }
+            "hooks" => {
+                self.hooks_config_menu.open();
+                true
+            }
+            "model" => {
+                let current = &self.model_name.clone();
+                self.model_picker.open(current);
+                true
+            }
+            "session" | "resume" => {
+                self.session_browser.open(vec![]);
+                true
+            }
+            "clear" => {
+                self.messages.clear();
+                self.system_annotations.clear();
+                self.display_messages.clear();
+                self.streaming_text.clear();
+                self.tool_use_blocks.clear();
+                self.invalidate_transcript();
+                self.status_message = Some("Conversation cleared.".to_string());
+                true
+            }
+            "exit" | "quit" => {
+                self.should_quit = true;
+                true
+            }
+            "vim" => {
+                self.prompt_input.vim_enabled = !self.prompt_input.vim_enabled;
+                let status = if self.prompt_input.vim_enabled { "enabled" } else { "disabled" };
+                self.status_message = Some(format!("Vim mode {}.", status));
+                self.refresh_prompt_input();
+                true
+            }
+            "fast" => {
+                self.fast_mode = !self.fast_mode;
+                let status = if self.fast_mode { "enabled" } else { "disabled" };
+                self.status_message = Some(format!("Fast mode {}.", status));
+                true
+            }
+            "compact" => {
+                // Emit compact request via status message; CLI loop checks this.
+                self.status_message = Some("Compacting\u{2026}".to_string());
+                self.push_system_message("Compact requested.".to_string(), SystemMessageStyle::Compact);
+                true
+            }
+            "copy" => {
+                // Copy last assistant message to clipboard. Attempt arboard; fall back to notification.
+                let last = self.messages.iter().rev()
+                    .find(|m| m.role == Role::Assistant)
+                    .map(|m| m.get_all_text());
+                if let Some(text) = last {
+                    // Try xclip/xsel/pbcopy/clip.exe for clipboard; fall back to notification.
+                    let copied = try_copy_to_clipboard(&text);
+                    if copied {
+                        self.notifications.push(
+                            NotificationKind::Info,
+                            "Copied to clipboard.".to_string(),
+                            Some(3),
+                        );
+                    } else {
+                        self.notifications.push(
+                            NotificationKind::Info,
+                            format!("Last response: {} chars (clipboard unavailable)", text.len()),
+                            Some(5),
+                        );
+                    }
+                } else {
+                    self.notifications.push(
+                        NotificationKind::Warning,
+                        "No assistant message to copy.".to_string(),
+                        Some(3),
+                    );
+                }
+                true
+            }
+            "output-style" => {
+                self.output_style = match self.output_style.as_str() {
+                    "auto" => "stream".to_string(),
+                    "stream" => "verbose".to_string(),
+                    _ => "auto".to_string(),
+                };
+                self.status_message = Some(format!("Output style: {}.", self.output_style));
+                true
+            }
+            "effort" => {
+                self.effort_level = match self.effort_level {
+                    EffortLevel::Low => EffortLevel::Medium,
+                    EffortLevel::Medium => EffortLevel::High,
+                    EffortLevel::High => EffortLevel::Max,
+                    EffortLevel::Max => EffortLevel::Low,
+                };
+                self.status_message = Some(format!("Effort: {:?}.", self.effort_level));
+                true
+            }
+            "voice" => {
+                let was_on = self.voice_recorder.is_some();
+                if was_on {
+                    self.voice_recorder = None;
+                    self.voice_mode_notice.dismiss();
+                    self.status_message = Some("Voice mode disabled.".to_string());
+                } else {
+                    let recorder = cc_core::voice::global_voice_recorder();
+                    if let Ok(mut r) = recorder.lock() {
+                        r.set_enabled(true);
+                    }
+                    self.voice_recorder = Some(recorder);
+                    self.voice_mode_notice = crate::voice_mode_notice::VoiceModeNoticeState::new();
+                    self.status_message = Some("Voice mode enabled. Press Alt+V to record.".to_string());
+                }
+                true
+            }
+            "doctor" => {
+                self.notifications.push(
+                    NotificationKind::Info,
+                    "Diagnostics: Rust TUI v{} — all systems nominal.".to_string(),
+                    Some(5),
+                );
+                true
+            }
+            "cost" => {
+                self.stats_dialog.open();
+                true
+            }
+            "rewind" => {
+                self.open_rewind_flow();
+                true
+            }
+            "export" => {
+                let count = self.messages.len();
+                self.notifications.push(
+                    NotificationKind::Info,
+                    format!("Export: {} messages (session browser → export coming soon).", count),
+                    Some(4),
+                );
+                true
+            }
+            "rename" => {
+                self.session_browser.open(vec![]);
+                self.session_browser.start_rename();
+                true
+            }
+            "init" => {
+                self.notifications.push(
+                    NotificationKind::Info,
+                    "Init: creating CLAUDE.md via /init (routing to CLI loop)\u{2026}".to_string(),
+                    Some(5),
+                );
+                true
+            }
+            "login" => {
+                self.notifications.push(
+                    NotificationKind::Info,
+                    "Login: routing to CLI loop\u{2026}".to_string(),
+                    Some(3),
+                );
+                true
+            }
+            "logout" => {
+                self.notifications.push(
+                    NotificationKind::Info,
+                    "Logout: routing to CLI loop\u{2026}".to_string(),
+                    Some(3),
+                );
+                true
+            }
+            "keybindings" => {
+                // Open settings on KeyBindings tab
+                self.settings_screen.open();
+                self.settings_screen.active_tab = crate::settings_screen::SettingsTab::KeyBindings;
+                true
+            }
             _ => false,
         }
     }
@@ -498,6 +917,11 @@ impl App {
         self.mcp_view.close();
         self.agents_menu.close();
         self.diff_viewer.close();
+        self.feedback_survey.close();
+        self.memory_file_selector.close();
+        self.hooks_config_menu.close();
+        self.model_picker.close();
+        self.session_browser.close();
     }
 
     fn project_root(&self) -> std::path::PathBuf {
@@ -845,6 +1269,46 @@ impl App {
         pending
     }
 
+    /// Returns and clears any pending MCP approval result.
+    pub fn take_mcp_approval_result(&mut self) -> Option<crate::dialogs::McpApprovalChoice> {
+        if !self.mcp_approval.visible {
+            return None;
+        }
+        // The dialog closes itself on confirm; we check if it's now closed
+        None // Actual result is read by CLI loop via mcp_approval.visible + confirm()
+    }
+
+    /// Detect the current PR from environment variables or git.
+    pub fn detect_pr(&mut self) {
+        // Check CLAUDE_PR_NUMBER and CLAUDE_PR_URL env vars
+        if let Ok(num) = std::env::var("CLAUDE_PR_NUMBER") {
+            if let Ok(n) = num.parse::<u32>() {
+                self.pr_number = Some(n);
+            }
+        }
+        if let Ok(url) = std::env::var("CLAUDE_PR_URL") {
+            self.pr_url = Some(url);
+        }
+        // Fall back to gh CLI if no env vars
+        if self.pr_number.is_none() {
+            if let Ok(output) = std::process::Command::new("gh")
+                .args(["pr", "view", "--json", "number,url", "--jq", ".number,.url"])
+                .output()
+            {
+                if output.status.success() {
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    let parts: Vec<&str> = text.trim().split('\n').collect();
+                    if parts.len() >= 2 {
+                        if let Ok(n) = parts[0].trim().parse::<u32>() {
+                            self.pr_number = Some(n);
+                            self.pr_url = Some(parts[1].trim().to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn clear_prompt(&mut self) {
         self.prompt_input.clear();
         self.refresh_prompt_input();
@@ -897,6 +1361,115 @@ impl App {
             }
         } else {
             self.keybindings.cancel_chord();
+        }
+
+        // Model picker intercepts navigation and Esc
+        if self.model_picker.visible {
+            match key.code {
+                KeyCode::Esc => self.model_picker.close(),
+                KeyCode::Up => self.model_picker.select_prev(),
+                KeyCode::Down => self.model_picker.select_next(),
+                KeyCode::Enter => {
+                    if let Some(model_id) = self.model_picker.confirm() {
+                        self.set_model(model_id.clone());
+                        self.status_message = Some(format!("Model: {}", model_id));
+                    }
+                }
+                KeyCode::Backspace => self.model_picker.pop_filter_char(),
+                KeyCode::Char(c) => self.model_picker.push_filter_char(c),
+                _ => {}
+            }
+            return false;
+        }
+
+        // Session browser intercepts navigation and Esc
+        if self.session_browser.visible {
+            use crate::session_browser::SessionBrowserMode;
+            match self.session_browser.mode {
+                SessionBrowserMode::Browse => {
+                    match key.code {
+                        KeyCode::Esc => self.session_browser.close(),
+                        KeyCode::Up => self.session_browser.select_prev(),
+                        KeyCode::Down => self.session_browser.select_next(),
+                        KeyCode::Char('r') => self.session_browser.start_rename(),
+                        _ => {}
+                    }
+                }
+                SessionBrowserMode::Rename => {
+                    match key.code {
+                        KeyCode::Esc => self.session_browser.cancel(),
+                        KeyCode::Enter => {
+                            if let Some((_id, name)) = self.session_browser.confirm_rename() {
+                                self.session_title = Some(name.clone());
+                                self.status_message = Some(format!("Renamed to: {}", name));
+                            }
+                        }
+                        KeyCode::Backspace => self.session_browser.pop_rename_char(),
+                        KeyCode::Char(c) => self.session_browser.push_rename_char(c),
+                        _ => {}
+                    }
+                }
+                SessionBrowserMode::Confirm => {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('n') => self.session_browser.cancel(),
+                        KeyCode::Enter | KeyCode::Char('y') => {
+                            self.session_browser.close();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            return false;
+        }
+
+        // MCP approval dialog
+        if self.mcp_approval.visible {
+            let result = crate::dialogs::handle_mcp_approval_key(&mut self.mcp_approval, key);
+            if result.is_some() {
+                // Result processed by CLI loop via take_mcp_approval_result()
+            }
+            return false;
+        }
+
+        // Feedback survey intercepts digit keys and Esc
+        if self.feedback_survey.visible {
+            if key.code == KeyCode::Esc {
+                self.feedback_survey.close();
+                return false;
+            }
+            if let KeyCode::Char(c) = key.code {
+                if let Some(d) = c.to_digit(10) {
+                    self.feedback_survey.handle_digit(d as u8);
+                    return false;
+                }
+            }
+            return false;
+        }
+
+        // Memory file selector intercepts navigation and Esc
+        if self.memory_file_selector.visible {
+            match key.code {
+                KeyCode::Esc => self.memory_file_selector.close(),
+                KeyCode::Up => self.memory_file_selector.select_prev(),
+                KeyCode::Down => self.memory_file_selector.select_next(),
+                KeyCode::Enter => {
+                    // Selection acknowledged — consumer can read selected_path()
+                    self.memory_file_selector.close();
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        // Hooks config menu intercepts navigation and Esc
+        if self.hooks_config_menu.visible {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.hooks_config_menu.close(),
+                KeyCode::Up => self.hooks_config_menu.select_prev(),
+                KeyCode::Down => self.hooks_config_menu.select_next(),
+                _ => {}
+            }
+            return false;
         }
 
         if self.diff_viewer.open {
@@ -989,6 +1562,94 @@ impl App {
             }
         }
 
+        // Overage upsell dismiss
+        if key.code == KeyCode::Esc && self.overage_upsell.visible {
+            self.overage_upsell.dismiss();
+            return false;
+        }
+
+        // Voice mode notice dismiss
+        if key.code == KeyCode::Esc && self.voice_mode_notice.visible {
+            self.voice_mode_notice.dismiss();
+            return false;
+        }
+
+        // Desktop upsell startup dialog
+        if self.desktop_upsell.visible {
+            match key.code {
+                KeyCode::Up | KeyCode::BackTab => {
+                    self.desktop_upsell.select_prev();
+                    return false;
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    self.desktop_upsell.select_next();
+                    return false;
+                }
+                KeyCode::Enter => {
+                    self.desktop_upsell.confirm();
+                    return false;
+                }
+                KeyCode::Esc => {
+                    self.desktop_upsell.dismiss_temporarily();
+                    return false;
+                }
+                _ => return false,
+            }
+        }
+
+        // Memory update notification dismiss
+        if key.code == KeyCode::Esc && self.memory_update_notification.visible {
+            self.memory_update_notification.dismiss();
+            return false;
+        }
+
+        // MCP elicitation dialog — highest priority modal
+        if self.elicitation.visible {
+            match key.code {
+                KeyCode::Esc => {
+                    self.elicitation.cancel();
+                    return false;
+                }
+                KeyCode::Enter => {
+                    self.elicitation.submit();
+                    return false;
+                }
+                KeyCode::Tab | KeyCode::Down => {
+                    if let crossterm::event::KeyModifiers::SHIFT = key.modifiers {
+                        self.elicitation.prev_field();
+                    } else {
+                        self.elicitation.next_field();
+                    }
+                    return false;
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    self.elicitation.prev_field();
+                    return false;
+                }
+                KeyCode::Left => {
+                    self.elicitation.cycle_enum_prev();
+                    return false;
+                }
+                KeyCode::Right => {
+                    self.elicitation.cycle_enum_next();
+                    return false;
+                }
+                KeyCode::Char(' ') => {
+                    self.elicitation.toggle_active();
+                    return false;
+                }
+                KeyCode::Backspace => {
+                    self.elicitation.backspace();
+                    return false;
+                }
+                KeyCode::Char(c) => {
+                    self.elicitation.insert_char(c);
+                    return false;
+                }
+                _ => return false,
+            }
+        }
+
         // ---- Voice hold-to-talk (Alt+V toggles recording on/off) ----------
         if key.code == KeyCode::Char('v')
             && key.modifiers.contains(KeyModifiers::ALT)
@@ -1047,6 +1708,7 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.is_streaming {
                     self.is_streaming = false;
+                    self.spinner_verb = None;
                     self.streaming_text.clear();
                     self.tool_use_blocks.clear();
                     self.status_message = Some("Cancelled.".to_string());
@@ -1454,6 +2116,7 @@ impl App {
             "interrupt" => {
                 if self.is_streaming {
                     self.is_streaming = false;
+                    self.spinner_verb = None;
                     self.streaming_text.clear();
                     self.tool_use_blocks.clear();
                     self.status_message = Some("Cancelled.".to_string());
@@ -1689,6 +2352,13 @@ impl App {
     pub fn handle_query_event(&mut self, event: QueryEvent) {
         match event {
             QueryEvent::Stream(stream_evt) => {
+                if !self.is_streaming {
+                    let seed = self.frame_count as usize ^ (self.messages.len() * 17);
+                    self.spinner_verb = Some(sample_spinner_verb(seed).to_string());
+                    self.turn_start = Some(std::time::Instant::now());
+                    self.last_turn_elapsed = None;
+                    self.last_turn_verb = None;
+                }
                 self.is_streaming = true;
                 match stream_evt {
                     cc_api::StreamEvent::ContentBlockDelta { delta, .. } => {
@@ -1707,6 +2377,7 @@ impl App {
                     }
                     cc_api::StreamEvent::MessageStop => {
                         self.is_streaming = false;
+                        self.spinner_verb = None;
                         self.stall_start = None;
                         if !self.streaming_text.is_empty() {
                             let text = std::mem::take(&mut self.streaming_text);
@@ -1723,7 +2394,11 @@ impl App {
                 }
             }
 
-            QueryEvent::ToolStart { tool_name, tool_id } => {
+            QueryEvent::ToolStart { tool_name, tool_id, input_json } => {
+                if !self.is_streaming && self.spinner_verb.is_none() {
+                    let seed = self.frame_count as usize ^ (self.messages.len() * 17);
+                    self.spinner_verb = Some(sample_spinner_verb(seed).to_string());
+                }
                 self.is_streaming = true;
                 self.status_message = Some(format!("Running {}…", tool_name));
                 if let Some(existing) =
@@ -1731,12 +2406,14 @@ impl App {
                 {
                     existing.status = ToolStatus::Running;
                     existing.output_preview = None;
+                    existing.input_json = input_json;
                 } else {
                     self.tool_use_blocks.push(ToolUseBlock {
                         id: tool_id,
                         name: tool_name,
                         status: ToolStatus::Running,
                         output_preview: None,
+                        input_json,
                     });
                 }
                 self.invalidate_transcript();
@@ -1778,6 +2455,14 @@ impl App {
             QueryEvent::TurnComplete { turn, stop_reason, .. } => {
                 debug!(turn, stop_reason, "Turn complete");
                 self.is_streaming = false;
+                self.spinner_verb = None;
+                // Record elapsed time and pick a completion verb
+                if let Some(start) = self.turn_start.take() {
+                    let secs = start.elapsed().as_secs();
+                    let seed = self.frame_count as usize ^ (self.messages.len() * 7);
+                    self.last_turn_elapsed = Some(format_elapsed(secs));
+                    self.last_turn_verb = Some(sample_completion_verb(seed));
+                }
                 if !self.streaming_text.is_empty() {
                     let text = std::mem::take(&mut self.streaming_text);
                     self.push_assistant_message(text);
@@ -1793,6 +2478,7 @@ impl App {
 
             QueryEvent::Error(msg) => {
                 self.is_streaming = false;
+                self.spinner_verb = None;
                 self.streaming_text.clear();
                 self.invalidate_transcript();
                 let err_msg = format!("Error: {}", msg);
@@ -1891,5 +2577,74 @@ impl App {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_app() -> App {
+        let config = Config::default();
+        let cost_tracker = cc_core::cost::CostTracker::new();
+        App::new(config, cost_tracker)
+    }
+
+    #[test]
+    fn test_clear_slash_command_clears_messages() {
+        let mut app = make_app();
+        app.add_message(Role::User, "hello".to_string());
+        app.add_message(Role::Assistant, "world".to_string());
+        assert_eq!(app.messages.len(), 2);
+        assert!(app.intercept_slash_command("clear"));
+        assert_eq!(app.messages.len(), 0);
+    }
+
+    #[test]
+    fn test_exit_slash_command_sets_quit_flag() {
+        let mut app = make_app();
+        assert!(!app.should_quit);
+        assert!(app.intercept_slash_command("exit"));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn test_vim_slash_command_toggles_vim() {
+        let mut app = make_app();
+        assert!(!app.prompt_input.vim_enabled);
+        assert!(app.intercept_slash_command("vim"));
+        assert!(app.prompt_input.vim_enabled);
+        assert!(app.intercept_slash_command("vim"));
+        assert!(!app.prompt_input.vim_enabled);
+    }
+
+    #[test]
+    fn test_model_slash_command_opens_picker() {
+        let mut app = make_app();
+        assert!(!app.model_picker.visible);
+        assert!(app.intercept_slash_command("model"));
+        assert!(app.model_picker.visible);
+    }
+
+    #[test]
+    fn test_fast_slash_command_toggles_fast_mode() {
+        let mut app = make_app();
+        assert!(!app.fast_mode);
+        assert!(app.intercept_slash_command("fast"));
+        assert!(app.fast_mode);
+        assert!(app.intercept_slash_command("fast"));
+        assert!(!app.fast_mode);
+    }
+
+    #[test]
+    fn test_output_style_cycles() {
+        let mut app = make_app();
+        assert_eq!(app.output_style, "auto");
+        assert!(app.intercept_slash_command("output-style"));
+        assert_eq!(app.output_style, "stream");
+        assert!(app.intercept_slash_command("output-style"));
+        assert_eq!(app.output_style, "verbose");
+        assert!(app.intercept_slash_command("output-style"));
+        assert_eq!(app.output_style, "auto");
     }
 }

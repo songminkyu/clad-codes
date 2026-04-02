@@ -65,6 +65,26 @@ pub mod stats_dialog;
 pub mod mcp_view;
 /// Complete prompt input with vim mode, history, typeahead, and paste handling.
 pub mod prompt_input;
+/// Session quality feedback survey overlay.
+pub mod feedback_survey;
+/// Memory file selector overlay (CLAUDE.md browser).
+pub mod memory_file_selector;
+/// Read-only hooks configuration browser.
+pub mod hooks_config_menu;
+/// Overage credit upsell banner (shown when user exceeds free-tier limit).
+pub mod overage_upsell;
+/// Voice mode availability notice (shown when voice is available but not enabled).
+pub mod voice_mode_notice;
+/// Desktop app upsell startup dialog (shown at startup on macOS/Windows x64).
+pub mod desktop_upsell_startup;
+/// Memory update notification banner (shown after Claude updates a CLAUDE.md file).
+pub mod memory_update_notification;
+/// MCP elicitation dialog (form-based user input requested by MCP servers).
+pub mod elicitation_dialog;
+/// Model picker overlay (/model command).
+pub mod model_picker;
+/// Session browser overlay (/session, /resume, /rename, /export).
+pub mod session_browser;
 
 // ---------------------------------------------------------------------------
 // Public re-exports
@@ -72,11 +92,21 @@ pub mod prompt_input;
 
 pub use app::App;
 pub use input::{is_slash_command, parse_slash_command};
+pub use feedback_survey::{FeedbackSurveyState, FeedbackSurveyStage, FeedbackResponse};
+pub use memory_file_selector::{MemoryFileSelectorState, MemoryFile, MemoryFileType};
+pub use hooks_config_menu::{HooksConfigMenuState, HookEntry};
+pub use overage_upsell::{OverageCreditUpsellState, render_overage_upsell};
+pub use voice_mode_notice::{VoiceModeNoticeState, render_voice_mode_notice};
+pub use desktop_upsell_startup::{DesktopUpsellStartupState, DesktopUpsellSelection, render_desktop_upsell_startup};
+pub use memory_update_notification::{MemoryUpdateNotificationState, render_memory_update_notification, get_relative_memory_path};
+pub use elicitation_dialog::{ElicitationDialogState, ElicitationField, ElicitationFieldKind, ElicitationResult, render_elicitation_dialog};
 pub use diff_viewer::{DiffViewerState, DiffPane, DiffType, load_git_diff, parse_unified_diff, render_diff_dialog};
 pub use agents_view::{AgentInfo, AgentStatus, AgentsMenuState, AgentDefinition, render_agents_menu, render_coordinator_status, load_agent_definitions};
 pub use stats_dialog::{StatsDialogState, StatsTab, load_stats, render_stats_dialog};
 pub use mcp_view::{McpViewState, McpServerView, McpToolView, McpViewStatus, render_mcp_view};
-pub use prompt_input::{PromptInputState, VimMode, InputMode, render_prompt_input, handle_paste, compute_typeahead};
+pub use prompt_input::{PromptInputState, VimMode, VimPendingState, VimOperator, VimFindKind, InputMode, render_prompt_input, handle_paste, compute_typeahead};
+pub use model_picker::{ModelPickerState, ModelEntry, render_model_picker};
+pub use session_browser::{SessionBrowserState, SessionBrowserMode, SessionEntry, render_session_browser};
 
 // ---------------------------------------------------------------------------
 // Terminal initialization / teardown helpers (public API)
@@ -113,6 +143,7 @@ mod tests {
     use cc_core::file_history::FileHistory;
     use cc_core::types::{ContentBlock, Role, ToolResultContent};
     use dialogs::PermissionRequest;
+    use notifications::NotificationKind;
     use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, Terminal};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -485,8 +516,112 @@ mod tests {
             .join("");
 
         assert!(rendered.contains("/agents"));
-        assert!(rendered.contains("? for shortcuts"));
-        assert!(rendered.contains("/effort"));
+        assert!(rendered.contains("[cmd]"));
+        assert!(rendered.contains("Browse agent definitions"));
+    }
+
+    #[test]
+    fn test_render_app_hides_generic_thinking_status_row() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = make_app();
+        app.is_streaming = true;
+
+        terminal
+            .draw(|frame| crate::render::render_app(frame, &app))
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(!rendered.contains("Thinking..."));
+    }
+
+    #[test]
+    fn test_render_app_shows_footer_notification_instead_of_effort() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = make_app();
+        app.notifications.push(
+            NotificationKind::Warning,
+            "Update available! Run upgrade".to_string(),
+            Some(30),
+        );
+
+        terminal
+            .draw(|frame| crate::render::render_app(frame, &app))
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(rendered.contains("Update available! Run upgrade"));
+        assert!(!rendered.contains("/effort"));
+    }
+
+    #[test]
+    fn test_render_app_hides_shortcuts_hint_when_prompt_has_text() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = make_app();
+        app.set_prompt_text("hello".to_string());
+
+        terminal
+            .draw(|frame| crate::render::render_app(frame, &app))
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(!rendered.contains("? for shortcuts"));
+    }
+
+    #[test]
+    fn test_render_app_shows_startup_notices_below_logo_header() {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = make_app();
+        app.away_summary = Some("2 agent updates while you were away".to_string());
+        app.remote_session_url = Some("https://example.com/session/123".to_string());
+        app.bridge_state = crate::bridge_state::BridgeConnectionState::Connected {
+            session_url: "https://example.com/session/123".to_string(),
+            peer_count: 2,
+        };
+
+        terminal
+            .draw(|frame| crate::render::render_app(frame, &app))
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(rendered.contains("2 agent updates while you were away"));
+        assert!(rendered.contains("Remote session active"));
+        assert!(rendered.contains("https://example.com/session/123"));
     }
 
     #[test]
@@ -497,6 +632,7 @@ mod tests {
             added: 2,
             removed: 1,
             binary: false,
+            is_new_file: false,
             hunks: vec![diff_viewer::DiffHunk {
                 old_range: (1, 1),
                 new_range: (1, 2),
@@ -754,6 +890,7 @@ mod tests {
         app.handle_query_event(cc_query::QueryEvent::ToolStart {
             tool_name: "Bash".to_string(),
             tool_id: "t1".to_string(),
+            input_json: r#"{"command":"ls -la"}"#.to_string(),
         });
         assert_eq!(app.tool_use_blocks.len(), 1);
         assert_eq!(app.tool_use_blocks[0].status, ToolStatus::Running);
@@ -775,6 +912,7 @@ mod tests {
             name: "Read".to_string(),
             status: ToolStatus::Running,
             output_preview: None,
+            input_json: r#"{"file_path":"foo.rs"}"#.to_string(),
         });
         app.handle_query_event(cc_query::QueryEvent::ToolEnd {
             tool_name: "Read".to_string(),

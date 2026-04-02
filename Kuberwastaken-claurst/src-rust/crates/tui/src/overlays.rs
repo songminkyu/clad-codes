@@ -4,10 +4,10 @@
 //   - MessageSelectorOverlay (/rewind step 1)
 //   - RewindFlowOverlay (/rewind full multi-step flow)
 
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
@@ -105,62 +105,146 @@ impl HelpOverlay {
 
 /// Render the help overlay into the frame.
 pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect) {
+    use ratatui::layout::{Constraint, Direction, Layout};
+    use ratatui::widgets::Wrap;
+    use cc_core::constants::APP_VERSION;
+
     if !overlay.visible {
         return;
     }
 
-    let dialog_width = 70u16.min(area.width.saturating_sub(4));
-    let dialog_height = 28u16.min(area.height.saturating_sub(4));
+    let dialog_width = 92u16.min(area.width.saturating_sub(2));
+    let dialog_height = 34u16.min(area.height.saturating_sub(2));
     let dialog_area = centered_rect(dialog_width, dialog_height, area);
 
     frame.render_widget(Clear, dialog_area);
 
-    let mut lines: Vec<Line> = Vec::new();
+    // Outer block
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(vec![
+            Span::styled(" Help ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("— Claude Code  ", Style::default().fg(Color::DarkGray)),
+        ]))
+        .border_style(Style::default().fg(Color::Cyan));
+    frame.render_widget(block, dialog_area);
 
-    // --- Header ----------------------------------------------------------
-    lines.push(Line::from(vec![Span::styled(
-        " Commands",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-    )]));
-    if !overlay.filter.is_empty() {
-        lines.push(Line::from(vec![
+    let inner = Rect {
+        x: dialog_area.x + 1,
+        y: dialog_area.y + 1,
+        width: dialog_area.width.saturating_sub(2),
+        height: dialog_area.height.saturating_sub(2),
+    };
+
+    // Reserve bottom row for version / hint line
+    let body_height = inner.height.saturating_sub(1);
+    let body_area = Rect { x: inner.x, y: inner.y, width: inner.width, height: body_height };
+    let version_area = Rect {
+        x: inner.x,
+        y: inner.y + body_height,
+        width: inner.width,
+        height: 1,
+    };
+
+    // Split filter row at top (if active)
+    let (filter_area, content_area) = if !overlay.filter.is_empty() {
+        let splits = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Min(1)])
+            .split(body_area);
+        (Some(splits[0]), splits[1])
+    } else {
+        (None, body_area)
+    };
+
+    // Render filter row
+    if let Some(fa) = filter_area {
+        let filter_line = Line::from(vec![
             Span::styled("  Filter: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 overlay.filter.clone(),
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
             ),
-        ]));
-    }
-    lines.push(Line::from(""));
-
-    // --- Keyboard shortcuts section ---------------------------------------
-    let show_kb = overlay.filter.is_empty();
-    if show_kb {
-        lines.push(Line::from(vec![Span::styled(
-            " Keyboard Shortcuts",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        )]));
-        lines.push(Line::from(""));
-        for (key, desc) in &[
-            ("Enter",           "Submit message"),
-            ("Ctrl+C",          "Cancel streaming / Quit"),
-            ("Ctrl+D",          "Quit (empty input)"),
-            ("Up / Down",       "Navigate input history"),
-            ("Ctrl+R",          "Search input history"),
-            ("PageUp / PgDn",   "Scroll messages"),
-            ("F1 / ?",          "Toggle this help"),
-            ("Esc",             "Close overlay / cancel"),
-        ] {
-            lines.push(kb_line(key, desc));
-        }
-        lines.push(Line::from(""));
+        ]);
+        frame.render_widget(Paragraph::new(filter_line), Rect { x: fa.x, y: fa.y, width: fa.width, height: 1 });
+        // separator
+        let sep = Line::from(Span::styled(
+            "\u{2500}".repeat(fa.width as usize),
+            Style::default().fg(Color::DarkGray),
+        ));
+        frame.render_widget(Paragraph::new(sep), Rect { x: fa.x, y: fa.y + 1, width: fa.width, height: 1 });
     }
 
-    // --- Commands by category --------------------------------------------
+    // Two columns: left = keyboard shortcuts, right = slash commands
+    let col_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Length(1), Constraint::Min(1)])
+        .split(content_area);
+
+    // ─── Left column: keyboard shortcuts by category ───────────────────────
+    let mut left_lines: Vec<Line<'static>> = Vec::new();
+
+    left_lines.push(Line::from(Span::styled(
+        " Keyboard Shortcuts",
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    )));
+    left_lines.push(Line::from(""));
+
+    // Navigation category
+    left_lines.push(Line::from(Span::styled(
+        " Navigation",
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+    )));
+    for (key, desc) in &[
+        ("PageUp / PgDn",   "Scroll messages"),
+        ("j / k",           "Scroll one line"),
+        ("Home / End",      "Top / bottom"),
+    ] {
+        left_lines.push(kb_line(key, desc));
+    }
+    left_lines.push(Line::from(""));
+
+    // Input category
+    left_lines.push(Line::from(Span::styled(
+        " Input",
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+    )));
+    for (key, desc) in &[
+        ("Enter",           "Submit message"),
+        ("Up / Down",       "Input history"),
+        ("Ctrl+R",          "Search history"),
+        ("Esc",             "Cancel / close"),
+    ] {
+        left_lines.push(kb_line(key, desc));
+    }
+    left_lines.push(Line::from(""));
+
+    // App category
+    left_lines.push(Line::from(Span::styled(
+        " App",
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+    )));
+    for (key, desc) in &[
+        ("F1 / ?",          "Toggle help"),
+        ("Ctrl+C",          "Cancel / quit"),
+        ("Ctrl+D",          "Quit (empty input)"),
+        ("Ctrl+L",          "Clear screen"),
+    ] {
+        left_lines.push(kb_line(key, desc));
+    }
+
+    frame.render_widget(
+        Paragraph::new(left_lines).wrap(Wrap { trim: false }),
+        col_chunks[0],
+    );
+
+    // ─── Center divider ────────────────────────────────────────────────────
+    let divider_lines: Vec<Line<'static>> = (0..content_area.height)
+        .map(|_| Line::from(Span::styled("\u{2502}", Style::default().fg(Color::DarkGray))))
+        .collect();
+    frame.render_widget(Paragraph::new(divider_lines), col_chunks[1]);
+
+    // ─── Right column: slash commands by category ──────────────────────────
     let filter_lc = overlay.filter.to_lowercase();
     let filtered: Vec<&HelpEntry> = overlay
         .commands
@@ -173,90 +257,261 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
         })
         .collect();
 
+    let mut right_lines: Vec<Line<'static>> = Vec::new();
+
+    right_lines.push(Line::from(Span::styled(
+        " Slash Commands",
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    )));
+    right_lines.push(Line::from(""));
+
     let mut current_cat = "";
     for entry in &filtered {
         if entry.category.as_str() != current_cat {
             current_cat = entry.category.as_str();
-            if !lines.is_empty() {
-                lines.push(Line::from(""));
+            if right_lines.len() > 2 {
+                right_lines.push(Line::from(""));
             }
-            lines.push(Line::from(vec![Span::styled(
+            right_lines.push(Line::from(Span::styled(
                 format!(" {}", entry.category),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            )]));
-            lines.push(Line::from(""));
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            )));
         }
-
         let aliases_text = if entry.aliases.is_empty() {
             String::new()
         } else {
             format!(" ({})", entry.aliases)
         };
-        lines.push(Line::from(vec![
+        right_lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                format!("/{:<15}", entry.name),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                format!("/{:<14}", entry.name),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                aliases_text,
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(aliases_text, Style::default().fg(Color::DarkGray)),
             Span::raw("  "),
             Span::raw(entry.description.clone()),
         ]));
     }
 
     if filtered.is_empty() {
-        lines.push(Line::from(vec![Span::styled(
+        right_lines.push(Line::from(Span::styled(
             "  (no matching commands)",
             Style::default().fg(Color::DarkGray),
-        )]));
+        )));
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(
-        " Type to filter  ·  Esc / ? to close  ·  ↑↓ to scroll",
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::ITALIC),
-    )]));
-
-    let total_lines = lines.len() as u16;
-    let inner_height = dialog_height.saturating_sub(2);
-    let max_scroll = total_lines.saturating_sub(inner_height);
+    let right_total = right_lines.len() as u16;
+    let right_visible = col_chunks[2].height;
+    let max_scroll = right_total.saturating_sub(right_visible);
     let scroll = overlay.scroll_offset.min(max_scroll);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Help — Claude Code ")
-        .border_style(Style::default().fg(Color::Cyan));
+    frame.render_widget(
+        Paragraph::new(right_lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        col_chunks[2],
+    );
 
-    let para = Paragraph::new(lines)
-        .block(block)
-        .alignment(Alignment::Left)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
-
-    frame.render_widget(para, dialog_area);
+    // ─── Version / hint bar ────────────────────────────────────────────────
+    let version_line = Line::from(vec![
+        Span::styled(
+            format!(" v{}  \u{00b7}  Type to filter  \u{00b7}  \u{2191}\u{2193} scroll commands  \u{00b7}  Esc to close", APP_VERSION),
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(version_line), version_area);
 }
 
 // ============================================================================
 // HistorySearchOverlay
 // ============================================================================
 
+// ---------------------------------------------------------------------------
+// HistoryEntry — wrapper with optional timestamp
+// ---------------------------------------------------------------------------
+
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// A single history entry with an optional Unix timestamp.
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
+    pub text: String,
+    /// Unix timestamp (seconds since epoch) when this entry was recorded.
+    /// `None` for legacy entries without timestamps.
+    pub timestamp: Option<u64>,
+}
+
+impl HistoryEntry {
+    /// Create a new entry stamped with the current time.
+    pub fn new(text: String) -> Self {
+        Self { text, timestamp: Some(current_unix_secs()) }
+    }
+
+    /// Create a legacy entry without a timestamp.
+    pub fn legacy(text: String) -> Self {
+        Self { text, timestamp: None }
+    }
+
+    /// Human-readable relative time: "just now", "2m ago", "3h ago", "2d ago", etc.
+    pub fn relative_time(&self) -> String {
+        let ts = match self.timestamp {
+            None => return String::new(),
+            Some(t) => t,
+        };
+        let now = current_unix_secs();
+        let delta = now.saturating_sub(ts);
+        if delta < 60 {
+            "just now".to_string()
+        } else if delta < 3600 {
+            format!("{}m ago", delta / 60)
+        } else if delta < 86400 {
+            format!("{}h ago", delta / 3600)
+        } else {
+            format!("{}d ago", delta / 86400)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fuzzy / subsequence matching
+// ---------------------------------------------------------------------------
+
+/// Compute a match score for `query` against `target`.
+///
+/// Fast path: if `target` contains `query` as a substring the score is
+/// `1.0 + position_bonus` so it always beats a pure subsequence match.
+///
+/// Subsequence path: each character of `query` must appear in `target` in
+/// order. The score is `consecutive_run_bonus + position_bonus` where
+///   - `consecutive_run_bonus = longest_consecutive_run as f32 / query.len() as f32`
+///   - `position_bonus       = 1.0 / (1.0 + first_match_position as f32)`
+///
+/// Returns `None` when `query` is neither a substring nor a subsequence of
+/// `target`.
+///
+/// The returned `Vec<usize>` contains the byte indices in `target` that were
+/// matched (useful for highlight rendering).
+pub fn subsequence_score(query: &str, target: &str) -> Option<(f32, Vec<usize>)> {
+    if query.is_empty() {
+        return Some((0.0, Vec::new()));
+    }
+
+    let q_lc = query.to_lowercase();
+    let t_lc = target.to_lowercase();
+
+    // --- Fast path: substring match (always wins over subsequence) ----------
+    if let Some(pos) = t_lc.find(q_lc.as_str()) {
+        let position_bonus = 1.0 / (1.0 + pos as f32);
+        let score = 1.0 + position_bonus;
+        // Matched positions are the contiguous byte range [pos, pos+q_lc.len())
+        let positions: Vec<usize> = (pos..pos + q_lc.len()).collect();
+        return Some((score, positions));
+    }
+
+    // --- Subsequence path ---------------------------------------------------
+    let q_chars: Vec<char> = q_lc.chars().collect();
+    let t_chars: Vec<char> = t_lc.chars().collect();
+
+    let mut q_pos = 0usize;
+    // Map: char index in t_chars -> byte offset in original target
+    let t_byte_offsets: Vec<usize> = {
+        let mut off = 0usize;
+        t_chars
+            .iter()
+            .map(|c| {
+                let o = off;
+                off += c.len_utf8();
+                o
+            })
+            .collect()
+    };
+
+    let mut matched_char_indices: Vec<usize> = Vec::with_capacity(q_chars.len());
+
+    for (t_i, &tc) in t_chars.iter().enumerate() {
+        if q_pos < q_chars.len() && tc == q_chars[q_pos] {
+            matched_char_indices.push(t_i);
+            q_pos += 1;
+        }
+    }
+
+    if q_pos < q_chars.len() {
+        // Not all query chars found in order
+        return None;
+    }
+
+    // Compute longest consecutive run among matched char indices
+    let mut max_run = 1usize;
+    let mut cur_run = 1usize;
+    for w in matched_char_indices.windows(2) {
+        if w[1] == w[0] + 1 {
+            cur_run += 1;
+            if cur_run > max_run {
+                max_run = cur_run;
+            }
+        } else {
+            cur_run = 1;
+        }
+    }
+
+    let q_len = q_chars.len() as f32;
+    let consecutive_run_bonus = max_run as f32 / q_len;
+    let first_match_pos = matched_char_indices[0];
+    let position_bonus = 1.0 / (1.0 + first_match_pos as f32);
+    let score = consecutive_run_bonus + position_bonus;
+
+    let byte_positions: Vec<usize> = matched_char_indices
+        .iter()
+        .map(|&ci| t_byte_offsets[ci])
+        .collect();
+
+    Some((score, byte_positions))
+}
+
+// ---------------------------------------------------------------------------
+// MatchEntry — scored match with highlight positions
+// ---------------------------------------------------------------------------
+
+/// One scored match result produced by `update_matches`.
+#[derive(Debug, Clone)]
+pub struct MatchEntry {
+    /// Index of this entry in the `snapshot` held by `HistorySearchOverlay`.
+    pub snapshot_idx: usize,
+    pub score: f32,
+    /// Byte positions in `entry.text` that were matched (for highlighting).
+    pub highlight_positions: Vec<usize>,
+}
+
+// ---------------------------------------------------------------------------
+// HistorySearchOverlay
+// ---------------------------------------------------------------------------
+
 /// State for the Ctrl+R history search floating panel.
 #[derive(Debug, Default)]
 pub struct HistorySearchOverlay {
     pub visible: bool,
     pub query: String,
-    /// Indices into the app's `input_history` that match the query.
-    pub matches: Vec<usize>,
+    /// Scored, sorted matches.  `matches[i].snapshot_idx` is the index into
+    /// `snapshot`.  `matches` is sorted best-score-first.
+    pub matches: Vec<MatchEntry>,
     pub selected_idx: usize,
+    /// Snapshot of the history taken at `open()` time, stored as
+    /// `HistoryEntry` so timestamps are available.
+    pub snapshot: Vec<HistoryEntry>,
+}
+
+/// Convenience accessor: the plain list of `snapshot_idx` values from
+/// `matches`, in order.  Kept for callers that only need indices.
+impl HistorySearchOverlay {
+    pub fn match_indices(&self) -> Vec<usize> {
+        self.matches.iter().map(|m| m.snapshot_idx).collect()
+    }
 }
 
 impl HistorySearchOverlay {
@@ -264,35 +519,84 @@ impl HistorySearchOverlay {
         Self::default()
     }
 
+    /// Open with a `&[String]` slice (legacy callers).  All entries are
+    /// treated as legacy (no timestamp).
     pub fn open(history: &[String]) -> Self {
+        let entries: Vec<HistoryEntry> = history
+            .iter()
+            .map(|s| HistoryEntry::legacy(s.clone()))
+            .collect();
+        Self::open_with_entries(entries)
+    }
+
+    /// Open with a pre-built `Vec<HistoryEntry>` (timestamp-aware callers).
+    pub fn open_with_entries(entries: Vec<HistoryEntry>) -> Self {
         let mut s = Self {
             visible: true,
             query: String::new(),
             matches: Vec::new(),
             selected_idx: 0,
+            snapshot: entries,
         };
-        s.update_matches(history);
+        s.recompute_matches();
         s
     }
 
-    /// Recompute `matches` based on `query` against the given `history` slice.
-    pub fn update_matches(&mut self, history: &[String]) {
+    // ------------------------------------------------------------------
+    // Internal scoring
+    // ------------------------------------------------------------------
+
+    fn recompute_matches(&mut self) {
         let q = self.query.to_lowercase();
-        self.matches = history
+        let mut scored: Vec<MatchEntry> = self
+            .snapshot
             .iter()
             .enumerate()
-            .filter_map(|(i, s)| {
-                if q.is_empty() || s.to_lowercase().contains(&q) {
-                    Some(i)
+            .filter_map(|(i, entry)| {
+                if q.is_empty() {
+                    Some(MatchEntry {
+                        snapshot_idx: i,
+                        score: 0.0,
+                        highlight_positions: Vec::new(),
+                    })
                 } else {
-                    None
+                    subsequence_score(&q, &entry.text).map(|(score, positions)| MatchEntry {
+                        snapshot_idx: i,
+                        score,
+                        highlight_positions: positions,
+                    })
                 }
             })
             .collect();
-        // clamp selection
+
+        // Sort best score first; stable sort preserves insertion order for ties.
+        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+        self.matches = scored;
+        // Clamp selection
         if !self.matches.is_empty() && self.selected_idx >= self.matches.len() {
             self.selected_idx = self.matches.len() - 1;
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Public API — backward-compatible with &[String] callers
+    // ------------------------------------------------------------------
+
+    /// Recompute matches from the given `history` slice.
+    ///
+    /// This updates the internal snapshot and recomputes.  Callers that pass
+    /// `&app.prompt_input.history` every time will continue to work unchanged.
+    pub fn update_matches(&mut self, history: &[String]) {
+        // Rebuild snapshot preserving existing timestamps where possible.
+        // Simple strategy: replace snapshot with legacy entries from `history`.
+        // (A more sophisticated approach would merge by text, but keeping it
+        // simple avoids complexity and matches the current call-site pattern.)
+        self.snapshot = history
+            .iter()
+            .map(|s| HistoryEntry::legacy(s.clone()))
+            .collect();
+        self.recompute_matches();
     }
 
     pub fn push_char(&mut self, c: char, history: &[String]) {
@@ -321,11 +625,20 @@ impl HistorySearchOverlay {
     }
 
     /// Return the currently selected history entry text, if any.
+    ///
+    /// The `history` parameter is accepted for backward compatibility but the
+    /// overlay uses its internal snapshot.  If `history` is non-empty it is
+    /// used as a fallback when the snapshot is empty.
     pub fn current_entry<'a>(&self, history: &'a [String]) -> Option<&'a str> {
-        self.matches
-            .get(self.selected_idx)
-            .and_then(|&i| history.get(i))
-            .map(String::as_str)
+        let snap_idx = self.matches.get(self.selected_idx)?.snapshot_idx;
+        // Try the history slice first (keeps existing call-sites working).
+        history.get(snap_idx).map(String::as_str)
+    }
+
+    /// Like `current_entry` but returns from the internal snapshot.
+    pub fn current_entry_owned(&self) -> Option<&str> {
+        let snap_idx = self.matches.get(self.selected_idx)?.snapshot_idx;
+        self.snapshot.get(snap_idx).map(|e| e.text.as_str())
     }
 
     pub fn close(&mut self) {
@@ -345,7 +658,7 @@ pub fn render_history_search_overlay(
     }
 
     const VISIBLE_MATCHES: usize = 8;
-    let dialog_width = 64u16.min(area.width.saturating_sub(4));
+    let dialog_width = 68u16.min(area.width.saturating_sub(4));
     let match_count = overlay.matches.len().max(1);
     let rows = VISIBLE_MATCHES.min(match_count) as u16;
     let dialog_height = (4 + rows).min(area.height.saturating_sub(4));
@@ -355,7 +668,8 @@ pub fn render_history_search_overlay(
 
     let mut lines: Vec<Line> = Vec::new();
 
-    // Search query line
+    // --- Search query line ---------------------------------------------------
+    let result_count_str = format!("{} results", overlay.matches.len());
     lines.push(Line::from(vec![
         Span::raw("  Search: "),
         Span::styled(
@@ -363,6 +677,13 @@ pub fn render_history_search_overlay(
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         ),
         Span::styled("\u{2588}", Style::default().fg(Color::White)),
+        Span::raw("  "),
+        Span::styled(
+            result_count_str,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ),
     ]));
     lines.push(Line::from(""));
 
@@ -378,21 +699,39 @@ pub fn render_history_search_overlay(
             .min(overlay.matches.len().saturating_sub(VISIBLE_MATCHES));
         let end = (start + VISIBLE_MATCHES).min(overlay.matches.len());
 
-        for (display_i, &hist_idx) in overlay.matches[start..end].iter().enumerate() {
+        for (display_i, match_entry) in overlay.matches[start..end].iter().enumerate() {
             let real_i = start + display_i;
             let is_selected = real_i == overlay.selected_idx;
-            let entry = history.get(hist_idx).map(String::as_str).unwrap_or("");
 
-            let max_chars = dialog_width as usize - 6;
-            let truncated = if UnicodeWidthStr::width(entry) > max_chars {
-                let mut s = entry.to_string();
-                s.truncate(max_chars.saturating_sub(1));
-                format!("{}…", s)
-            } else {
-                entry.to_string()
-            };
+            // Resolve entry text: prefer snapshot, fall back to passed-in history.
+            let entry_text: &str = overlay
+                .snapshot
+                .get(match_entry.snapshot_idx)
+                .map(|e| e.text.as_str())
+                .or_else(|| {
+                    history
+                        .get(match_entry.snapshot_idx)
+                        .map(String::as_str)
+                })
+                .unwrap_or("");
 
-            let (prefix, style) = if is_selected {
+            // Relative timestamp (right-aligned suffix)
+            let time_suffix: String = overlay
+                .snapshot
+                .get(match_entry.snapshot_idx)
+                .map(|e| {
+                    let t = e.relative_time();
+                    if t.is_empty() { t } else { format!(" · {}", t) }
+                })
+                .unwrap_or_default();
+
+            // Available width for the entry text (account for prefix + time suffix)
+            let prefix_width: usize = 4; // "    " or "  ► "
+            let time_width = UnicodeWidthStr::width(time_suffix.as_str());
+            let max_text_chars = (dialog_width as usize)
+                .saturating_sub(prefix_width + time_width + 2);
+
+            let (prefix, base_style) = if is_selected {
                 (
                     "  \u{25BA} ",
                     Style::default()
@@ -403,10 +742,27 @@ pub fn render_history_search_overlay(
                 ("    ", Style::default().fg(Color::White))
             };
 
-            lines.push(Line::from(vec![
-                Span::raw(prefix),
-                Span::styled(truncated, style),
-            ]));
+            // Build highlighted spans for the entry text
+            let text_spans = build_highlighted_spans(
+                entry_text,
+                &match_entry.highlight_positions,
+                max_text_chars,
+                base_style,
+                is_selected,
+            );
+
+            let mut row_spans: Vec<Span> = vec![Span::raw(prefix)];
+            row_spans.extend(text_spans);
+            if !time_suffix.is_empty() {
+                row_spans.push(Span::styled(
+                    time_suffix,
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                ));
+            }
+
+            lines.push(Line::from(row_spans));
         }
     }
 
@@ -417,6 +773,65 @@ pub fn render_history_search_overlay(
 
     let para = Paragraph::new(lines).block(block);
     frame.render_widget(para, dialog_area);
+}
+
+/// Build a list of `Span`s for `text`, highlighting the bytes at
+/// `highlight_positions` in yellow. Text is truncated to `max_chars`.
+fn build_highlighted_spans<'a>(
+    text: &str,
+    highlight_positions: &[usize],
+    max_chars: usize,
+    base_style: Style,
+    _is_selected: bool,
+) -> Vec<Span<'a>> {
+    // Collect char-level info (byte offset, char)
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+
+    // Convert highlight byte-positions to a set of byte offsets for O(1) lookup
+    let hl_set: std::collections::HashSet<usize> =
+        highlight_positions.iter().copied().collect();
+
+    let mut spans: Vec<Span<'a>> = Vec::new();
+    let mut current_text = String::new();
+    let mut current_highlighted = false;
+    let mut char_count = 0usize;
+    let mut truncated = false;
+
+    for (byte_off, ch) in &chars {
+        if char_count >= max_chars {
+            truncated = true;
+            break;
+        }
+        let is_hl = hl_set.contains(byte_off);
+        if is_hl != current_highlighted && !current_text.is_empty() {
+            let style = if current_highlighted {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                base_style
+            };
+            spans.push(Span::styled(current_text.clone(), style));
+            current_text.clear();
+        }
+        current_highlighted = is_hl;
+        current_text.push(*ch);
+        char_count += 1;
+    }
+    if !current_text.is_empty() {
+        let style = if current_highlighted {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            base_style
+        };
+        spans.push(Span::styled(current_text, style));
+    }
+    if truncated {
+        spans.push(Span::styled("…".to_string(), Style::default().fg(Color::DarkGray)));
+    }
+    spans
 }
 
 // ============================================================================
@@ -863,6 +1278,7 @@ pub fn render_global_search(state: &GlobalSearchState, area: ratatui::layout::Re
         text::{Line, Span},
         widgets::{Block, Borders, Clear, Paragraph, Widget},
     };
+    use std::path::Path;
 
     if !state.open { return; }
 
@@ -874,61 +1290,180 @@ pub fn render_global_search(state: &GlobalSearchState, area: ratatui::layout::Re
 
     Clear.render(dialog, buf);
     Block::default()
-        .title(" Search [Esc: close, Enter: insert, ↑↓: navigate] ")
+        .title(" Search [Esc: close, Enter: insert, \u{2191}\u{2193}: navigate] ")
         .borders(Borders::ALL)
         .style(Style::default().fg(Color::Cyan))
         .render(dialog, buf);
 
-    let inner = Rect { x: dialog.x + 1, y: dialog.y + 1, width: dialog.width.saturating_sub(2), height: dialog.height.saturating_sub(2) };
+    let inner = Rect {
+        x: dialog.x + 1,
+        y: dialog.y + 1,
+        width: dialog.width.saturating_sub(2),
+        height: dialog.height.saturating_sub(2),
+    };
 
     // Query input bar (first row)
     let query_line = Line::from(vec![
         Span::styled("/ ", Style::default().fg(Color::Cyan)),
         Span::styled(state.query.clone(), Style::default().fg(Color::White)),
-        Span::styled("█", Style::default().fg(Color::Cyan)),
+        Span::styled("\u{2588}", Style::default().fg(Color::Cyan)),
     ]);
-    Paragraph::new(query_line).render(Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 }, buf);
+    Paragraph::new(query_line).render(
+        Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
+        buf,
+    );
 
-    // Results
-    let results_area = Rect { x: inner.x, y: inner.y + 2, width: inner.width, height: inner.height.saturating_sub(3) };
+    // Separator
+    let sep = Line::from(Span::styled(
+        "\u{2500}".repeat(inner.width as usize),
+        Style::default().fg(Color::DarkGray),
+    ));
+    Paragraph::new(sep).render(
+        Rect { x: inner.x, y: inner.y + 1, width: inner.width, height: 1 },
+        buf,
+    );
+
+    let results_area = Rect {
+        x: inner.x,
+        y: inner.y + 2,
+        width: inner.width,
+        height: inner.height.saturating_sub(3),
+    };
+
+    // Build grouped display rows: (is_header, result_idx_or_none, file_label, match_count, result_ref)
+    // Group results by file
+    #[derive(Clone)]
+    enum DisplayRow {
+        Header { label: String, count: usize },
+        Result { result_idx: usize },
+    }
+
+    let mut rows: Vec<DisplayRow> = Vec::new();
+    if !state.results.is_empty() {
+        let mut current_file = "";
+        let mut group_count = 0usize;
+        let mut group_start = 0usize;
+
+        for (idx, result) in state.results.iter().enumerate() {
+            if result.file.as_str() != current_file {
+                if !current_file.is_empty() {
+                    // Patch the header we already pushed with the real count
+                    if let Some(DisplayRow::Header { count, .. }) = rows.get_mut(group_start) {
+                        *count = group_count;
+                    }
+                }
+                current_file = result.file.as_str();
+                group_count = 0;
+                group_start = rows.len();
+                let label = Path::new(&result.file)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&result.file)
+                    .to_string();
+                rows.push(DisplayRow::Header { label, count: 0 });
+            }
+            group_count += 1;
+            rows.push(DisplayRow::Result { result_idx: idx });
+        }
+        // Patch last group
+        if let Some(DisplayRow::Header { count, .. }) = rows.get_mut(group_start) {
+            *count = group_count;
+        }
+    }
+
     let max_visible = results_area.height as usize;
-    let start = state.selected.saturating_sub(max_visible / 2);
+    // Scroll so the selected result is visible — find which display row it's in
+    let selected_display_row = rows.iter().position(|r| {
+        if let DisplayRow::Result { result_idx } = r {
+            *result_idx == state.selected
+        } else {
+            false
+        }
+    }).unwrap_or(0);
+    let start = selected_display_row.saturating_sub(max_visible / 2);
 
-    for (i, result) in state.results[start..].iter().enumerate() {
+    for (i, row) in rows[start..].iter().enumerate() {
         if i >= max_visible { break; }
-        let selected = start + i == state.selected;
-        let y = results_area.y + i as u16;
-        let prefix = if selected { "> " } else { "  " };
-        let style = if selected {
-            Style::default().add_modifier(Modifier::BOLD).fg(Color::White)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
+        let row_y = results_area.y + i as u16;
 
-        let avail = results_area.width.saturating_sub(20) as usize;
-        let file_short = if result.file.len() > avail {
-            format!("…{}", &result.file[result.file.len() - avail..])
-        } else {
-            result.file.clone()
-        };
+        match row {
+            DisplayRow::Header { label, count } => {
+                // File group header: ─── filename (N) ──────────
+                let count_str = format!(" ({}) ", count);
+                let label_part = format!(" {} ", label);
+                let dashes_right = (results_area.width as usize)
+                    .saturating_sub(4 + label_part.len() + count_str.len());
+                let header_line = Line::from(vec![
+                    Span::styled(
+                        format!("\u{2500}\u{2500}\u{2500}{}{}{}", label_part, count_str, "\u{2500}".repeat(dashes_right)),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ),
+                ]);
+                Paragraph::new(header_line).render(
+                    Rect { x: results_area.x, y: row_y, width: results_area.width, height: 1 },
+                    buf,
+                );
+            }
+            DisplayRow::Result { result_idx } => {
+                let result = &state.results[*result_idx];
+                let selected = *result_idx == state.selected;
+                let prefix = if selected { "> " } else { "  " };
+                let style = if selected {
+                    Style::default().add_modifier(Modifier::BOLD).fg(Color::White)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
 
-        let text_short: String = result.text.trim().chars().take(40).collect();
+                // Highlight query match in text
+                let text_trimmed = result.text.trim();
+                let query_lc = state.query.to_lowercase();
+                let text_spans: Vec<Span<'static>> = if !query_lc.is_empty() {
+                    let text_lc = text_trimmed.to_lowercase();
+                    if let Some(pos) = text_lc.find(query_lc.as_str()) {
+                        let before: String = text_trimmed.chars().take(
+                            text_trimmed[..pos].chars().count()
+                        ).collect();
+                        let matched: String = text_trimmed[pos..pos + query_lc.len()].to_string();
+                        let after: String = text_trimmed[pos + query_lc.len()..].chars().take(30).collect();
+                        vec![
+                            Span::styled(before, style),
+                            Span::styled(matched, style.bg(Color::Rgb(60, 50, 0)).fg(Color::Yellow)),
+                            Span::styled(after, style),
+                        ]
+                    } else {
+                        let t: String = text_trimmed.chars().take(50).collect();
+                        vec![Span::styled(t, style)]
+                    }
+                } else {
+                    let t: String = text_trimmed.chars().take(50).collect();
+                    vec![Span::styled(t, style)]
+                };
 
-        let line = Line::from(vec![
-            Span::styled(prefix, style),
-            Span::styled(format!("{}:{}", file_short, result.line), style.fg(Color::Cyan)),
-            Span::styled(format!("  {}", text_short), style),
-        ]);
-        Paragraph::new(line).render(Rect { x: results_area.x, y, width: results_area.width, height: 1 }, buf);
+                let mut spans = vec![
+                    Span::styled(prefix.to_string(), style),
+                    Span::styled(
+                        format!("{:>4}  ", result.line),
+                        style.fg(Color::DarkGray),
+                    ),
+                ];
+                spans.extend(text_spans);
+
+                Paragraph::new(Line::from(spans)).render(
+                    Rect { x: results_area.x, y: row_y, width: results_area.width, height: 1 },
+                    buf,
+                );
+            }
+        }
     }
 
     // Status bar
     let status = if state.searching {
-        "Searching…".to_string()
+        "Searching\u{2026}".to_string()
     } else if state.results.is_empty() && !state.query.is_empty() {
         "No matches".to_string()
     } else if state.total_matches > 0 {
-        format!("{} matches", state.total_matches)
+        format!("{} matches in {} files", state.total_matches,
+            state.results.iter().map(|r| &r.file).collect::<std::collections::HashSet<_>>().len())
     } else {
         "Type to search".to_string()
     };
@@ -983,19 +1518,24 @@ mod tests {
 
     #[test]
     fn history_search_update_matches() {
-        // "cargo build" also contains 'g', so all three match a single-char 'g' query.
+        // All three entries contain 'g', so all three match.
         let history = vec!["git commit".to_string(), "cargo build".to_string(), "git push".to_string()];
         let mut hs = HistorySearchOverlay::open(&history);
         hs.push_char('g', &history);
-        // All three entries contain 'g' (cargo, git×2)
         assert_eq!(hs.matches.len(), 3);
 
-        // Narrowing to "gi" matches only the git entries
+        // "gi": "cargo build" has 'g' at index 3 and 'i' in "build",
+        // so it IS a subsequence match -- all three still match.
         hs.push_char('i', &history);
+        assert_eq!(hs.matches.len(), 3);
+
+        // Narrowing further to "git": "cargo build" has no 't' after g+i, so
+        // only the two git entries match.
+        hs.push_char('t', &history);
         assert_eq!(hs.matches.len(), 2);
-        // Should be "git commit" (idx 0) and "git push" (idx 2)
-        assert!(hs.matches.contains(&0));
-        assert!(hs.matches.contains(&2));
+        let idxs: Vec<usize> = hs.matches.iter().map(|m| m.snapshot_idx).collect();
+        assert!(idxs.contains(&0));
+        assert!(idxs.contains(&2));
     }
 
     #[test]
@@ -1012,9 +1552,123 @@ mod tests {
     #[test]
     fn history_search_current_entry() {
         let history = vec!["first".to_string(), "second".to_string()];
+        let hs = HistorySearchOverlay::open(&history);
+        // With no query all entries match; index 0 is first.
+        assert_eq!(hs.current_entry(&history), Some("first"));
+    }
+
+    // --- subsequence_score tests --------------------------------------
+
+    #[test]
+    fn subseq_score_none_for_non_subsequence() {
+        // "xyz" cannot be a subsequence of "abcde"
+        assert!(subsequence_score("xyz", "abcde").is_none());
+        // letters out of order
+        assert!(subsequence_score("ba", "abc").is_none());
+    }
+
+    #[test]
+    fn subseq_score_some_for_exact_subsequence() {
+        // 'g','i','t' in order inside "git push"
+        assert!(subsequence_score("git", "git push").is_some());
+        // non-consecutive subsequence: 'g','t' in "get it together"
+        assert!(subsequence_score("gt", "get it together").is_some());
+    }
+
+    #[test]
+    fn subseq_score_substring_beats_subsequence() {
+        // "git" appears as a substring in "git push" and as a subsequence in
+        // "go into town".  The substring match should score higher.
+        let (score_sub, _) = subsequence_score("git", "git push").unwrap();
+        let (score_seq, _) = subsequence_score("git", "go into town").unwrap();
+        assert!(
+            score_sub > score_seq,
+            "substring score {score_sub} should beat subsequence score {score_seq}"
+        );
+    }
+
+    #[test]
+    fn subseq_score_returns_correct_positions_for_substring() {
+        // "git" at position 0 in "git commit" → positions 0,1,2
+        let (_, positions) = subsequence_score("git", "git commit").unwrap();
+        assert_eq!(positions, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn subseq_score_sorts_correctly_in_overlay() {
+        // "git commit" and "get items together" both match query "git".
+        // "git commit" is a substring match → higher score → appears first.
+        let history = vec![
+            "get items together".to_string(),
+            "git commit".to_string(),
+        ];
         let mut hs = HistorySearchOverlay::open(&history);
-        hs.selected_idx = 1;
-        assert_eq!(hs.current_entry(&history), Some("second"));
+        hs.push_char('g', &history);
+        hs.push_char('i', &history);
+        hs.push_char('t', &history);
+        // First match should be "git commit" (snapshot_idx 1, higher score)
+        assert_eq!(hs.matches[0].snapshot_idx, 1);
+    }
+
+    // --- HistoryEntry timestamp tests ---------------------------------
+
+    #[test]
+    fn history_entry_relative_time_just_now() {
+        let entry = HistoryEntry::new("hello".to_string());
+        assert_eq!(entry.relative_time(), "just now");
+    }
+
+    #[test]
+    fn history_entry_relative_time_minutes() {
+        let five_mins_ago = current_unix_secs().saturating_sub(300);
+        let entry = HistoryEntry {
+            text: "cmd".to_string(),
+            timestamp: Some(five_mins_ago),
+        };
+        assert_eq!(entry.relative_time(), "5m ago");
+    }
+
+    #[test]
+    fn history_entry_relative_time_hours() {
+        let two_hours_ago = current_unix_secs().saturating_sub(7200);
+        let entry = HistoryEntry {
+            text: "cmd".to_string(),
+            timestamp: Some(two_hours_ago),
+        };
+        assert_eq!(entry.relative_time(), "2h ago");
+    }
+
+    #[test]
+    fn history_entry_relative_time_days() {
+        let three_days_ago = current_unix_secs().saturating_sub(3 * 86400);
+        let entry = HistoryEntry {
+            text: "cmd".to_string(),
+            timestamp: Some(three_days_ago),
+        };
+        assert_eq!(entry.relative_time(), "3d ago");
+    }
+
+    #[test]
+    fn history_entry_legacy_has_no_timestamp() {
+        let entry = HistoryEntry::legacy("old command".to_string());
+        assert!(entry.timestamp.is_none());
+        assert_eq!(entry.relative_time(), "");
+    }
+
+    #[test]
+    fn history_search_with_timestamps_stores_snapshot() {
+        let entries = vec![
+            HistoryEntry::new("cargo test".to_string()),
+            HistoryEntry::legacy("old cmd".to_string()),
+        ];
+        let hs = HistorySearchOverlay::open_with_entries(entries);
+        assert_eq!(hs.snapshot.len(), 2);
+        assert!(hs.snapshot[0].timestamp.is_some());
+        assert!(hs.snapshot[1].timestamp.is_none());
+        // Relative time for legacy entry is empty
+        assert_eq!(hs.snapshot[1].relative_time(), "");
+        // Relative time for new entry is "just now"
+        assert_eq!(hs.snapshot[0].relative_time(), "just now");
     }
 
     // --- MessageSelectorOverlay ---------------------------------------

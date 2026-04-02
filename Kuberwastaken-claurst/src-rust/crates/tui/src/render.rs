@@ -3,12 +3,22 @@
 use std::cell::RefCell;
 
 use crate::agents_view::render_agents_menu;
-use crate::app::{App, EffortLevel, SystemAnnotation, SystemMessageStyle, ToolStatus};
+use crate::app::{App, SystemAnnotation, SystemMessageStyle, ToolStatus};
 use crate::clawd::{clawd_lines, ClawdPose};
 use crate::diff_viewer::render_diff_dialog;
+use crate::model_picker::render_model_picker;
+use crate::session_browser::render_session_browser;
+use crate::dialogs::{render_mcp_approval_dialog, render_permission_dialog};
+use crate::feedback_survey::render_feedback_survey;
+use crate::overage_upsell::render_overage_upsell;
+use crate::voice_mode_notice::render_voice_mode_notice;
+use crate::desktop_upsell_startup::render_desktop_upsell_startup;
+use crate::memory_update_notification::render_memory_update_notification;
+use crate::elicitation_dialog::render_elicitation_dialog;
 use crate::figures;
-use crate::dialogs::render_permission_dialog;
+use crate::hooks_config_menu::render_hooks_config_menu;
 use crate::mcp_view::render_mcp_view;
+use crate::memory_file_selector::render_memory_file_selector;
 use crate::messages::{RenderContext, render_markdown, render_message};
 use crate::notifications::render_notification_banner;
 use crate::overlays::{
@@ -16,7 +26,7 @@ use crate::overlays::{
 };
 use crate::plugin_views::render_plugin_hints;
 use crate::privacy_screen::render_privacy_screen;
-use crate::prompt_input::{InputMode, render_prompt_input};
+use crate::prompt_input::{InputMode, TypeaheadSource, VimMode, render_prompt_input};
 use crate::settings_screen::render_settings_screen;
 use crate::stats_dialog::render_stats_dialog;
 use crate::theme_screen::render_theme_screen;
@@ -30,9 +40,15 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wra
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-// ASCII spinner sequence. We keep this ASCII-only to avoid Windows source
-// encoding surprises while still giving the prompt/status row visible motion.
-const SPINNER: &[char] = &['-', '\\', '|', '/'];
+// Spinner frames matching the TypeScript SpinnerGlyph: platform-specific base
+// characters mirrored (forward + reverse) for a smooth pulse effect.
+// Windows uses '*' instead of '✳'/'✽' for better font coverage.
+#[cfg(target_os = "windows")]
+const SPINNER: &[char] = &['\u{00b7}', '\u{2722}', '*', '\u{2736}', '\u{273b}', '\u{273d}',
+                            '\u{273d}', '\u{273b}', '\u{2736}', '*', '\u{2722}', '\u{00b7}'];
+#[cfg(not(target_os = "windows"))]
+const SPINNER: &[char] = &['\u{00b7}', '\u{2722}', '\u{2733}', '\u{2736}', '\u{273b}', '\u{273d}',
+                            '\u{273d}', '\u{273b}', '\u{2736}', '\u{2733}', '\u{2722}', '\u{00b7}'];
 const CLAUDE_ORANGE: Color = Color::Rgb(215, 119, 87);
 const WELCOME_BOX_HEIGHT: u16 = 11;
 
@@ -49,6 +65,153 @@ fn spinner_color(app: &App) -> Color {
         }
     }
     Color::Yellow
+}
+
+// -----------------------------------------------------------------------
+// Text truncation helpers
+// -----------------------------------------------------------------------
+
+fn truncate_end(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 1 {
+        return "\u{2026}".to_string();
+    }
+    let mut out = String::new();
+    let mut width = 0usize;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthStr::width(ch.encode_utf8(&mut [0; 4]));
+        if width + ch_width >= max_width {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out.push('\u{2026}');
+    out
+}
+
+fn truncate_middle(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 3 {
+        return truncate_end(text, max_width);
+    }
+    let keep_each_side = (max_width.saturating_sub(1)) / 2;
+    let left: String = text.chars().take(keep_each_side).collect();
+    let right: String = text
+        .chars()
+        .rev()
+        .take(keep_each_side)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{left}\u{2026}{right}")
+}
+
+fn truncate_text(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for ch in text.chars() {
+        let next = format!("{out}{ch}");
+        if next.width() > max_width {
+            if max_width > 1 && out.width() < max_width {
+                out.push('\u{2026}');
+            }
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+// -----------------------------------------------------------------------
+// Startup notice helpers
+// -----------------------------------------------------------------------
+
+fn startup_notice_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let max_width = width.saturating_sub(10) as usize;
+
+    if let Some(summary) = app.away_summary.as_deref() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {} ", crate::figures::REFERENCE_MARK),
+                Style::default().fg(CLAUDE_ORANGE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                truncate_end(summary, max_width),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+
+    match &app.bridge_state {
+        crate::bridge_state::BridgeConnectionState::Connected { peer_count, .. } => {
+            let label = if *peer_count > 0 {
+                format!("Remote session active \u{00b7} {} peer{}", peer_count, if *peer_count == 1 { "" } else { "s" })
+            } else {
+                "Remote session active".to_string()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(" remote ", Style::default().fg(CLAUDE_ORANGE)),
+                Span::styled(label, Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+        crate::bridge_state::BridgeConnectionState::Reconnecting { attempt } => {
+            lines.push(Line::from(vec![
+                Span::styled(" remote ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("Reconnecting remote session (attempt #{attempt})"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+        crate::bridge_state::BridgeConnectionState::Failed { reason } => {
+            lines.push(Line::from(vec![
+                Span::styled(" remote ", Style::default().fg(Color::Red)),
+                Span::styled(
+                    truncate_end(reason, max_width),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+        _ => {}
+    }
+
+    if let Some(url) = app.remote_session_url.as_deref() {
+        lines.push(Line::from(vec![
+            Span::styled(" link ", Style::default().fg(CLAUDE_ORANGE)),
+            Span::styled(
+                truncate_end(url, max_width),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+
+    lines
+}
+
+fn render_startup_notices(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let lines = startup_notice_lines(app, area.width);
+    if lines.is_empty() {
+        return;
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 #[derive(Clone)]
@@ -94,8 +257,24 @@ struct MessageLinesCache {
     lines: Vec<RenderedLineItem>,
 }
 
+/// Cache key for completed messages only (no ptr — len change = new message).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CompletedMsgCacheKey {
+    width: u16,
+    messages_len: usize,
+    annotations_len: usize,
+}
+
+#[derive(Clone)]
+struct CompletedMsgCache {
+    key: CompletedMsgCacheKey,
+    lines: Vec<RenderedLineItem>,
+}
+
 thread_local! {
     static MESSAGE_LINES_CACHE: RefCell<Option<MessageLinesCache>> = const { RefCell::new(None) };
+    /// Stores rendered lines for committed messages only; valid even during streaming.
+    static COMPLETED_MSG_CACHE: RefCell<Option<CompletedMsgCache>> = const { RefCell::new(None) };
 }
 
 // -----------------------------------------------------------------------
@@ -115,7 +294,11 @@ pub fn render_app(frame: &mut Frame, app: &App) {
 
     let prompt_focused =
         !app.is_streaming && app.permission_request.is_none() && !app.history_search_overlay.visible;
-    let status_height = if should_render_status_row(app) { 1 } else { 0 };
+    let status_visible = should_render_status_row(app);
+    // One blank separator row above the status/input area when status is active,
+    // matching the visual breathing room in the TS layout.
+    let separator_height: u16 = if status_visible { 1 } else { 0 };
+    let status_height: u16 = if status_visible { 1 } else { 0 };
     let suggestions_height = if prompt_focused && !app.prompt_input.suggestions.is_empty() {
         app.prompt_input.suggestions.len().min(5) as u16
     } else {
@@ -126,6 +309,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
+            Constraint::Length(separator_height),
             Constraint::Length(status_height),
             Constraint::Length(3),
             Constraint::Length(suggestions_height),
@@ -134,14 +318,15 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         .split(size);
 
     render_messages(frame, app, chunks[0]);
+    // chunks[1] is the blank separator — intentionally left empty
     if status_height > 0 {
-        render_status_row(frame, app, chunks[1]);
+        render_status_row(frame, app, chunks[2]);
     }
-    render_input(frame, app, chunks[2], prompt_focused);
+    render_input(frame, app, chunks[3], prompt_focused);
     if suggestions_height > 0 {
-        render_prompt_suggestions(frame, app, chunks[3]);
+        render_prompt_suggestions(frame, app, chunks[4]);
     }
-    render_footer(frame, app, chunks[4]);
+    render_footer(frame, app, chunks[5]);
 
     // Overlays (rendered on top in Z-order)
 
@@ -212,6 +397,76 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_global_search(&app.global_search, size, frame.buffer_mut());
     }
 
+    if app.feedback_survey.visible {
+        render_feedback_survey(&app.feedback_survey, size, frame.buffer_mut());
+    }
+
+    if app.memory_file_selector.visible {
+        render_memory_file_selector(&app.memory_file_selector, size, frame.buffer_mut());
+    }
+
+    if app.hooks_config_menu.visible {
+        render_hooks_config_menu(&app.hooks_config_menu, size, frame.buffer_mut());
+    }
+
+    // Overage credit upsell banner
+    if app.overage_upsell.visible {
+        let banner_h = app.overage_upsell.height();
+        if size.height > banner_h + 4 {
+            let banner_area = Rect { x: size.x, y: size.y, width: size.width, height: banner_h };
+            render_overage_upsell(&app.overage_upsell, banner_area, frame.buffer_mut());
+        }
+    }
+
+    // Voice mode availability notice
+    if app.voice_mode_notice.visible {
+        let notice_h = app.voice_mode_notice.height();
+        if size.height > notice_h + 4 {
+            let notice_area = Rect { x: size.x, y: size.y, width: size.width, height: notice_h };
+            render_voice_mode_notice(&app.voice_mode_notice, notice_area, frame.buffer_mut());
+        }
+    }
+
+    // Memory update notification banner (bottom of message area)
+    if app.memory_update_notification.visible {
+        let notif_h = app.memory_update_notification.height();
+        if size.height > notif_h + 4 {
+            // Place at the bottom of the screen, just above the prompt bar area
+            let notif_y = size.y + size.height.saturating_sub(notif_h + 4);
+            let notif_area = Rect { x: size.x, y: notif_y, width: size.width, height: notif_h };
+            render_memory_update_notification(
+                &app.memory_update_notification,
+                notif_area,
+                frame.buffer_mut(),
+            );
+        }
+    }
+
+    // Desktop upsell startup modal (rendered on top of everything else)
+    if app.desktop_upsell.visible {
+        render_desktop_upsell_startup(&app.desktop_upsell, size, frame.buffer_mut());
+    }
+
+    // MCP elicitation dialog (highest priority modal — rendered last to sit on top)
+    if app.elicitation.visible {
+        render_elicitation_dialog(&app.elicitation, size, frame.buffer_mut());
+    }
+
+    // Model picker overlay
+    if app.model_picker.visible {
+        render_model_picker(&app.model_picker, size, frame.buffer_mut());
+    }
+
+    // Session browser overlay
+    if app.session_browser.visible {
+        render_session_browser(&app.session_browser, size, frame.buffer_mut());
+    }
+
+    // MCP approval dialog
+    if app.mcp_approval.visible {
+        render_mcp_approval_dialog(&app.mcp_approval, size, frame.buffer_mut());
+    }
+
     // Notification banner (bottom of overlays stack so it's always visible)
     if !app.notifications.is_empty() {
         render_notification_banner(frame, &app.notifications, size);
@@ -245,26 +500,65 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
         render_plugin_hints(frame, &app.plugin_hints, ha);
     }
 
-    let show_logo_header =
-        content_area.height >= WELCOME_BOX_HEIGHT + 3 && content_area.width >= 60;
-    let (logo_area, msg_area) = if show_logo_header {
+    let notice_lines = startup_notice_lines(app, content_area.width);
+    let header_height = WELCOME_BOX_HEIGHT + notice_lines.len() as u16;
+    let show_logo_header = content_area.height >= header_height + 3 && content_area.width >= 60;
+    let (logo_area, notices_area, msg_area) = if show_logo_header {
         let splits = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(WELCOME_BOX_HEIGHT), Constraint::Min(1)])
+            .constraints([Constraint::Length(header_height), Constraint::Min(1)])
             .split(content_area);
-        (Some(splits[0]), splits[1])
+        if notice_lines.is_empty() {
+            (Some(splits[0]), None, splits[1])
+        } else {
+            let header_splits = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(WELCOME_BOX_HEIGHT),
+                    Constraint::Length(notice_lines.len() as u16),
+                ])
+                .split(splits[0]);
+            (Some(header_splits[0]), Some(header_splits[1]), splits[1])
+        }
     } else {
-        (None, content_area)
+        (None, None, content_area)
     };
 
     if let Some(la) = logo_area {
         render_welcome_box(frame, app, la);
+        if let Some(na) = notices_area {
+            render_startup_notices(frame, app, na);
+        }
     } else if app.messages.is_empty() && app.streaming_text.is_empty() {
         render_welcome_box(frame, app, content_area);
         return;
     }
 
     let lines = render_message_items(app, msg_area.width);
+
+    // Highlight search matches in transcript when global search is active
+    let lines = if app.global_search.open && !app.global_search.query.is_empty() {
+        let query_lc = app.global_search.query.to_lowercase();
+        lines.into_iter().map(|mut item| {
+            if item.search_text.to_lowercase().contains(query_lc.as_str()) {
+                // Re-render the line with yellow highlight on matching spans
+                let highlighted_spans: Vec<Span<'static>> = item.line.spans.into_iter().map(|span| {
+                    if span.content.to_lowercase().contains(query_lc.as_str()) {
+                        Span::styled(
+                            span.content,
+                            span.style.bg(Color::Rgb(60, 50, 0)).fg(Color::Yellow),
+                        )
+                    } else {
+                        span
+                    }
+                }).collect();
+                item.line = ratatui::text::Line::from(highlighted_spans);
+            }
+            item
+        }).collect()
+    } else {
+        lines
+    };
 
     // Compute total virtual height and apply scroll clamping.
     // When auto_scroll is on we always show the tail; otherwise we respect
@@ -319,44 +613,96 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
-    let cacheable = app.streaming_text.is_empty() && app.tool_use_blocks.is_empty();
-    let cache_key = MessageLinesCacheKey {
+    let streaming = !app.streaming_text.is_empty();
+    let has_tool_blocks = !app.tool_use_blocks.is_empty();
+    let cacheable = !streaming && !has_tool_blocks;
+
+    // Fast path: nothing live — use the full-result cache (ptr-stable check).
+    let full_key = MessageLinesCacheKey {
         width,
         messages_ptr: app.messages.as_ptr() as usize,
         messages_len: app.messages.len(),
         annotations_ptr: app.system_annotations.as_ptr() as usize,
         annotations_len: app.system_annotations.len(),
     };
-
     if cacheable {
         if let Some(lines) = MESSAGE_LINES_CACHE.with(|cache| {
             cache
                 .borrow()
                 .as_ref()
-                .filter(|cached| cached.key == cache_key)
-                .map(|cached| cached.lines.clone())
+                .filter(|c| c.key == full_key)
+                .map(|c| c.lines.clone())
         }) {
             return lines;
         }
     }
 
-    let mut lines: Vec<Line> = Vec::new();
-    let total = app.messages.len();
-    for i in 0..=total {
-        for ann in app.system_annotations.iter().filter(|a| a.after_index == i) {
-            render_system_annotation_lines(&mut lines, ann, width as usize);
-        }
+    // Build or retrieve the completed-messages portion.
+    // This cache is always valid while messages_len and annotations_len are unchanged,
+    // even during active streaming — so we only re-render committed messages when a
+    // new message is actually added, not on every streaming frame.
+    let completed_key = CompletedMsgCacheKey {
+        width,
+        messages_len: app.messages.len(),
+        annotations_len: app.system_annotations.len(),
+    };
+    let completed_lines: Vec<RenderedLineItem> =
+        if let Some(lines) = COMPLETED_MSG_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .as_ref()
+                .filter(|c| c.key == completed_key)
+                .map(|c| c.lines.clone())
+        }) {
+            lines
+        } else {
+            let tool_names = build_tool_names(&app.messages);
+            let mut raw: Vec<Line> = Vec::new();
+            let total = app.messages.len();
+            for i in 0..=total {
+                for ann in app.system_annotations.iter().filter(|a| a.after_index == i) {
+                    render_system_annotation_lines(&mut raw, ann, width as usize);
+                }
+                if i < total {
+                    render_message_lines(&mut raw, &app.messages[i], width as usize, &tool_names);
+                }
+            }
+            let items: Vec<RenderedLineItem> = raw
+                .into_iter()
+                .map(|line| RenderedLineItem {
+                    search_text: flatten_line_text(&line),
+                    line,
+                })
+                .collect();
+            COMPLETED_MSG_CACHE.with(|cache| {
+                *cache.borrow_mut() = Some(CompletedMsgCache {
+                    key: completed_key,
+                    lines: items.clone(),
+                });
+            });
+            items
+        };
 
-        if i < total {
-            render_message_lines(&mut lines, &app.messages[i], width as usize);
-        }
+    // If there is no live content, store in the full cache and return.
+    if cacheable {
+        MESSAGE_LINES_CACHE.with(|cache| {
+            *cache.borrow_mut() = Some(MessageLinesCache {
+                key: full_key,
+                lines: completed_lines.clone(),
+            });
+        });
+        return completed_lines;
     }
+
+    // Append live tool blocks and streaming text (cheap — small and transient).
+    let mut items = completed_lines;
+    let mut live: Vec<Line> = Vec::new();
 
     for block in &app.tool_use_blocks {
-        render_tool_block_lines(&mut lines, block, app.frame_count);
+        render_tool_block_lines(&mut live, block, app.frame_count);
     }
 
-    if !app.streaming_text.is_empty() {
+    if streaming {
         let rendered = render_markdown(&app.streaming_text, width);
         let mut first = true;
         for line in rendered {
@@ -371,27 +717,14 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
                 spans = prefixed;
                 first = false;
             }
-            lines.push(Line::from(spans));
+            live.push(Line::from(spans));
         }
     }
 
-    let items = lines
-        .into_iter()
-        .map(|line| RenderedLineItem {
-            search_text: flatten_line_text(&line),
-            line,
-        })
-        .collect::<Vec<_>>();
-
-    if cacheable {
-        MESSAGE_LINES_CACHE.with(|cache| {
-            *cache.borrow_mut() = Some(MessageLinesCache {
-                key: cache_key,
-                lines: items.clone(),
-            });
-        });
-    }
-
+    items.extend(live.into_iter().map(|line| RenderedLineItem {
+        search_text: flatten_line_text(&line),
+        line,
+    }));
     items
 }
 
@@ -420,7 +753,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     // The box should be at most the full area width, and a fixed height.
     let box_width = area.width.min(area.width);
     let box_height: u16 = WELCOME_BOX_HEIGHT;
-    if area.height < box_height + 1 || box_width < 30 {
+    if area.height < box_height || box_width < 30 {
         // Too small: fall back to a single line
         let line = Line::from(vec![
             Span::styled("Claude Code ", Style::default().fg(CLAUDE_ORANGE).add_modifier(Modifier::BOLD)),
@@ -530,13 +863,33 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
 
 // â”€â”€ Per-message rendering â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-fn render_message_lines(lines: &mut Vec<Line<'static>>, msg: &cc_core::types::Message, width: usize) {
+/// Build a tool_use_id → tool_name lookup from all messages in the transcript.
+/// This allows ToolResult blocks to dispatch to tool-specific renderers.
+fn build_tool_names(messages: &[cc_core::types::Message]) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for msg in messages {
+        for block in msg.content_blocks() {
+            if let cc_core::types::ContentBlock::ToolUse { id, name, .. } = block {
+                map.insert(id.clone(), name.clone());
+            }
+        }
+    }
+    map
+}
+
+fn render_message_lines(
+    lines: &mut Vec<Line<'static>>,
+    msg: &cc_core::types::Message,
+    width: usize,
+    tool_names: &std::collections::HashMap<String, String>,
+) {
     let rendered = render_message(
         msg,
         &RenderContext {
             width: width as u16,
             highlight: true,
             show_thinking: false,
+            tool_names: tool_names.clone(),
         },
     );
 
@@ -617,63 +970,82 @@ fn render_system_annotation_lines(
 // â”€â”€ Tool use block â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 fn render_tool_block_lines(lines: &mut Vec<Line<'static>>, block: &crate::app::ToolUseBlock, frame_count: u64) {
-    let (icon, icon_style) = match block.status {
-        ToolStatus::Running => (
-            format!("{}", spinner_char(frame_count)),
-            Style::default().fg(Color::Yellow),
+    // ● icon: blinks Yellow↔DarkGray when running, solid Green/Red when done/error
+    let (icon_color, name_color) = match block.status {
+        ToolStatus::Running => {
+            let blink_on = (frame_count / 4) % 2 == 0;
+            let c = if blink_on { Color::Yellow } else { Color::DarkGray };
+            (c, Color::White)
+        }
+        ToolStatus::Done => (Color::Green, Color::White),
+        ToolStatus::Error => (Color::Red, Color::Red),
+    };
+
+    // Extract summary from input_json for header
+    let input_val: serde_json::Value =
+        serde_json::from_str(&block.input_json).unwrap_or(serde_json::Value::Null);
+    let summary = crate::messages::extract_tool_summary(&block.name, &input_val);
+
+    // Header: ● ToolName (summary)
+    let mut header_spans = vec![
+        Span::styled("  \u{25cf} ".to_string(), Style::default().fg(icon_color)),
+        Span::styled(
+            block.name.clone(),
+            Style::default().fg(name_color).add_modifier(Modifier::BOLD),
         ),
-        ToolStatus::Done => ("\u{2713}".to_string(), Style::default().fg(Color::Green)),
-        ToolStatus::Error => ("\u{2717}".to_string(), Style::default().fg(Color::Red)),
-    };
+    ];
+    if !summary.is_empty() {
+        header_spans.push(Span::styled(
+            format!(" ({})", summary),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    lines.push(Line::from(header_spans));
 
-    let label_style = match block.status {
-        ToolStatus::Running => Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-        ToolStatus::Done => Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-        ToolStatus::Error => Style::default()
-            .fg(Color::Red)
-            .add_modifier(Modifier::BOLD),
-    };
+    // Bash/PowerShell: show `$ command` body
+    if block.name == "Bash" || block.name == "PowerShell" {
+        let command = input_val
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        for (i, cmd_line) in command.lines().enumerate() {
+            if i >= 2 {
+                break;
+            }
+            let display: String = cmd_line.chars().take(160).collect();
+            let display = if cmd_line.chars().count() > 160 {
+                format!("{}\u{2026}", display)
+            } else {
+                display
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "    $ ".to_string(),
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    display,
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+    }
 
-    let verb = match block.status {
-        ToolStatus::Running => "Running",
-        ToolStatus::Done => "Done",
-        ToolStatus::Error => "Error",
-    };
-
-    lines.push(Line::from(vec![
-        Span::styled(format!("  {} ", icon), icon_style),
-        Span::styled(verb.to_string(), Style::default().fg(Color::DarkGray)),
-        Span::raw(": "),
-        Span::styled(block.name.clone(), label_style),
-    ]));
-
+    // Output preview (done/error state)
     if let Some(ref preview) = block.output_preview {
-        let (preview_style, is_error) = match block.status {
-            ToolStatus::Error => (Style::default().fg(Color::Red), true),
-            _ => (Style::default().fg(Color::DarkGray), false),
+        let preview_style = match block.status {
+            ToolStatus::Error => Style::default().fg(Color::Red),
+            _ => Style::default().fg(Color::DarkGray),
         };
-        for (i, line_text) in preview.lines().enumerate() {
-            if i == 0 && is_error {
-                lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(
-                        line_text.to_string(),
-                        Style::default().fg(Color::Red),
-                    ),
-                ]));
-            } else if line_text.starts_with('\u{2026}') {
-                // "â€¦ N more lines" truncation marker
+        for line_text in preview.lines() {
+            if line_text.starts_with('\u{2026}') {
                 lines.push(Line::from(vec![
                     Span::raw("    "),
                     Span::styled(
                         line_text.to_string(),
                         Style::default()
                             .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
+                            .add_modifier(Modifier::DIM),
                     ),
                 ]));
             } else {
@@ -684,6 +1056,14 @@ fn render_tool_block_lines(lines: &mut Vec<Line<'static>>, block: &crate::app::T
             }
         }
     }
+
+    // (ctrl+o to expand) hint
+    lines.push(Line::from(vec![Span::styled(
+        "  (ctrl+o to expand)".to_string(),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    )]));
 }
 
 // -----------------------------------------------------------------------
@@ -707,7 +1087,10 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
 }
 
 fn should_render_status_row(app: &App) -> bool {
-    app.is_streaming || app.voice_recording || app.status_message.is_some()
+    app.voice_recording
+        || app.is_streaming
+        || app.last_turn_elapsed.is_some()
+        || (!app.is_streaming && app.status_message.is_some())
 }
 
 fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
@@ -721,21 +1104,29 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )]
     } else if app.is_streaming {
-        vec![
-            Span::styled(
-                spinner_char(app.frame_count).to_string(),
-                Style::default().fg(spinner_color(app)).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                app.status_message
-                    .as_deref()
-                    .unwrap_or("Thinking..."),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]
+        // Spinner glyph (turns red on stall)
+        let mut s = vec![Span::styled(
+            spinner_char(app.frame_count).to_string(),
+            Style::default().fg(spinner_color(app)).add_modifier(Modifier::BOLD),
+        )];
+
+        // Label: explicit tool status takes priority over the thinking verb
+        let raw_label = app.status_message.as_deref()
+            .or(app.spinner_verb.as_deref())
+            .unwrap_or("Thinking");
+        let label = format!("{}…", raw_label.trim_end_matches('…'));
+
+        s.push(Span::raw(" "));
+        s.extend(shimmer_spans(&label, app.frame_count));
+        s
+    } else if let (Some(verb), Some(elapsed)) = (app.last_turn_verb, app.last_turn_elapsed.as_deref()) {
+        // "✽ Worked for 2m 5s" — mirrors TS TeammateSpinnerLine idle state
+        vec![Span::styled(
+            format!("{} {} for {}", figures::TEARDROP_ASTERISK, verb, elapsed),
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+        )]
     } else if let Some(status) = app.status_message.as_deref() {
-        vec![Span::styled(status, Style::default().fg(Color::DarkGray))]
+        vec![Span::styled(status.to_string(), Style::default().fg(Color::DarkGray))]
     } else {
         Vec::new()
     };
@@ -746,58 +1137,288 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
+
+/// Build spans for a text string with a right-to-left glimmer sweep, matching
+/// the TS `GlimmerMessage` behaviour (glimmerSpeed=200ms, 3-char shimmer window).
+///
+/// At ~50ms per frame a 4-frame step ≈ 200ms, giving the same cadence as TS.
+fn shimmer_spans(text: &str, frame_count: u64) -> Vec<Span<'static>> {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    if len == 0 {
+        return Vec::new();
+    }
+
+    // Cycle length = text_len + 20 (10 off-screen on each side)
+    let cycle_len = len + 20;
+    // One step every 4 frames (~200ms at 50ms/frame)
+    let cycle_pos = (frame_count as usize / 4) % cycle_len;
+    // Glimmer sweeps right→left: starts at len+10 (off right), ends at -10 (off left)
+    let glimmer_center = (len + 10).saturating_sub(cycle_pos) as isize;
+
+    let base = Style::default().fg(Color::DarkGray);
+    let bright = Style::default().fg(Color::White);
+
+    // Accumulate runs of same style to minimise span count
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_bright = false;
+
+    for (i, &ch) in chars.iter().enumerate() {
+        let is_bright = (i as isize - glimmer_center).abs() <= 1
+            && glimmer_center >= 0
+            && glimmer_center < len as isize;
+
+        if is_bright != run_bright && !run.is_empty() {
+            spans.push(Span::styled(run.clone(), if run_bright { bright } else { base }));
+            run.clear();
+        }
+        run_bright = is_bright;
+        run.push(ch);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, if run_bright { bright } else { base }));
+    }
+    spans
+}
 // Keybinding hints footer
 // -----------------------------------------------------------------------
 
-/// Single footer line matching real Claude Code:
-///   Left:  "? for shortcuts" (dimmed)  â€” or streaming/mode context
-///   Right: "â— high Â· /effort" (effort indicator + model)
+/// Single footer line matching the TS contract more closely:
+/// - `? for shortcuts` is suppressed once the prompt becomes non-empty
+/// - the right side shows comprehensive status info and notifications
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
     }
 
-    // Left side
+    // Left side: ordered pills — voice > PR badge > background task > vim > hint
     let left_spans: Vec<Span> = if app.voice_recording {
         vec![Span::styled(
-            format!(" {} REC â€” speak now", figures::black_circle()),
+            format!(" {} REC — speak now", figures::black_circle()),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )]
     } else {
-        vec![Span::styled(
-            "? for shortcuts",
-            Style::default().fg(Color::DarkGray),
-        )]
+        let mut spans: Vec<Span> = Vec::new();
+
+        // Agent type badge (shown when running as subagent / coordinator)
+        if let Some(ref badge) = app.agent_type_badge {
+            spans.push(Span::styled(
+                format!("\u{2699} {}", badge),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        // PR badge
+        if let Some(pr_num) = app.pr_number {
+            spans.push(Span::styled(
+                format!(" #{}", pr_num),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        // Background task status pill
+        if let Some(ref task_status) = app.background_task_status {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(
+                format!("⟳ {}", task_status),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+
+        // Vim mode indicator (only when non-insert in vim mode, to save space)
+        if app.prompt_input.vim_enabled && app.prompt_input.vim_mode == VimMode::Insert {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(
+                "-- INSERT --",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        // "? for shortcuts" hint only when prompt is empty and no other badges
+        if spans.is_empty() && app.prompt_input.text.is_empty() {
+            spans.push(Span::styled(
+                "? for shortcuts",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        spans
     };
 
-    // Right side: effort glyph Â· effort name Â· /effort  (matches TS StatusLine)
-    let effort_glyph = match app.effort_level {
-        EffortLevel::Low => figures::EFFORT_LOW,
-        EffortLevel::Medium => figures::EFFORT_MEDIUM,
-        EffortLevel::High => figures::EFFORT_HIGH,
-        EffortLevel::Max => figures::EFFORT_MAX,
+    // Right side: notifications take priority, otherwise build status parts
+    let right_spans: Vec<Span> = if let Some(notification) = app.notifications.current() {
+        vec![Span::styled(
+            notification.message.clone(),
+            Style::default()
+                .fg(notification.kind.color())
+                .add_modifier(Modifier::BOLD),
+        )]
+    } else {
+        let mut parts: Vec<Span> = Vec::new();
+
+        // 1. Context window usage — show "N% until auto-compact" mirroring TS TokenWarning
+        if app.context_window_size > 0 {
+            let used_pct = (app.context_used_tokens as f64 / app.context_window_size as f64 * 100.0) as u64;
+            let left_pct = 100u64.saturating_sub(used_pct);
+
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+
+            if used_pct >= 95 {
+                // Critical: red, urge /compact now
+                parts.push(Span::styled(
+                    format!("{}% context used — /compact now", used_pct),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ));
+            } else if used_pct >= 70 {
+                // Warning: show "N% until auto-compact" in yellow
+                parts.push(Span::styled(
+                    format!("{}% until auto-compact", left_pct),
+                    Style::default().fg(Color::Yellow),
+                ));
+            } else {
+                // Normal: dim green percentage
+                let used_k = app.context_used_tokens / 1000;
+                let total_k = app.context_window_size / 1000;
+                parts.push(Span::styled(
+                    format!("{}k/{}k", used_k, total_k),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        }
+
+        // 3. Cost
+        if app.cost_usd > 0.0 {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            parts.push(Span::styled(
+                format!("${:.2}", app.cost_usd),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        // 4. Rate limits
+        if let Some(pct) = app.rate_limit_5h_pct {
+            if pct > 0.0 {
+                if !parts.is_empty() {
+                    parts.push(Span::raw("  "));
+                }
+                let color = if pct >= 90.0 { Color::Red } else { Color::Yellow };
+                parts.push(Span::styled(
+                    format!("5h:{:.0}%", pct),
+                    Style::default().fg(color),
+                ));
+            }
+        }
+        if let Some(pct) = app.rate_limit_7day_pct {
+            if pct > 0.0 {
+                if !parts.is_empty() {
+                    parts.push(Span::raw("  "));
+                }
+                let color = if pct >= 90.0 { Color::Red } else { Color::Yellow };
+                parts.push(Span::styled(
+                    format!("7d:{:.0}%", pct),
+                    Style::default().fg(color),
+                ));
+            }
+        }
+
+        // 5. Vim mode indicator
+        if app.prompt_input.vim_enabled {
+            let mode_str = match app.prompt_input.vim_mode {
+                VimMode::Insert => "[INSERT]",
+                VimMode::Normal => "[NORMAL]",
+                VimMode::Visual => "[VISUAL]",
+            };
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            parts.push(Span::styled(mode_str, Style::default().fg(Color::DarkGray)));
+        }
+
+        // 6. Agent type badge
+        if let Some(ref badge) = app.agent_type_badge {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            parts.push(Span::styled(
+                format!("[{}]", badge),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+
+        // 7. Worktree branch
+        if let Some(ref branch) = app.worktree_branch {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            parts.push(Span::styled(
+                format!("[{}]", branch),
+                Style::default().fg(Color::Green),
+            ));
+        }
+
+        // Output style indicator (only when non-default)
+        if app.output_style != "auto" {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            parts.push(Span::styled(
+                format!("[{}]", app.output_style),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        // External status line override
+        if let Some(ref override_text) = app.status_line_override {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            // Strip any ANSI escapes for terminal rendering (plain text)
+            let clean: String = override_text
+                .chars()
+                .filter(|c| c.is_ascii_graphic() || *c == ' ')
+                .collect();
+            parts.push(Span::styled(clean, Style::default().fg(Color::DarkGray)));
+        }
+
+        // 8. Bridge badge
+        if let Some(badge) = app.bridge_state.status_badge(app.frame_count) {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            parts.push(badge);
+        } else if app.pending_mcp_reconnect {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            parts.push(Span::styled(
+                "MCP reconnecting",
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+
+        parts
     };
-    let effort_name = match app.effort_level {
-        EffortLevel::Low => "low",
-        EffortLevel::Medium => "medium",
-        EffortLevel::High => "high",
-        EffortLevel::Max => "max",
-    };
-    let mut right_spans: Vec<Span> = Vec::new();
-    if app.fast_mode {
-        right_spans.push(Span::styled(
-            format!("{} ", figures::LIGHTNING_BOLT),
-            Style::default().fg(Color::Yellow),
-        ));
-    }
-    right_spans.push(Span::styled(
-        format!("{} {} \u{00b7} /effort", effort_glyph, effort_name),
-        Style::default().fg(Color::DarkGray),
-    ));
 
     // Gap fill
-    let left_len: usize = left_spans.iter().map(|s| s.content.len()).sum();
-    let right_len: usize = right_spans.iter().map(|s| s.content.len()).sum();
+    let left_len: usize = left_spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    let right_len: usize = right_spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
     let gap = (area.width as usize).saturating_sub(left_len + right_len);
 
     let mut spans = left_spans;
@@ -815,26 +1436,76 @@ fn render_prompt_suggestions(frame: &mut Frame, app: &App, area: Rect) {
 
     let selected = app.prompt_input.suggestion_index.unwrap_or(0);
     let max_visible = area.height as usize;
-    let start = selected.saturating_sub(max_visible / 2).min(suggestions.len().saturating_sub(max_visible));
+    let start = selected
+        .saturating_sub(max_visible / 2)
+        .min(suggestions.len().saturating_sub(max_visible));
     let end = (start + max_visible).min(suggestions.len());
+    let label_width = area.width.saturating_div(3).max(12) as usize;
 
     for (row, suggestion) in suggestions[start..end].iter().enumerate() {
         let is_selected = start + row == selected;
-        let prefix = if is_selected { "> " } else { "  " };
-        let style = if is_selected {
+        let accent_style = if is_selected {
             Style::default().fg(CLAUDE_ORANGE).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let mut spans = vec![
-            Span::styled(prefix, style),
-            Span::styled(suggestion.text.clone(), style),
-        ];
-        if !suggestion.description.is_empty() {
-            spans.push(Span::styled(
-                format!("  {}", suggestion.description),
-                Style::default().fg(Color::DarkGray),
-            ));
+        let label_style = if is_selected {
+            Style::default().fg(CLAUDE_ORANGE).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let detail_style = if is_selected {
+            Style::default().fg(CLAUDE_ORANGE)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let mut spans = vec![Span::styled(if is_selected { "\u{203a} " } else { "  " }, accent_style)];
+        match suggestion.source {
+            TypeaheadSource::SlashCommand => {
+                let display_name = truncate_text(&suggestion.text, label_width);
+                spans.push(Span::styled(
+                    format!("{display_name:<width$}", width = label_width),
+                    label_style,
+                ));
+                spans.push(Span::styled(" [cmd] ", Style::default().fg(Color::DarkGray)));
+                if !suggestion.description.is_empty() {
+                    spans.push(Span::styled(
+                        truncate_text(
+                            &suggestion.description,
+                            area.width.saturating_sub(label_width as u16 + 10) as usize,
+                        ),
+                        detail_style,
+                    ));
+                }
+            }
+            TypeaheadSource::FileRef => {
+                spans.push(Span::styled("+ ", accent_style));
+                spans.push(Span::styled(
+                    truncate_middle(&suggestion.text, label_width),
+                    label_style,
+                ));
+                if !suggestion.description.is_empty() {
+                    spans.push(Span::styled(" \u{2014} ", Style::default().fg(Color::DarkGray)));
+                    spans.push(Span::styled(
+                        truncate_text(&suggestion.description, area.width as usize / 2),
+                        detail_style,
+                    ));
+                }
+            }
+            TypeaheadSource::History => {
+                let display_name = truncate_text(&suggestion.text, label_width);
+                spans.push(Span::styled(
+                    format!("{display_name:<width$}", width = label_width),
+                    label_style,
+                ));
+                spans.push(Span::styled(" [history] ", Style::default().fg(Color::DarkGray)));
+                if !suggestion.description.is_empty() {
+                    spans.push(Span::styled(
+                        truncate_text(&suggestion.description, area.width as usize / 2),
+                        detail_style,
+                    ));
+                }
+            }
         }
 
         frame.render_widget(

@@ -1144,11 +1144,11 @@ async fn run_interactive(
                         delta: text.clone(),
                         message_id: format!("msg-{}", index),
                     }),
-                    QueryEvent::ToolStart { tool_name, tool_id } => {
+                    QueryEvent::ToolStart { tool_name, tool_id, input_json } => {
                         Some(BridgeOutbound::ToolStart {
                             id: tool_id.clone(),
                             name: tool_name.clone(),
-                            input_preview: None,
+                            input_preview: Some(input_json.clone()),
                         })
                     }
                     QueryEvent::ToolEnd { tool_id, result, is_error, .. } => {

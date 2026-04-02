@@ -50,13 +50,40 @@ impl NamedCommand for AgentsCommand {
     fn description(&self) -> &str { "Manage and configure sub-agents" }
     fn usage(&self) -> &str { "claude agents [list|create|edit|delete] [name]" }
 
-    fn execute_named(&self, args: &[&str], _ctx: &CommandContext) -> CommandResult {
+    fn execute_named(&self, args: &[&str], ctx: &CommandContext) -> CommandResult {
         match args.first().copied().unwrap_or("list") {
-            "list" => CommandResult::Message(
-                "Sub-agents are defined in .claude/agents/ as Markdown files.\n\
-                 Use 'claude agents create <name>' to scaffold a new agent."
-                    .to_string(),
-            ),
+            "list" => {
+                // Load agent definitions from .claude/agents/ in working dir
+                // (and home dir), using the same loader as the TUI agents view.
+                let defs = cc_tui::agents_view::load_agent_definitions(&ctx.working_dir);
+
+                if defs.is_empty() {
+                    return CommandResult::Message(
+                        "Available Agents (0)\n\n\
+                         No custom agents defined. Create one with /new-agent\n\
+                         or run: claude agents create <name>"
+                            .to_string(),
+                    );
+                }
+
+                let mut out = format!("Available Agents ({})\n\n", defs.len());
+                for def in &defs {
+                    let model_str = def.model.as_deref().unwrap_or("default model");
+                    if def.description.is_empty() {
+                        out.push_str(&format!(
+                            "  \u{2022} {} ({})\n",
+                            def.name, model_str
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  \u{2022} {}: {}\n    Model: {}\n",
+                            def.name, def.description, model_str
+                        ));
+                    }
+                }
+                out.push_str("\nUse 'claude agents create <name>' to add a new agent.");
+                CommandResult::Message(out)
+            }
             "create" => {
                 let name = args.get(1).copied().unwrap_or("my-agent");
                 CommandResult::Message(format!(
@@ -426,10 +453,10 @@ impl NamedCommand for PassesCommand {
 
     fn execute_named(&self, _args: &[&str], _ctx: &CommandContext) -> CommandResult {
         CommandResult::Message(
-            "Claude Passes — referral program\n\n\
-             Check your passes status at: https://claude.ai/passes\n\
-             Share your referral link to earn free API credits.\n\n\
-             To view your referral link, sign in at claude.ai and visit the Passes section."
+            "Claude Code Passes \u{2014} Share Claude with friends\n\n\
+             Share a free week of Claude Code with a friend\n\
+             Visit https://claude.ai/passes to get your referral link\n\
+             Each referral gives your friend 1 week of Claude Code Pro"
                 .to_string(),
         )
     }
@@ -603,39 +630,89 @@ impl NamedCommand for DesktopCommand {
     fn description(&self) -> &str { "Download and set up Claude Desktop app" }
     fn usage(&self) -> &str { "claude desktop" }
 
-    fn execute_named(&self, _args: &[&str], _ctx: &CommandContext) -> CommandResult {
-        let (platform, download_url, instructions) = if cfg!(target_os = "windows") {
-            (
-                "Windows",
-                "https://claude.ai/download/windows",
-                "1. Download and install Claude Desktop\n\
-                 2. Open Claude Desktop and sign in with the same account\n\
-                 3. Your Claude Code sessions will sync automatically"
+    fn execute_named(&self, _args: &[&str], ctx: &CommandContext) -> CommandResult {
+        // If a bridge/remote session is already active, the user is already
+        // connected to Claude Desktop.
+        if ctx.remote_session_url.is_some() {
+            return CommandResult::Message(
+                "\u{2713} Already connected to Claude Desktop\n\n\
+                 Your Claude Code session is synced with Claude Desktop.\n\
+                 Visit https://claude.ai/download to manage your installation."
+                    .to_string(),
+            );
+        }
+
+        // Detect platform at compile-time (std::env::consts is equivalent for
+        // static strings, but cfg!() works at compile time without an import).
+        let os = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
+
+        let download_url = "https://claude.ai/download";
+
+        let msg = if os == "macos" {
+            format!(
+                "Open Claude Desktop \u{2014} macOS\n\n\
+                 Download: {download_url}\n\n\
+                 Setup instructions:\n\
+                 1. Download and install Claude Desktop for macOS\n\
+                 2. Open Claude Desktop and sign in with the same Anthropic account\n\
+                 3. Claude Code will detect the Desktop bridge automatically"
             )
-        } else if cfg!(target_os = "macos") {
-            (
-                "macOS",
-                "https://claude.ai/download/mac",
-                "1. Download and install Claude Desktop\n\
-                 2. Open Claude Desktop and sign in with the same account\n\
-                 3. Your Claude Code sessions will sync automatically"
+        } else if os == "windows" {
+            let arch_note = if arch == "x86_64" { " (x64)" } else { "" };
+            format!(
+                "Download Claude Desktop for Windows{arch_note}\n\n\
+                 Download: {download_url}\n\n\
+                 Setup instructions:\n\
+                 1. Download and run the Claude Desktop installer\n\
+                 2. Open Claude Desktop and sign in with the same Anthropic account\n\
+                 3. Claude Code will detect the Desktop bridge automatically"
             )
         } else {
-            (
-                "Linux",
-                "https://claude.ai/download",
-                "Claude Desktop is currently available for Windows and macOS.\n\
-                 On Linux, use Claude Code CLI or the web app at https://claude.ai"
+            // Linux and other platforms
+            format!(
+                "Claude Desktop is not yet available for {os}\n\n\
+                 On Linux, you can use Claude Code via the CLI or visit https://claude.ai in your browser.\n\
+                 Check https://claude.ai/download for the latest platform availability."
             )
         };
 
-        CommandResult::Message(format!(
-            "Claude Desktop for {}\n\n\
-             Download: {}\n\n\
-             Setup instructions:\n{}",
-            platform, download_url, instructions
-        ))
+        CommandResult::Message(msg)
     }
+}
+
+// ---------------------------------------------------------------------------
+// mobile — helper
+// ---------------------------------------------------------------------------
+
+/// Generate a placeholder ASCII QR-code-like block pattern.
+///
+/// Produces a 15-row grid using Unicode block characters (`\u{2588}` full block
+/// and space) arranged to look like a real QR code finder pattern.  The `url`
+/// parameter is incorporated as a comment but does not affect the pixel layout
+/// (a real QR encoder would be needed for that).
+fn ascii_qr_placeholder(_url: &str) -> Vec<String> {
+    // Each row is 15 chars wide.  1 = filled (\u{2588}), 0 = space.
+    // Rows are designed to mimic QR finder squares in the corners plus some
+    // pseudo-random data in the centre.
+    let rows: &[&str] = &[
+        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}",
+        "\u{2588}     \u{2588} \u{2588} \u{2588} \u{2588} \u{2588}     \u{2588}",
+        "\u{2588} \u{2588}\u{2588}\u{2588}\u{2588} \u{2588} \u{2588}\u{2588}\u{2588} \u{2588} \u{2588} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588} \u{2588}",
+        "\u{2588} \u{2588}\u{2588}\u{2588}\u{2588} \u{2588} \u{2588} \u{2588}\u{2588} \u{2588} \u{2588} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588} \u{2588}",
+        "\u{2588} \u{2588}\u{2588}\u{2588}\u{2588} \u{2588} \u{2588}\u{2588}  \u{2588} \u{2588} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588} \u{2588}",
+        "\u{2588}     \u{2588}  \u{2588}\u{2588}\u{2588}\u{2588}  \u{2588} \u{2588}     \u{2588}",
+        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588} \u{2588} \u{2588} \u{2588} \u{2588} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}",
+        " \u{2588}\u{2588}  \u{2588}\u{2588}\u{2588} \u{2588}\u{2588} \u{2588}\u{2588} \u{2588}\u{2588}  \u{2588} ",
+        "\u{2588}\u{2588}\u{2588}\u{2588}  \u{2588}\u{2588}\u{2588}  \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}\u{2588}  ",
+        " \u{2588}  \u{2588}  \u{2588} \u{2588}\u{2588}\u{2588}  \u{2588} \u{2588}  \u{2588}\u{2588}",
+        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}  \u{2588}\u{2588}  \u{2588}  \u{2588}  \u{2588}\u{2588}",
+        "\u{2588}     \u{2588} \u{2588} \u{2588} \u{2588}\u{2588}  \u{2588} \u{2588}\u{2588}\u{2588}",
+        "\u{2588} \u{2588}\u{2588}\u{2588}\u{2588} \u{2588} \u{2588}\u{2588}\u{2588}  \u{2588}\u{2588} \u{2588}  \u{2588}",
+        "\u{2588}     \u{2588} \u{2588}\u{2588}  \u{2588} \u{2588}\u{2588} \u{2588}\u{2588}\u{2588} ",
+        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588} \u{2588}  \u{2588}\u{2588}\u{2588}  \u{2588}\u{2588}\u{2588}\u{2588}",
+    ];
+    rows.iter().map(|r| r.to_string()).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -647,22 +724,41 @@ pub struct MobileCommand;
 impl NamedCommand for MobileCommand {
     fn name(&self) -> &str { "mobile" }
     fn description(&self) -> &str { "Download the Claude mobile app" }
-    fn usage(&self) -> &str { "claude mobile" }
+    fn usage(&self) -> &str { "claude mobile [ios|android]" }
 
-    fn execute_named(&self, _args: &[&str], _ctx: &CommandContext) -> CommandResult {
-        CommandResult::Message(
-            "Claude Mobile App\n\n\
-             iOS:     https://apps.apple.com/app/claude/id6475207963\n\
-             Android: https://play.google.com/store/apps/details?id=com.anthropic.claude\n\n\
-             Or visit https://claude.ai/mobile on your phone to download\n\n\
-             Scan this QR code with your phone camera:\n\n\
-             \u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\n\
-             \u{2588} \u{2584}\u{2584}\u{2584}\u{2584}\u{2584} \u{2588}\u{2580}\u{2584} \u{2584}\u{2580}\u{2588} \u{2584}\u{2584}\u{2584}\u{2584}\u{2584} \u{2588}\n\
-             \u{2588} \u{2588}   \u{2588} \u{2588}\u{2584}\u{2580}\u{2588}\u{2588}\u{2580}\u{2588} \u{2588}   \u{2588} \u{2588}\n\
-             \u{2588} \u{2588}\u{2584}\u{2584}\u{2584}\u{2588} \u{2588} \u{2584}\u{2584}\u{2584}\u{2580}\u{2588} \u{2588}\u{2584}\u{2584}\u{2584}\u{2588} \u{2588}\n\
-             \u{2588}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2588}\u{2584}\u{2580}\u{2584}\u{2588}\u{2584}\u{2588}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2588}\n\
-             (Visit https://claude.ai/mobile for the actual QR code)".to_string()
-        )
+    fn execute_named(&self, args: &[&str], _ctx: &CommandContext) -> CommandResult {
+        let ios_url     = "https://apps.apple.com/app/claude-by-anthropic/id6473753684";
+        let android_url = "https://play.google.com/store/apps/details?id=com.anthropic.claude";
+        let mobile_url  = "https://claude.ai/mobile";
+
+        // Choose which platform to show the QR for (default: claude.ai/mobile)
+        let (platform_label, qr_url) = match args.first().copied().unwrap_or("") {
+            "ios" | "1"     => ("[1] iOS  (selected)", ios_url),
+            "android" | "2" => ("[2] Android  (selected)", android_url),
+            _               => ("both platforms", mobile_url),
+        };
+
+        let qr_lines = ascii_qr_placeholder(qr_url);
+
+        let mut out = String::new();
+        out.push_str("Scan to download Claude mobile app\n");
+        out.push_str(&format!("Platform: {platform_label}\n\n"));
+        out.push_str("  [1] iOS    [2] Android\n\n");
+
+        // QR block — indent by 2 spaces
+        for line in &qr_lines {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
+
+        out.push('\n');
+        out.push_str(&format!("  iOS:     {ios_url}\n"));
+        out.push_str(&format!("  Android: {android_url}\n"));
+        out.push('\n');
+        out.push_str(&format!("Or visit {mobile_url}"));
+
+        CommandResult::Message(out)
     }
 }
 
