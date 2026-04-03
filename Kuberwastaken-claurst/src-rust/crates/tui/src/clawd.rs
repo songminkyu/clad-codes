@@ -16,17 +16,17 @@ pub enum ClawdPose {
     LookRight,
 }
 
-/// Body-part style: bold orange foreground (matches TS theme clawd_body rgb(215,119,87)).
+/// Body-part style: bold pink foreground (#e91e63).
 fn body_style() -> Style {
     Style::default()
-        .fg(Color::Rgb(215, 119, 87))
+        .fg(Color::Rgb(233, 30, 99))
         .add_modifier(Modifier::BOLD)
 }
 
-/// Eye-row style: orange text on black background (matches TS theme clawd_background black).
+/// Eye-row style: pink text on black background.
 fn eye_bg_style() -> Style {
     Style::default()
-        .fg(Color::Rgb(215, 119, 87))
+        .fg(Color::Rgb(233, 30, 99))
         .bg(Color::Black)
         .add_modifier(Modifier::BOLD)
 }

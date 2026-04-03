@@ -224,13 +224,20 @@ pub enum PluginSubCommand {
     Info(String),
     /// `/plugin install <path>` — install a plugin from a local path.
     Install(String),
+    /// `/plugin reload` — reload plugins from disk.
+    Reload,
     /// Show usage / help.
     Help,
 }
 
 /// Parse the arguments string for `/plugin`.
 pub fn parse_plugin_args(args: &str) -> PluginSubCommand {
-    let parts: Vec<&str> = args.trim().splitn(3, char::is_whitespace).collect();
+    let args = args.trim();
+    // No args → show list
+    if args.is_empty() {
+        return PluginSubCommand::List;
+    }
+    let parts: Vec<&str> = args.splitn(3, char::is_whitespace).collect();
     match parts.first().map(|s| s.to_lowercase()).as_deref() {
         Some("list") | Some("ls") => PluginSubCommand::List,
         Some("enable") => PluginSubCommand::Enable(
@@ -245,6 +252,7 @@ pub fn parse_plugin_args(args: &str) -> PluginSubCommand {
         Some("install") | Some("i") => PluginSubCommand::Install(
             parts.get(1).unwrap_or(&"").to_string(),
         ),
+        Some("reload") | Some("refresh") => PluginSubCommand::Reload,
         Some("help") | Some("--help") | Some("-h") => PluginSubCommand::Help,
         _ => PluginSubCommand::Help,
     }
@@ -260,7 +268,12 @@ pub fn format_plugin_list(registry: &PluginRegistry) -> String {
         return "No plugins installed.\n\nUse `/plugin install <path>` to install a plugin from a local directory.".to_string();
     }
 
-    out.push_str("Installed plugins:\n\n");
+    let total = all.len();
+    let enabled_count = all.iter().filter(|p| registry.is_enabled(&p.name)).count();
+    out.push_str(&format!(
+        "Installed plugins: {} ({} enabled)\n\n",
+        total, enabled_count
+    ));
     for p in &all {
         let status = if registry.is_enabled(&p.name) {
             "enabled"
@@ -269,12 +282,40 @@ pub fn format_plugin_list(registry: &PluginRegistry) -> String {
         };
         let version = p.manifest.version.as_deref().unwrap_or("(no version)");
         let desc = p.manifest.description.as_deref().unwrap_or("");
+
+        // Count commands and hooks for this plugin.
+        let cmd_count = loader::collect_command_defs(p).len();
+        let hook_count = p
+            .hooks_config
+            .as_ref()
+            .map(|hc| hc.events.values().map(|v| v.len()).sum::<usize>())
+            .unwrap_or(0);
+
         out.push_str(&format!("  {} [{}] v{}", p.name, status, version));
         if !desc.is_empty() {
             out.push_str(&format!(" — {}", desc));
         }
+        let mut extras: Vec<String> = Vec::new();
+        if cmd_count > 0 {
+            extras.push(format!("{} cmd{}", cmd_count, if cmd_count == 1 { "" } else { "s" }));
+        }
+        if hook_count > 0 {
+            extras.push(format!("{} hook{}", hook_count, if hook_count == 1 { "" } else { "s" }));
+        }
+        if !extras.is_empty() {
+            out.push_str(&format!(" ({})", extras.join(", ")));
+        }
         out.push('\n');
     }
+
+    if registry.error_count() > 0 {
+        out.push_str(&format!(
+            "\n{} plugin{} failed to load. Use `/plugin info <name>` for details.\n",
+            registry.error_count(),
+            if registry.error_count() == 1 { "" } else { "s" }
+        ));
+    }
+
     out
 }
 
@@ -307,6 +348,22 @@ pub fn format_plugin_info(registry: &PluginRegistry, name: &str) -> String {
                 out.push_str(&format!("\nCommands ({}):\n", cmd_defs.len()));
                 for cmd in &cmd_defs {
                     out.push_str(&format!("  /{} — {}\n", cmd.name, cmd.description));
+                }
+            }
+
+            // Hooks.
+            if let Some(ref hooks_config) = p.hooks_config {
+                let hook_count: usize = hooks_config.events.values().map(|v| v.len()).sum();
+                if hook_count > 0 {
+                    out.push_str(&format!("\nHooks ({}):\n", hook_count));
+                    for (event, matchers) in &hooks_config.events {
+                        for matcher in matchers {
+                            for hook in &matcher.hooks {
+                                let blocking = if hook.blocking { " [blocking]" } else { "" };
+                                out.push_str(&format!("  {} {}{}\n", event, hook.command, blocking));
+                            }
+                        }
+                    }
                 }
             }
 

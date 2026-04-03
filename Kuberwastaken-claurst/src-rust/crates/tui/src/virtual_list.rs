@@ -19,6 +19,12 @@ pub trait VirtualItem {
 
     /// Return a searchable text representation of this item.
     fn search_text(&self) -> String;
+
+    /// Returns true if this item is a section header that should be pinned
+    /// at the top of the viewport when scrolled past.
+    fn is_section_header(&self) -> bool {
+        false
+    }
 }
 
 /// Virtual scrolling list.
@@ -148,6 +154,25 @@ impl<T: VirtualItem> VirtualList<T> {
         }
     }
 
+    /// Find the index of the section header that should be pinned at the top.
+    /// This is the last header item that lies entirely above `scroll_offset`.
+    pub fn sticky_header_index(&mut self, width: u16) -> Option<usize> {
+        let mut row = 0u16;
+        let mut last_header: Option<usize> = None;
+        for i in 0..self.items.len() {
+            let h = self.item_height(i, width);
+            if row + h > self.scroll_offset {
+                // This item is in or after the viewport
+                break;
+            }
+            if self.items[i].is_section_header() {
+                last_header = Some(i);
+            }
+            row += h;
+        }
+        last_header
+    }
+
     /// Render visible items into `buf` within `area`.
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
         if self.items.is_empty() || area.height == 0 {
@@ -209,6 +234,36 @@ impl<T: VirtualItem> VirtualList<T> {
 
             screen_row += visible_rows;
             current_row = item_end;
+        }
+
+        // Overlay the sticky section header (if any) at the top of the viewport.
+        // This ensures the user always knows which section they're in.
+        if let Some(header_idx) = self.sticky_header_index(width) {
+            // Only render the sticky header if it's not already visible at the top
+            // (i.e., the item's virtual row is before scroll_offset)
+            let mut row = 0u16;
+            for i in 0..header_idx {
+                row = row.saturating_add(self.item_height(i, width));
+            }
+            // row is now the virtual start of header_idx
+            if row < self.scroll_offset {
+                let h = self.item_height(header_idx, width).min(area.height);
+                let header_area = Rect {
+                    x: area.x,
+                    y: area.y,
+                    width: area.width,
+                    height: h,
+                };
+                // Clear the background for the sticky header
+                for by in header_area.y..header_area.y + h {
+                    for bx in header_area.x..header_area.x + header_area.width {
+                        if let Some(cell) = buf.cell_mut((bx, by)) {
+                            cell.set_char(' ');
+                        }
+                    }
+                }
+                self.items[header_idx].render(header_area, buf, false);
+            }
         }
     }
 

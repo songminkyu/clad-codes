@@ -241,13 +241,22 @@ impl VoiceRecorder {
         let is_recording = self.is_recording.clone();
         let config = self.config.clone();
 
-        tokio::spawn(async move {
-            match record_and_transcribe(is_recording, event_tx.clone(), config).await {
-                Ok(()) => {}
-                Err(e) => {
-                    let _ = event_tx.send(VoiceEvent::Error(e.to_string())).await;
+        // cpal::Stream is !Send, so we can't use tokio::spawn (which requires Send).
+        // Instead, spin up a dedicated OS thread with its own single-threaded tokio
+        // runtime so the stream stays local to that thread throughout its lifetime.
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("voice thread runtime");
+            rt.block_on(async move {
+                match record_and_transcribe(is_recording, event_tx.clone(), config).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        let _ = event_tx.send(VoiceEvent::Error(e.to_string())).await;
+                    }
                 }
-            }
+            });
         });
 
         Ok(())

@@ -8,6 +8,7 @@ cc-core = { workspace = true }
 cc-api = { workspace = true }
 cc-tools = { workspace = true }
 cc-query = { workspace = true }
+cc-mcp = { workspace = true }
 cc-tui = { workspace = true }
 cc-plugins = { workspace = true }
 tokio = { workspace = true }
@@ -23,3 +24,6 @@ reqwest = { workspace = true }
 arboard = { version = "3", default-features = false }
 urlencoding = { workspace = true }
 open = { workspace = true }
+qrcode = { workspace = true }
+cc-bridge = { workspace = true }
+hostname = "0.4"

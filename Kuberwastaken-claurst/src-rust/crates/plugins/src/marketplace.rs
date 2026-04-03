@@ -37,12 +37,26 @@ pub struct InstalledPlugin {
 
 const REGISTRY_URL: &str = "https://registry.claude.ai/plugins";
 
-/// Search the marketplace for plugins matching `query`.
-pub async fn marketplace_search(query: &str) -> Result<Vec<MarketplaceEntry>, String> {
-    let url = if query.is_empty() {
+/// Search the marketplace for plugins matching `query`, optionally filtered by `tags`.
+///
+/// When `tags` is non-empty, `tags[]=tag` query parameters are appended to the URL.
+pub async fn marketplace_search_filtered(
+    query: &str,
+    tags: &[&str],
+) -> Result<Vec<MarketplaceEntry>, String> {
+    let mut params: Vec<String> = Vec::new();
+
+    if !query.is_empty() {
+        params.push(format!("q={}", urlencoding::encode(query)));
+    }
+    for tag in tags {
+        params.push(format!("tags[]={}", urlencoding::encode(tag)));
+    }
+
+    let url = if params.is_empty() {
         REGISTRY_URL.to_string()
     } else {
-        format!("{}?q={}", REGISTRY_URL, urlencoding::encode(query))
+        format!("{}?{}", REGISTRY_URL, params.join("&"))
     };
 
     let resp = reqwest::get(&url)
@@ -56,6 +70,40 @@ pub async fn marketplace_search(query: &str) -> Result<Vec<MarketplaceEntry>, St
     resp.json::<Vec<MarketplaceEntry>>()
         .await
         .map_err(|e| format!("Parse error: {e}"))
+}
+
+/// Search the marketplace for plugins matching `query`.
+///
+/// Convenience wrapper around [`marketplace_search_filtered`] with no tag filter.
+pub async fn marketplace_search(query: &str) -> Result<Vec<MarketplaceEntry>, String> {
+    marketplace_search_filtered(query, &[]).await
+}
+
+/// Check all installed plugins for updates.
+///
+/// Returns `(name, current_version, latest_version)` for each plugin that has
+/// a newer version available in the marketplace.
+pub async fn marketplace_check_updates_all() -> Vec<(String, String, String)> {
+    let installed = list_installed();
+    let mut futures_vec = Vec::new();
+    for plugin in &installed {
+        let name = plugin.name.clone();
+        let current = plugin.version.clone();
+        futures_vec.push(async move {
+            let results = marketplace_search(&name).await.unwrap_or_default();
+            if let Some(latest) = results.iter().find(|e| e.name == name) {
+                if latest.version != current {
+                    return Some((name, current, latest.version.clone()));
+                }
+            }
+            None
+        });
+    }
+    futures::future::join_all(futures_vec)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// Install a plugin by name from the marketplace, or from a URL directly.

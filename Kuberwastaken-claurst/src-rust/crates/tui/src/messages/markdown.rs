@@ -62,8 +62,8 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
             lines.push(Line::from(vec![Span::styled(
                 format!("  {}", &raw[4..]),
                 Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             )]));
             continue;
         }
@@ -71,8 +71,8 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
             lines.push(Line::from(vec![Span::styled(
                 format!("  {}", &raw[3..]),
                 Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             )]));
             continue;
         }
@@ -80,8 +80,8 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
             lines.push(Line::from(vec![Span::styled(
                 format!("  {}", &raw[2..]),
                 Style::default()
-                    .fg(Color::Blue)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED),
             )]));
             continue;
         }

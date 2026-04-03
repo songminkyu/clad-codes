@@ -185,6 +185,46 @@ pub mod types {
             #[serde(skip_serializing_if = "Option::is_none")]
             citations: Option<CitationsConfig>,
         },
+        /// A `!`-prefixed shell command invoked by the user, with its captured output.
+        /// Rendered as a faint gray block with a `!command` header.
+        UserLocalCommandOutput {
+            command: String,
+            output: String,
+        },
+        /// A skill/slash-command invocation entered by the user.
+        /// Rendered as `▸ name args` with cyan styling.
+        UserCommand {
+            name: String,
+            args: String,
+        },
+        /// A memory key/value written by the user (e.g. via `/memory`).
+        /// Rendered as `# key: value` in cyan with a `Got it.` footer.
+        UserMemoryInput {
+            key: String,
+            value: String,
+        },
+        /// A system-level API error, rendered as a red-bordered block.
+        /// Shows first 5 lines with `[expand]` hint when truncated, and an
+        /// optional `Retrying in Ns...` countdown line when `retry_secs` is set.
+        SystemAPIError {
+            message: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            retry_secs: Option<u32>,
+        },
+        /// A collapsed summary of multiple read/search tool calls.
+        /// Rendered as `▸ Read N files (+ M more)` on a single line.
+        CollapsedReadSearch {
+            tool_name: String,
+            paths: Vec<String>,
+            n_hidden: usize,
+        },
+        /// A sub-task assignment in an agentic workflow.
+        /// Rendered as a cyan-bordered box with Task ID, subject, and description.
+        TaskAssignment {
+            id: String,
+            subject: String,
+            description: String,
+        },
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -360,6 +400,94 @@ pub mod types {
         pub fn has_tool_use(&self) -> bool {
             !self.get_tool_use_blocks().is_empty()
         }
+
+        /// Create a user message representing a `!`-prefixed local shell command with output.
+        pub fn user_local_command_output(command: impl Into<String>, output: impl Into<String>) -> Self {
+            Self {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::UserLocalCommandOutput {
+                    command: command.into(),
+                    output: output.into(),
+                }]),
+                uuid: None,
+                cost: None,
+            }
+        }
+
+        /// Create a user message representing a skill/slash-command invocation.
+        pub fn user_command(name: impl Into<String>, args: impl Into<String>) -> Self {
+            Self {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::UserCommand {
+                    name: name.into(),
+                    args: args.into(),
+                }]),
+                uuid: None,
+                cost: None,
+            }
+        }
+
+        /// Create a user message representing a memory key/value entry.
+        pub fn user_memory_input(key: impl Into<String>, value: impl Into<String>) -> Self {
+            Self {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::UserMemoryInput {
+                    key: key.into(),
+                    value: value.into(),
+                }]),
+                uuid: None,
+                cost: None,
+            }
+        }
+
+        /// Create a system message representing an API error (red-bordered block).
+        pub fn system_api_error(message: impl Into<String>, retry_secs: Option<u32>) -> Self {
+            Self {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::SystemAPIError {
+                    message: message.into(),
+                    retry_secs,
+                }]),
+                uuid: None,
+                cost: None,
+            }
+        }
+
+        /// Create a system message representing a collapsed read/search summary.
+        pub fn collapsed_read_search(
+            tool_name: impl Into<String>,
+            paths: Vec<String>,
+            n_hidden: usize,
+        ) -> Self {
+            Self {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::CollapsedReadSearch {
+                    tool_name: tool_name.into(),
+                    paths,
+                    n_hidden,
+                }]),
+                uuid: None,
+                cost: None,
+            }
+        }
+
+        /// Create a system message representing a sub-task assignment.
+        pub fn task_assignment(
+            id: impl Into<String>,
+            subject: impl Into<String>,
+            description: impl Into<String>,
+        ) -> Self {
+            Self {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::TaskAssignment {
+                    id: id.into(),
+                    subject: subject.into(),
+                    description: description.into(),
+                }]),
+                uuid: None,
+                cost: None,
+            }
+        }
     }
 
     // ---- Cost / usage ----------------------------------------------------
@@ -470,6 +598,9 @@ pub mod config {
         pub project_dir: Option<PathBuf>,
         #[serde(default)]
         pub workspace_paths: Vec<PathBuf>,
+        /// Additional directories granted access via --add-dir.
+        #[serde(default)]
+        pub additional_dirs: Vec<PathBuf>,
         /// Event hooks: map of event → list of hook commands.
         #[serde(default)]
         pub hooks: HashMap<HookEvent, Vec<HookEntry>>,
@@ -541,6 +672,13 @@ pub mod config {
         /// Names of plugins that have been explicitly disabled by the user.
         #[serde(default, rename = "disabledPlugins")]
         pub disabled_plugins: std::collections::HashSet<String>,
+        /// Whether the user has completed the first-launch onboarding flow.
+        /// Mirrors TS `hasAcknowledgedSafetyNotice` / `hasCompletedOnboarding`.
+        #[serde(default, rename = "hasCompletedOnboarding")]
+        pub has_completed_onboarding: bool,
+        /// App version at last launch — used to detect upgrades and show release notes.
+        #[serde(default, rename = "lastSeenVersion")]
+        pub last_seen_version: Option<String>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -757,7 +895,8 @@ pub mod constants {
     pub const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
     pub const ANTHROPIC_API_VERSION: &str = "2023-06-01";
     pub const ANTHROPIC_BETA_HEADER: &str =
-        "interleaved-thinking-2025-05-14,token-efficient-tools-2025-02-19,files-api-2025-04-14";
+        "interleaved-thinking-2025-05-14,token-efficient-tools-2025-02-19,files-api-2025-04-14,\
+         effort-2025-11-24,task-budgets-2026-03-13";
 
     // File system
     pub const CLAUDE_MD_FILENAME: &str = "CLAUDE.md";
@@ -828,7 +967,7 @@ pub mod context {
             self
         }
 
-        /// System context (git status, platform, etc.)
+        /// System context (git status, platform, IDE, etc.)
         pub async fn build_system_context(&self) -> String {
             let mut parts = vec![];
 
@@ -841,6 +980,12 @@ pub mod context {
 
             if let Some(git_context) = self.get_git_context().await {
                 parts.push(git_context);
+            }
+
+            // IDE context — injected when an IDE extension is connected.
+            // Mirrors TS getContextAttachments() → IdeContext attachment.
+            if let Some(ide_ctx) = crate::attachments::get_ide_context() {
+                parts.push(format!("# IDE Context\n{}", ide_ctx));
             }
 
             parts.join("\n\n")

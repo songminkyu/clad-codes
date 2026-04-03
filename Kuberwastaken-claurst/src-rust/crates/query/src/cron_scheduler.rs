@@ -108,6 +108,12 @@ async fn run_scheduler_loop(
                     QueryOutcome::Cancelled => {
                         debug!(id = %task_id, "Cron task cancelled");
                     }
+                    QueryOutcome::BudgetExceeded { cost_usd, limit_usd } => {
+                        eprintln!(
+                            "[cron] task {} budget exceeded: spent ${:.4} of ${:.4}",
+                            task_id, cost_usd, limit_usd
+                        );
+                    }
                 }
             });
         }

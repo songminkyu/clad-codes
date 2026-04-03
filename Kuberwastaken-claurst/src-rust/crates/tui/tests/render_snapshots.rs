@@ -7,6 +7,7 @@ use cc_tui::messages::{
     render_compact_boundary, render_summary_message,
     render_unseen_divider, render_system_message, render_thinking_block,
     render_rate_limit_banner, render_hook_progress, render_code_block,
+    render_user_command, render_user_memory_input, render_user_local_command_output,
     RenderContext,
 };
 
@@ -210,4 +211,79 @@ fn code_block_shows_language_and_code() {
     let lines = render_code_block(Some("rust"), "fn main() {}", 80);
     let combined = flatten(&lines);
     assert!(combined.contains("rust") && combined.contains("fn main()"));
+}
+
+// ---------------------------------------------------------------------------
+// UserLocalCommandOutput
+// ---------------------------------------------------------------------------
+
+#[test]
+fn user_local_command_output_shows_command_header() {
+    let lines = render_user_local_command_output("ls -la", "file1\nfile2", 30);
+    assert!(!lines.is_empty());
+    let combined = flatten(&lines);
+    assert!(combined.contains("ls -la"));
+}
+
+#[test]
+fn user_local_command_output_shows_output_lines() {
+    let lines = render_user_local_command_output("echo hi", "hello world", 30);
+    let combined = flatten(&lines);
+    assert!(combined.contains("hello world"));
+}
+
+#[test]
+fn user_local_command_output_truncates_at_max_lines() {
+    let output = (0..50).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
+    let lines = render_user_local_command_output("cmd", &output, 10);
+    let combined = flatten(&lines);
+    assert!(combined.contains("more lines"));
+}
+
+// ---------------------------------------------------------------------------
+// UserCommandMessage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn user_command_shows_chevron_and_name() {
+    let lines = render_user_command("doctor", "");
+    assert_eq!(lines.len(), 1);
+    let combined = flatten(&lines);
+    assert!(combined.contains('\u{25b8}'));
+    assert!(combined.contains("doctor"));
+}
+
+#[test]
+fn user_command_shows_args() {
+    let lines = render_user_command("skill", "--verbose");
+    let combined = flatten(&lines);
+    assert!(combined.contains("skill"));
+    assert!(combined.contains("--verbose"));
+}
+
+// ---------------------------------------------------------------------------
+// UserMemoryInputMessage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn user_memory_input_shows_key_value() {
+    let lines = render_user_memory_input("preferred_language", "Rust");
+    assert!(lines.len() >= 2);
+    let combined = flatten(&lines);
+    assert!(combined.contains("preferred_language"));
+    assert!(combined.contains("Rust"));
+}
+
+#[test]
+fn user_memory_input_shows_got_it_footer() {
+    let lines = render_user_memory_input("name", "Alice");
+    let combined = flatten(&lines);
+    assert!(combined.contains("Got it."));
+}
+
+#[test]
+fn user_memory_input_hash_prefix() {
+    let lines = render_user_memory_input("key", "val");
+    let first_line = flatten(&lines[..1]);
+    assert!(first_line.contains('#'));
 }

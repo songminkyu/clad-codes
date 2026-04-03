@@ -304,6 +304,19 @@ mod sse_parser {
 }
 
 // ---------------------------------------------------------------------------
+// Models endpoint types (public)
+// ---------------------------------------------------------------------------
+
+/// A model entry returned by `GET /v1/models`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct AvailableModel {
+    pub id: String,
+    pub display_name: Option<String>,
+    /// Unix timestamp of when the model was created (seconds).
+    pub created_at: Option<i64>,
+}
+
+// ---------------------------------------------------------------------------
 // Anthropic client
 // ---------------------------------------------------------------------------
 pub mod client {
@@ -434,6 +447,43 @@ pub mod client {
             });
 
             Ok(rx)
+        }
+
+        // ---- Models list ------------------------------------------------
+
+        /// Fetch available models from `GET /v1/models`.
+        ///
+        /// Returns a list of models the current API key has access to.
+        /// Falls back gracefully: returns an empty `Vec` on any error so
+        /// callers can fall back to the hardcoded default list instead of
+        /// surfacing an error.
+        pub async fn fetch_available_models(&self) -> anyhow::Result<Vec<crate::AvailableModel>> {
+            let url = format!("{}/v1/models", self.config.api_base);
+
+            let mut req = self
+                .http
+                .get(&url)
+                .header("anthropic-version", &self.config.api_version)
+                .header("content-type", "application/json");
+            req = if self.config.use_bearer_auth {
+                req.header("Authorization", format!("Bearer {}", &self.config.api_key))
+            } else {
+                req.header("x-api-key", &self.config.api_key)
+            };
+
+            let resp = req.send().await?;
+
+            if !resp.status().is_success() {
+                anyhow::bail!("models endpoint returned {}", resp.status());
+            }
+
+            #[derive(serde::Deserialize)]
+            struct ModelsResponse {
+                data: Vec<crate::AvailableModel>,
+            }
+
+            let body: ModelsResponse = resp.json().await?;
+            Ok(body.data)
         }
 
         // ---- Internal helpers --------------------------------------------

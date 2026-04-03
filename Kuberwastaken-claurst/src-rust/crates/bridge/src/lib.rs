@@ -869,6 +869,316 @@ async fn start_bridge_with_client(
 }
 
 // ---------------------------------------------------------------------------
+// High-level session API (start_bridge_session / poll / respond)
+// ---------------------------------------------------------------------------
+
+/// Information about a newly registered bridge session, returned by
+/// [`start_bridge_session`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BridgeSessionInfo {
+    /// UUID assigned to this session.
+    pub session_id: String,
+    /// Full URL that can be shared with others to open the session in a browser.
+    pub session_url: String,
+    /// The auth token used for this session (redacted in Display).
+    pub token: String,
+}
+
+impl std::fmt::Display for BridgeSessionInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BridgeSessionInfo {{ session_id: {}, session_url: {} }}", self.session_id, self.session_url)
+    }
+}
+
+/// A message returned by [`poll_bridge_messages`]: an inbound item from the
+/// remote peer identified by a string `id`, `role`, and `content`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimpleMessage {
+    /// Server-assigned message identifier.
+    pub id: String,
+    /// Sender role (`"user"` or `"assistant"`).
+    pub role: String,
+    /// Message text content.
+    pub content: String,
+}
+
+/// Start a bridge session: generate a session ID, register it with the
+/// Anthropic API, and return session info including the shareable URL.
+///
+/// # Authentication
+///
+/// Reads the bearer token from (in order of precedence):
+/// 1. `CLAUDE_CODE_BRIDGE_TOKEN` environment variable
+/// 2. `CLAUDE_BRIDGE_OAUTH_TOKEN` environment variable
+///
+/// If no token is found, returns an informative error.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - No auth token is available
+/// - The HTTP POST fails or the server returns a non-2xx status
+/// - The server URL is not configured
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// match cc_bridge::start_bridge_session(None).await {
+///     Ok(info) => println!("Session URL: {}", info.session_url),
+///     Err(e) => eprintln!("Could not start bridge: {e}"),
+/// }
+/// # });
+/// ```
+pub async fn start_bridge_session(
+    token_override: Option<String>,
+) -> anyhow::Result<BridgeSessionInfo> {
+    // Resolve auth token.
+    let token = token_override
+        .or_else(|| std::env::var("CLAUDE_CODE_BRIDGE_TOKEN").ok())
+        .or_else(|| std::env::var("CLAUDE_BRIDGE_OAUTH_TOKEN").ok())
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Remote Control requires a session token.\n\
+                 Set CLAUDE_CODE_BRIDGE_TOKEN=<your-token> to enable.\n\
+                 Get a token from https://claude.ai (Settings → Remote Control).\n\
+                 Note: Remote Control is only available with claude.ai subscriptions."
+            )
+        })?;
+
+    // Resolve server base URL.
+    let server_url = std::env::var("CLAUDE_CODE_BRIDGE_URL")
+        .or_else(|_| std::env::var("CLAUDE_BRIDGE_BASE_URL"))
+        .unwrap_or_else(|_| "https://claude.ai".to_string());
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+
+    let hostname = {
+        hostname::get()
+            .map(|h| h.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "unknown".to_string())
+    };
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(format!("claude-code-rust/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("start_bridge_session: failed to build HTTP client")?;
+
+    let register_url = format!("{}/api/bridge/sessions", server_url);
+
+    debug!(
+        session_id = %session_id,
+        url = %register_url,
+        "Registering new bridge session"
+    );
+
+    let body = serde_json::json!({
+        "session_id": session_id,
+        "hostname": hostname,
+        "client_version": env!("CARGO_PKG_VERSION"),
+        "device_id": device_fingerprint(),
+    });
+
+    let resp = http
+        .post(&register_url)
+        .bearer_auth(&token)
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", "environments-2025-11-01")
+        .json(&body)
+        .send()
+        .await
+        .context("start_bridge_session: HTTP POST failed")?;
+
+    let status = resp.status().as_u16();
+
+    match status {
+        200 | 201 => {
+            info!(session_id = %session_id, "Bridge session registered successfully");
+        }
+        401 | 403 => {
+            anyhow::bail!(
+                "Bridge session registration failed: authentication error (HTTP {}).\n\
+                 Your token may be invalid or expired.\n\
+                 Get a new token from https://claude.ai (Settings → Remote Control).",
+                status
+            );
+        }
+        404 => {
+            // The /api/bridge/sessions endpoint may not exist in all deployments.
+            // Fall through to synthetic session URL (best-effort mode).
+            warn!(
+                session_id = %session_id,
+                "Bridge registration endpoint not found (HTTP 404) — \
+                 using local session ID without server validation"
+            );
+        }
+        _ => {
+            let body_text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Bridge session registration failed: server returned HTTP {}. {}",
+                status,
+                if body_text.is_empty() { String::new() } else { format!("Response: {}", &body_text[..body_text.len().min(200)]) }
+            );
+        }
+    }
+
+    // Build the shareable session URL.
+    let session_url = format!("{}/code/sessions/{}", server_url, session_id);
+
+    Ok(BridgeSessionInfo {
+        session_id,
+        session_url,
+        token,
+    })
+}
+
+/// Poll for incoming messages on an active bridge session.
+///
+/// GETs `/api/bridge/sessions/<id>/messages?since=<last_msg_id>` and returns
+/// the batch of new messages. Uses a 30-second HTTP timeout. On HTTP 429
+/// (rate-limited) the function sleeps with exponential back-off before
+/// retrying (up to 3 attempts).
+///
+/// Returns an empty `Vec` when there are no new messages (HTTP 204 or empty
+/// body).
+pub async fn poll_bridge_messages(
+    info: &BridgeSessionInfo,
+    since_id: Option<&str>,
+) -> anyhow::Result<Vec<SimpleMessage>> {
+    let server_url = std::env::var("CLAUDE_CODE_BRIDGE_URL")
+        .or_else(|_| std::env::var("CLAUDE_BRIDGE_BASE_URL"))
+        .unwrap_or_else(|_| "https://claude.ai".to_string());
+
+    // Validate session_id before interpolating into URL.
+    BridgeConfig::validate_id(&info.session_id, "session_id")?;
+
+    let base_url = format!(
+        "{}/api/bridge/sessions/{}/messages",
+        server_url, info.session_id
+    );
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(35))
+        .user_agent(format!("claude-code-rust/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("poll_bridge_messages: failed to build HTTP client")?;
+
+    // Retry loop for 429 back-off.
+    let max_retries = 3u32;
+    let mut attempt = 0u32;
+    loop {
+        let mut request = http
+            .get(&base_url)
+            .bearer_auth(&info.token)
+            .header("anthropic-version", "2023-06-01");
+
+        if let Some(since) = since_id {
+            request = request.query(&[("since", since)]);
+        }
+
+        let resp = request
+            .send()
+            .await
+            .context("poll_bridge_messages: HTTP GET failed")?;
+
+        let status = resp.status().as_u16();
+        match status {
+            200 => {
+                let text = resp.text().await.context("poll_bridge_messages: reading body")?;
+                if text.trim().is_empty() || text.trim() == "[]" {
+                    return Ok(vec![]);
+                }
+                let msgs: Vec<SimpleMessage> =
+                    serde_json::from_str(&text).context("poll_bridge_messages: JSON parse")?;
+                return Ok(msgs);
+            }
+            204 => return Ok(vec![]),
+            429 => {
+                attempt += 1;
+                if attempt > max_retries {
+                    anyhow::bail!("poll_bridge_messages: rate-limited (HTTP 429) after {} retries", max_retries);
+                }
+                let backoff = std::time::Duration::from_millis(1_000 * 2u64.pow(attempt - 1));
+                warn!(attempt, "Bridge poll rate-limited; backing off {:?}", backoff);
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+            401 | 403 => {
+                anyhow::bail!("poll_bridge_messages: auth error (HTTP {})", status);
+            }
+            _ => {
+                anyhow::bail!("poll_bridge_messages: server returned HTTP {}", status);
+            }
+        }
+    }
+}
+
+/// Post a response to a specific incoming message on an active bridge session.
+///
+/// PUTs `/api/bridge/sessions/<session_id>/messages/<msg_id>/response` with
+/// a JSON body `{"content": "<response>", "done": true}`.
+pub async fn post_bridge_response(
+    info: &BridgeSessionInfo,
+    msg_id: &str,
+    content: &str,
+    done: bool,
+) -> anyhow::Result<()> {
+    let server_url = std::env::var("CLAUDE_CODE_BRIDGE_URL")
+        .or_else(|_| std::env::var("CLAUDE_BRIDGE_BASE_URL"))
+        .unwrap_or_else(|_| "https://claude.ai".to_string());
+
+    // Validate IDs before URL interpolation.
+    BridgeConfig::validate_id(&info.session_id, "session_id")?;
+    BridgeConfig::validate_id(msg_id, "msg_id")?;
+
+    let url = format!(
+        "{}/api/bridge/sessions/{}/messages/{}/response",
+        server_url, info.session_id, msg_id
+    );
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(format!("claude-code-rust/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("post_bridge_response: failed to build HTTP client")?;
+
+    let body = serde_json::json!({
+        "content": content,
+        "done": done,
+    });
+
+    debug!(
+        session_id = %info.session_id,
+        msg_id = %msg_id,
+        done = done,
+        "Posting bridge response"
+    );
+
+    let resp = http
+        .put(&url)
+        .bearer_auth(&info.token)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await
+        .context("post_bridge_response: HTTP PUT failed")?;
+
+    let status = resp.status().as_u16();
+    if resp.status().is_success() {
+        debug!(session_id = %info.session_id, msg_id = %msg_id, "Bridge response posted");
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "post_bridge_response: server returned HTTP {} for msg {}",
+            status,
+            msg_id
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TUI-facing bridge event types (bridge → TUI state machine)
 // ---------------------------------------------------------------------------
 

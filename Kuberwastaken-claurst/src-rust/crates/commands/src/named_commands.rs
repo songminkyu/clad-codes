@@ -631,49 +631,91 @@ impl NamedCommand for DesktopCommand {
     fn usage(&self) -> &str { "claude desktop" }
 
     fn execute_named(&self, _args: &[&str], ctx: &CommandContext) -> CommandResult {
-        // If a bridge/remote session is already active, the user is already
-        // connected to Claude Desktop.
-        if ctx.remote_session_url.is_some() {
-            return CommandResult::Message(
-                "\u{2713} Already connected to Claude Desktop\n\n\
-                 Your Claude Code session is synced with Claude Desktop.\n\
-                 Visit https://claude.ai/download to manage your installation."
-                    .to_string(),
-            );
-        }
-
-        // Detect platform at compile-time (std::env::consts is equivalent for
-        // static strings, but cfg!() works at compile time without an import).
         let os = std::env::consts::OS;
         let arch = std::env::consts::ARCH;
-
         let download_url = "https://claude.ai/download";
 
+        // Detect if Claude Desktop is likely installed (platform-specific heuristic).
+        let desktop_likely_installed = match os {
+            "macos" => {
+                std::path::Path::new("/Applications/Claude.app").exists()
+                    || std::path::Path::new(&format!(
+                        "{}/Applications/Claude.app",
+                        std::env::var("HOME").unwrap_or_default()
+                    ))
+                    .exists()
+            }
+            "windows" => {
+                std::env::var("LOCALAPPDATA")
+                    .map(|p| std::path::Path::new(&p).join("Programs/Claude/Claude.exe").exists())
+                    .unwrap_or(false)
+                    || std::path::Path::new("C:\\Program Files\\Claude\\Claude.exe").exists()
+            }
+            _ => false,
+        };
+
+        // If a remote session is active the user is already bridged — show a
+        // deep link so they can open the current session in Desktop.
+        if let Some(ref session_url) = ctx.remote_session_url {
+            let session_id = session_url.split('/').last().unwrap_or("");
+            let deep_link = format!("claude://session/{}", session_id);
+
+            let mut msg = String::new();
+            msg.push_str("\u{2713} Already connected to Claude Desktop\n\n");
+            msg.push_str("Your Claude Code session is synced with Claude Desktop.\n\n");
+            msg.push_str(&format!("Open this session in Desktop: {deep_link}\n\n"));
+            if desktop_likely_installed {
+                msg.push_str("Claude Desktop is installed on this machine.\n");
+                msg.push_str(&format!("Manage your installation: {download_url}"));
+            } else {
+                msg.push_str(&format!("Download / manage Desktop: {download_url}"));
+            }
+            return CommandResult::Message(msg);
+        }
+
         let msg = if os == "macos" {
-            format!(
-                "Open Claude Desktop \u{2014} macOS\n\n\
-                 Download: {download_url}\n\n\
-                 Setup instructions:\n\
-                 1. Download and install Claude Desktop for macOS\n\
-                 2. Open Claude Desktop and sign in with the same Anthropic account\n\
-                 3. Claude Code will detect the Desktop bridge automatically"
-            )
+            if desktop_likely_installed {
+                format!(
+                    "Open Claude Desktop \u{2014} macOS\n\n\
+                     Claude Desktop appears to be installed.\n\
+                     Launch it from /Applications/Claude.app and sign in with your Anthropic account.\n\n\
+                     Download / update: {download_url}"
+                )
+            } else {
+                format!(
+                    "Download Claude Desktop \u{2014} macOS\n\n\
+                     Download: {download_url}\n\n\
+                     Setup instructions:\n\
+                     1. Download and install Claude Desktop for macOS\n\
+                     2. Open Claude Desktop and sign in with the same Anthropic account\n\
+                     3. Claude Code will detect the Desktop bridge automatically"
+                )
+            }
         } else if os == "windows" {
             let arch_note = if arch == "x86_64" { " (x64)" } else { "" };
-            format!(
-                "Download Claude Desktop for Windows{arch_note}\n\n\
-                 Download: {download_url}\n\n\
-                 Setup instructions:\n\
-                 1. Download and run the Claude Desktop installer\n\
-                 2. Open Claude Desktop and sign in with the same Anthropic account\n\
-                 3. Claude Code will detect the Desktop bridge automatically"
-            )
+            if desktop_likely_installed {
+                format!(
+                    "Open Claude Desktop \u{2014} Windows{arch_note}\n\n\
+                     Claude Desktop appears to be installed.\n\
+                     Launch it from your Start menu and sign in with your Anthropic account.\n\n\
+                     Download / update: {download_url}"
+                )
+            } else {
+                format!(
+                    "Download Claude Desktop for Windows{arch_note}\n\n\
+                     Download: {download_url}\n\n\
+                     Setup instructions:\n\
+                     1. Download and run the Claude Desktop installer\n\
+                     2. Open Claude Desktop and sign in with the same Anthropic account\n\
+                     3. Claude Code will detect the Desktop bridge automatically"
+                )
+            }
         } else {
             // Linux and other platforms
             format!(
                 "Claude Desktop is not yet available for {os}\n\n\
                  On Linux, you can use Claude Code via the CLI or visit https://claude.ai in your browser.\n\
-                 Check https://claude.ai/download for the latest platform availability."
+                 Check {download_url} for the latest platform availability."
             )
         };
 
@@ -685,34 +727,58 @@ impl NamedCommand for DesktopCommand {
 // mobile — helper
 // ---------------------------------------------------------------------------
 
-/// Generate a placeholder ASCII QR-code-like block pattern.
+/// Render a URL as a real QR code using Unicode half-block characters.
 ///
-/// Produces a 15-row grid using Unicode block characters (`\u{2588}` full block
-/// and space) arranged to look like a real QR code finder pattern.  The `url`
-/// parameter is incorporated as a comment but does not affect the pixel layout
-/// (a real QR encoder would be needed for that).
-fn ascii_qr_placeholder(_url: &str) -> Vec<String> {
-    // Each row is 15 chars wide.  1 = filled (\u{2588}), 0 = space.
-    // Rows are designed to mimic QR finder squares in the corners plus some
-    // pseudo-random data in the centre.
-    let rows: &[&str] = &[
-        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}",
-        "\u{2588}     \u{2588} \u{2588} \u{2588} \u{2588} \u{2588}     \u{2588}",
-        "\u{2588} \u{2588}\u{2588}\u{2588}\u{2588} \u{2588} \u{2588}\u{2588}\u{2588} \u{2588} \u{2588} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588} \u{2588}",
-        "\u{2588} \u{2588}\u{2588}\u{2588}\u{2588} \u{2588} \u{2588} \u{2588}\u{2588} \u{2588} \u{2588} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588} \u{2588}",
-        "\u{2588} \u{2588}\u{2588}\u{2588}\u{2588} \u{2588} \u{2588}\u{2588}  \u{2588} \u{2588} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588} \u{2588}",
-        "\u{2588}     \u{2588}  \u{2588}\u{2588}\u{2588}\u{2588}  \u{2588} \u{2588}     \u{2588}",
-        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588} \u{2588} \u{2588} \u{2588} \u{2588} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}",
-        " \u{2588}\u{2588}  \u{2588}\u{2588}\u{2588} \u{2588}\u{2588} \u{2588}\u{2588} \u{2588}\u{2588}  \u{2588} ",
-        "\u{2588}\u{2588}\u{2588}\u{2588}  \u{2588}\u{2588}\u{2588}  \u{2588}\u{2588}\u{2588} \u{2588}\u{2588}\u{2588}\u{2588}  ",
-        " \u{2588}  \u{2588}  \u{2588} \u{2588}\u{2588}\u{2588}  \u{2588} \u{2588}  \u{2588}\u{2588}",
-        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}  \u{2588}\u{2588}  \u{2588}  \u{2588}  \u{2588}\u{2588}",
-        "\u{2588}     \u{2588} \u{2588} \u{2588} \u{2588}\u{2588}  \u{2588} \u{2588}\u{2588}\u{2588}",
-        "\u{2588} \u{2588}\u{2588}\u{2588}\u{2588} \u{2588} \u{2588}\u{2588}\u{2588}  \u{2588}\u{2588} \u{2588}  \u{2588}",
-        "\u{2588}     \u{2588} \u{2588}\u{2588}  \u{2588} \u{2588}\u{2588} \u{2588}\u{2588}\u{2588} ",
-        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588} \u{2588}  \u{2588}\u{2588}\u{2588}  \u{2588}\u{2588}\u{2588}\u{2588}",
-    ];
-    rows.iter().map(|r| r.to_string()).collect()
+/// Uses the `qrcode` crate to encode the URL, then converts the bit matrix
+/// to lines of "▀" / "▄" / "█" / " " so that two QR rows are packed into
+/// one terminal line (each cell is rendered as a half-block character).
+/// This matches the approach used by many CLI QR renderers and fits in ~40
+/// terminal columns for typical short URLs.
+pub fn render_qr(url: &str) -> Vec<String> {
+    use qrcode::{EcLevel, QrCode};
+
+    let code = match QrCode::with_error_correction_level(url.as_bytes(), EcLevel::L) {
+        Ok(c) => c,
+        Err(_) => return vec!["[QR generation failed]".to_string()],
+    };
+
+    let matrix = code.to_colors();
+    let width = code.width();
+
+    // Add a 2-module quiet zone on each side (QR spec requires ≥4, but 2 renders fine).
+    let qz = 2usize;
+    let padded_width = width + qz * 2;
+
+    // Helper: return true if module at (row, col) is dark, treating the quiet zone as light.
+    let dark = |row: isize, col: isize| -> bool {
+        if row < 0 || col < 0 || row >= width as isize || col >= width as isize {
+            return false;
+        }
+        matrix[row as usize * width + col as usize] == qrcode::Color::Dark
+    };
+
+    let mut lines = Vec::new();
+    // Iterate two matrix rows per terminal line.
+    let total_rows = (width + qz * 2) as isize;
+    let mut r: isize = -(qz as isize);
+    while r < (width + qz) as isize {
+        let mut line = String::new();
+        for c in -(qz as isize)..(width + qz) as isize {
+            let top  = dark(r,     c);
+            let bot  = dark(r + 1, c);
+            line.push(match (top, bot) {
+                (true,  true)  => '█',
+                (true,  false) => '▀',
+                (false, true)  => '▄',
+                (false, false) => ' ',
+            });
+        }
+        lines.push(line);
+        r += 2;
+    }
+    let _ = padded_width; // suppress unused warning
+    let _ = total_rows;
+    lines
 }
 
 // ---------------------------------------------------------------------------
@@ -726,24 +792,45 @@ impl NamedCommand for MobileCommand {
     fn description(&self) -> &str { "Download the Claude mobile app" }
     fn usage(&self) -> &str { "claude mobile [ios|android]" }
 
-    fn execute_named(&self, args: &[&str], _ctx: &CommandContext) -> CommandResult {
+    fn execute_named(&self, args: &[&str], ctx: &CommandContext) -> CommandResult {
         let ios_url     = "https://apps.apple.com/app/claude-by-anthropic/id6473753684";
         let android_url = "https://play.google.com/store/apps/details?id=com.anthropic.claude";
         let mobile_url  = "https://claude.ai/mobile";
 
-        // Choose which platform to show the QR for (default: claude.ai/mobile)
-        let (platform_label, qr_url) = match args.first().copied().unwrap_or("") {
-            "ios" | "1"     => ("[1] iOS  (selected)", ios_url),
-            "android" | "2" => ("[2] Android  (selected)", android_url),
-            _               => ("both platforms", mobile_url),
+        let has_session = ctx.remote_session_url.is_some();
+
+        // Build a session URL string upfront (may be empty if no session).
+        let session_qr_url: String = if let Some(ref url) = ctx.remote_session_url {
+            let encoded = urlencoding::encode(url);
+            format!("https://claude.ai/code/mobile?session={}", encoded)
+        } else {
+            String::new()
         };
 
-        let qr_lines = ascii_qr_placeholder(qr_url);
+        // Choose which platform / URL to show the QR for (default: claude.ai/mobile).
+        let (platform_label, qr_url): (&str, &str) = match args.first().copied().unwrap_or("") {
+            "ios" | "1"         => ("[1] iOS  (selected)", ios_url),
+            "android" | "2"     => ("[2] Android  (selected)", android_url),
+            "session" | "3"     => {
+                if has_session {
+                    ("[3] Session  (selected)", session_qr_url.as_str())
+                } else {
+                    ("session link unavailable \u{2014} no active remote session", mobile_url)
+                }
+            }
+            _                   => ("both platforms", mobile_url),
+        };
+
+        let qr_lines = render_qr(qr_url);
 
         let mut out = String::new();
         out.push_str("Scan to download Claude mobile app\n");
         out.push_str(&format!("Platform: {platform_label}\n\n"));
-        out.push_str("  [1] iOS    [2] Android\n\n");
+        if has_session {
+            out.push_str("  [1] iOS    [2] Android    [3] Session (QR links to active session)\n\n");
+        } else {
+            out.push_str("  [1] iOS    [2] Android\n\n");
+        }
 
         // QR block — indent by 2 spaces
         for line in &qr_lines {
@@ -755,6 +842,9 @@ impl NamedCommand for MobileCommand {
         out.push('\n');
         out.push_str(&format!("  iOS:     {ios_url}\n"));
         out.push_str(&format!("  Android: {android_url}\n"));
+        if has_session {
+            out.push_str(&format!("  Session: {}\n", session_qr_url));
+        }
         out.push('\n');
         out.push_str(&format!("Or visit {mobile_url}"));
 
@@ -934,6 +1024,7 @@ mod tests {
             session_id: "named-test-session".to_string(),
             session_title: None,
             remote_session_url: None,
+            mcp_manager: None,
         }
     }
 

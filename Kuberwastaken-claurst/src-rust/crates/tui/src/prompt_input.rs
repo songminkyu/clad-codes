@@ -17,7 +17,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
-const CLAUDE_ORANGE: Color = Color::Rgb(215, 119, 87);
+const CLAUDE_ORANGE: Color = Color::Rgb(233, 30, 99);
 const PROMPT_POINTER: &str = "\u{276f}";
 
 // ---------------------------------------------------------------------------
@@ -31,6 +31,14 @@ pub enum VimMode {
     Insert,
     Normal,
     Visual,
+    /// Linewise visual selection (V).
+    VisualLine,
+    /// Block visual selection (Ctrl+V).
+    VisualBlock,
+    /// Command-line mode (:).
+    Command,
+    /// In-prompt forward search (/).
+    Search,
 }
 
 impl VimMode {
@@ -39,6 +47,10 @@ impl VimMode {
             Self::Insert => "INSERT",
             Self::Normal => "NORMAL",
             Self::Visual => "VISUAL",
+            Self::VisualLine => "VISUAL LINE",
+            Self::VisualBlock => "VISUAL BLOCK",
+            Self::Command => "COMMAND",
+            Self::Search => "SEARCH",
         }
     }
 
@@ -46,7 +58,8 @@ impl VimMode {
         match self {
             Self::Insert => Color::Blue,
             Self::Normal => Color::Green,
-            Self::Visual => Color::Magenta,
+            Self::Visual | Self::VisualLine | Self::VisualBlock => Color::Magenta,
+            Self::Command | Self::Search => Color::Cyan,
         }
     }
 }
@@ -1101,6 +1114,16 @@ pub struct PromptInputState {
     pub vim_dot_action: Option<DotRepeatAction>,
     /// Pending insert-mode text (accumulates between entering and leaving insert mode).
     vim_insert_text_before: Option<String>,
+    /// Command-line buffer for `:` command mode.
+    pub vim_command_buf: String,
+    /// In-prompt search buffer for `/` search mode.
+    pub vim_search_buf: String,
+    /// Last executed search pattern for `n`/`N` navigation.
+    pub vim_search_last: Option<String>,
+    /// Set by `:q`/`:wq` — the app loop should check and honour this.
+    pub vim_quit_requested: bool,
+    /// Pending image attachments (from clipboard paste) to be sent with next message.
+    pub pending_images: Vec<crate::image_paste::PastedImage>,
 }
 
 impl PromptInputState {
@@ -1130,7 +1153,22 @@ impl PromptInputState {
             vim_marks: std::collections::HashMap::new(),
             vim_dot_action: None,
             vim_insert_text_before: None,
+            vim_command_buf: String::new(),
+            vim_search_buf: String::new(),
+            vim_search_last: None,
+            vim_quit_requested: false,
+            pending_images: Vec::new(),
         }
+    }
+
+    /// Add a clipboard image attachment to the pending list.
+    pub fn add_image(&mut self, img: crate::image_paste::PastedImage) {
+        self.pending_images.push(img);
+    }
+
+    /// Drain and return all pending image attachments (called at send time).
+    pub fn clear_images(&mut self) -> Vec<crate::image_paste::PastedImage> {
+        std::mem::take(&mut self.pending_images)
     }
 
     /// Insert a character at cursor position.
@@ -1275,6 +1313,57 @@ impl PromptInputState {
             self.vim_pending = VimPendingState::None;
             self.visual_anchor = None;
             self.normalize();
+            return;
+        }
+
+        // ---- Command-line mode (`:`) ----
+        if self.vim_mode == VimMode::Command {
+            match key {
+                "Backspace" => {
+                    if self.vim_command_buf.is_empty() {
+                        self.vim_mode = VimMode::Normal;
+                    } else {
+                        self.vim_command_buf.pop();
+                    }
+                }
+                "Enter" => {
+                    let cmd = self.vim_command_buf.trim().to_string();
+                    self.vim_command_buf.clear();
+                    self.vim_mode = VimMode::Normal;
+                    self.execute_vim_cmdline(&cmd);
+                }
+                _ if key.len() == 1 => {
+                    self.vim_command_buf.push(key.chars().next().unwrap());
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // ---- In-prompt search mode (`/`) ----
+        if self.vim_mode == VimMode::Search {
+            match key {
+                "Backspace" => {
+                    if self.vim_search_buf.is_empty() {
+                        self.vim_mode = VimMode::Normal;
+                    } else {
+                        self.vim_search_buf.pop();
+                    }
+                }
+                "Enter" => {
+                    let pattern = self.vim_search_buf.clone();
+                    if !pattern.is_empty() {
+                        self.vim_search_last = Some(pattern.clone());
+                        self.vim_search_forward(&pattern, 0);
+                    }
+                    self.vim_search_buf.clear();
+                    self.vim_mode = VimMode::Normal;
+                }
+                _ if key.len() == 1 => {
+                    self.vim_search_buf.push(key.chars().next().unwrap());
+                }
+                _ => {}
+            }
             return;
         }
 
@@ -1469,6 +1558,134 @@ impl PromptInputState {
             self.visual_anchor = Some(self.cursor);
             return;
         }
+        // Enter command-line mode with `:`
+        if key == ":" && self.vim_mode == VimMode::Normal && self.vim_pending == VimPendingState::None {
+            self.vim_mode = VimMode::Command;
+            self.vim_command_buf.clear();
+            return;
+        }
+        // Enter in-prompt search with `/`
+        if key == "/" && self.vim_mode == VimMode::Normal && self.vim_pending == VimPendingState::None {
+            self.vim_mode = VimMode::Search;
+            self.vim_search_buf.clear();
+            return;
+        }
+        // Enter visual-line mode with `V`
+        if key == "V" && self.vim_mode == VimMode::Normal && self.vim_pending == VimPendingState::None {
+            self.vim_mode = VimMode::VisualLine;
+            let ls = self.text[..self.cursor].rfind('\n').map(|p| p + 1).unwrap_or(0);
+            self.visual_anchor = Some(ls);
+            return;
+        }
+        // Enter visual-block mode with Ctrl+V
+        if key == "\x16" && self.vim_mode == VimMode::Normal && self.vim_pending == VimPendingState::None {
+            self.vim_mode = VimMode::VisualBlock;
+            self.visual_anchor = Some(self.cursor);
+            return;
+        }
+        // `n` — repeat last search forward
+        if key == "n" && self.vim_mode == VimMode::Normal && self.vim_pending == VimPendingState::None {
+            if let Some(pat) = self.vim_search_last.clone() {
+                self.vim_search_forward(&pat, 1);
+            }
+            return;
+        }
+        // `N` — repeat last search backward
+        if key == "N" && self.vim_mode == VimMode::Normal && self.vim_pending == VimPendingState::None {
+            if let Some(pat) = self.vim_search_last.clone() {
+                self.vim_search_backward(&pat);
+            }
+            return;
+        }
+        // In visual-line mode, `y`/`d`/`c` operate on whole lines, motion keys extend selection
+        if self.vim_mode == VimMode::VisualLine {
+            if let Some(anchor) = self.visual_anchor {
+                let line_start = |pos: usize, s: &str| -> usize {
+                    s[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0)
+                };
+                let line_end = |pos: usize, s: &str| -> usize {
+                    s[pos..].find('\n').map(|p| pos + p + 1).unwrap_or(s.len())
+                };
+                let sel_start = line_start(anchor.min(self.cursor), &self.text);
+                let sel_end = line_end(anchor.max(self.cursor), &self.text);
+                match key {
+                    "y" => {
+                        self.yank_buf = self.text[sel_start..sel_end].to_string();
+                        self.cursor = sel_start;
+                        self.vim_mode = VimMode::Normal;
+                        self.visual_anchor = None;
+                        return;
+                    }
+                    "d" | "x" => {
+                        self.push_undo();
+                        self.yank_buf = self.text[sel_start..sel_end].to_string();
+                        let char_count = self.yank_buf.chars().count();
+                        self.text.drain(sel_start..sel_end);
+                        self.cursor = sel_start.min(self.text.len());
+                        self.vim_mode = VimMode::Normal;
+                        self.visual_anchor = None;
+                        self.vim_dot_action = Some(DotRepeatAction::DeleteChars { count: char_count });
+                        self.normalize();
+                        return;
+                    }
+                    "c" => {
+                        self.push_undo();
+                        self.yank_buf = self.text[sel_start..sel_end].to_string();
+                        self.text.drain(sel_start..sel_end);
+                        self.cursor = sel_start;
+                        self.vim_mode = VimMode::Insert;
+                        self.visual_anchor = None;
+                        self.vim_insert_text_before = Some(self.text.clone());
+                        self.normalize();
+                        return;
+                    }
+                    _ => {
+                        // Motion keys extend the selection (handled by apply_vim_key below)
+                    }
+                }
+            }
+        }
+        // In visual-block mode, treat like character-wise visual for single-line input
+        if self.vim_mode == VimMode::VisualBlock {
+            if let Some(anchor) = self.visual_anchor {
+                let from = anchor.min(self.cursor);
+                let to_excl = anchor.max(self.cursor);
+                let to = self.text[to_excl..].char_indices().nth(1).map(|(b,_)| to_excl+b).unwrap_or(self.text.len());
+                match key {
+                    "y" => {
+                        self.yank_buf = self.text[from..to].to_string();
+                        self.cursor = from;
+                        self.vim_mode = VimMode::Normal;
+                        self.visual_anchor = None;
+                        return;
+                    }
+                    "d" | "x" => {
+                        self.push_undo();
+                        self.yank_buf = self.text[from..to].to_string();
+                        let char_count = self.yank_buf.chars().count();
+                        self.text.drain(from..to);
+                        self.cursor = from.min(self.text.len());
+                        self.vim_mode = VimMode::Normal;
+                        self.visual_anchor = None;
+                        self.vim_dot_action = Some(DotRepeatAction::DeleteChars { count: char_count });
+                        self.normalize();
+                        return;
+                    }
+                    "c" => {
+                        self.push_undo();
+                        self.yank_buf = self.text[from..to].to_string();
+                        self.text.drain(from..to);
+                        self.cursor = from;
+                        self.vim_mode = VimMode::Insert;
+                        self.visual_anchor = None;
+                        self.vim_insert_text_before = Some(self.text.clone());
+                        self.normalize();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
         // In visual mode, `y`/`d`/`c` operate on the selection, Escape exits
         if self.vim_mode == VimMode::Visual {
             if let Some(anchor) = self.visual_anchor {
@@ -1569,7 +1786,7 @@ impl PromptInputState {
         }
 
         // Update visual anchor tracking when in visual mode
-        if self.vim_mode == VimMode::Visual && self.visual_anchor.is_none() {
+        if (self.vim_mode == VimMode::Visual || self.vim_mode == VimMode::VisualBlock) && self.visual_anchor.is_none() {
             self.visual_anchor = Some(self.cursor);
         }
         self.normalize();
@@ -1635,6 +1852,78 @@ impl PromptInputState {
         self.vim_macro_content.get(&register).cloned().unwrap_or_default()
     }
 
+    // ---- Vim command-line execution ----
+
+    /// Execute a `:` command-line command.
+    /// Recognised: `q`/`quit`, `wq`, `set` (no-op), `noh` (clear search highlight).
+    pub fn execute_vim_cmdline(&mut self, cmd: &str) {
+        match cmd {
+            "q" | "quit" | "wq" | "x" => {
+                // In prompt context we can only signal quit by clearing + a special flag.
+                // We set a dedicated field that the app loop can inspect.
+                self.vim_quit_requested = true;
+            }
+            "noh" | "nohlsearch" => {
+                self.vim_search_last = None;
+            }
+            s if s.starts_with("set ") => {
+                // `:set vim` → enable, `:set novim` → disable (runtime toggle)
+                let arg = s["set ".len()..].trim();
+                match arg {
+                    "vim" => { self.vim_enabled = true; }
+                    "novim" => { self.vim_enabled = false; }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ---- In-prompt search ----
+
+    /// Move cursor to the next occurrence of `pattern` after `cursor + skip`.
+    /// `skip = 0` finds from current position; `skip = 1` finds the *next* one.
+    pub fn vim_search_forward(&mut self, pattern: &str, skip: usize) {
+        if pattern.is_empty() { return; }
+        let start = if skip > 0 {
+            // Start after the current character to avoid re-matching same position
+            let next = self.text[self.cursor..].char_indices().nth(1)
+                .map(|(b, _)| self.cursor + b)
+                .unwrap_or(0);
+            next
+        } else {
+            self.cursor
+        };
+        // Search from `start` forward, then wrap around
+        let text_lc = self.text.to_lowercase();
+        let pat_lc = pattern.to_lowercase();
+        if let Some(pos) = text_lc[start..].find(&pat_lc) {
+            self.cursor = start + pos;
+            return;
+        }
+        // Wrap: search from beginning
+        if let Some(pos) = text_lc.find(&pat_lc) {
+            self.cursor = pos;
+        }
+    }
+
+    /// Move cursor to the previous occurrence of `pattern` before current cursor.
+    pub fn vim_search_backward(&mut self, pattern: &str) {
+        if pattern.is_empty() { return; }
+        let text_lc = self.text.to_lowercase();
+        let pat_lc = pattern.to_lowercase();
+        // Find all occurrences, pick the last one before cursor
+        let before = &text_lc[..self.cursor];
+        if let Some(pos) = before.rfind(&pat_lc) {
+            self.cursor = pos;
+            return;
+        }
+        // Wrap: find last occurrence in whole text
+        if let Some(pos) = text_lc.rfind(&pat_lc) {
+            self.cursor = pos;
+        }
+    }
+
     /// Clear the input and reset state.
     pub fn clear(&mut self) {
         self.text.clear();
@@ -1645,6 +1934,8 @@ impl PromptInputState {
         self.token_estimate = 0;
         self.vim_pending = VimPendingState::None;
         self.visual_anchor = None;
+        self.vim_command_buf.clear();
+        self.vim_search_buf.clear();
     }
 
     /// Take the current text, clearing the input.
@@ -1731,9 +2022,24 @@ impl Default for PromptInputState {
 // Rendering
 // ---------------------------------------------------------------------------
 
+/// Return the number of rows needed to render the input for the given text.
+/// Minimum 4 (1 top-line + 1 text row + 1 bottom-line + 1 breathing room), capped at 12.
+pub fn input_height(state: &PromptInputState) -> u16 {
+    let line_count = if state.text.is_empty() {
+        1
+    } else {
+        state.text.lines().count().max(1)
+    };
+    // top-line + text rows + bottom-line + 1 breathing-room row, at least 4, at most 12
+    let base = ((line_count as u16) + 3).max(4).min(12);
+    // +1 for image pill row when images are pending
+    base + if state.pending_images.is_empty() { 0 } else { 1 }
+}
+
 /// Render the prompt input widget in the same low-chrome style as Claude Code:
-/// one live input row plus an accent underline. Suggestions are rendered by the
-/// footer, not as a boxed dropdown here.
+/// multi-line input rows (one per logical line in the text) plus an accent
+/// underline. Suggestions are rendered by the footer, not as a boxed dropdown
+/// here.
 pub fn render_prompt_input(
     state: &PromptInputState,
     area: Rect,
@@ -1745,26 +2051,47 @@ pub fn render_prompt_input(
         return;
     }
 
+    // If images are pending, render a pill row above everything else and shrink area.
+    let (area, image_row_y) = if !state.pending_images.is_empty() && area.height > 1 {
+        let pill_y = area.y;
+        let rest = Rect { x: area.x, y: area.y + 1, width: area.width, height: area.height - 1 };
+        (rest, Some(pill_y))
+    } else {
+        (area, None)
+    };
+
+    if let Some(pill_y) = image_row_y {
+        let mut pills: Vec<Span<'static>> = Vec::new();
+        for img in &state.pending_images {
+            let label = if let Some((w, h)) = img.dimensions {
+                format!(" \u{f03e} {} {}x{} ", img.label, w, h)  // nerd-font image icon, fallback to plain text
+            } else {
+                format!(" \u{f03e} {} ", img.label)
+            };
+            pills.push(Span::styled(label, Style::default().fg(Color::Black).bg(Color::Cyan)));
+            pills.push(Span::raw(" "));
+        }
+        if !pills.is_empty() {
+            Paragraph::new(Line::from(pills))
+                .render(Rect { x: area.x, y: pill_y, width: area.width, height: 1 }, buf);
+        }
+    }
+
     let accent = match mode {
         InputMode::Readonly => CLAUDE_ORANGE,   // orange = locked while Claude responds
         InputMode::Plan => Color::Yellow,
-        InputMode::Default => {
-            if focused { Color::Cyan } else { Color::DarkGray }
-        }
+        InputMode::Default => CLAUDE_ORANGE,    // always orange regardless of focus
     };
-    let prompt_prefix = if mode == InputMode::Readonly {
-        "x ".to_string()
-    } else {
-        format!("{PROMPT_POINTER} ")
-    };
-    let available_width = area.width.saturating_sub(prompt_prefix.chars().count() as u16) as usize;
+    let prompt_prefix = format!("{PROMPT_POINTER} ");
+    let prefix_width = prompt_prefix.chars().count() as u16;
+    let available_width = area.width.saturating_sub(prefix_width) as usize;
     let cursor = if focused { "\u{2588}" } else { "" };
 
-    let mut content = if state.text.is_empty() {
+    // Build the full content string (with cursor embedded).
+    let full_content: String = if state.text.is_empty() {
         if focused {
             cursor.to_string()
         } else if mode == InputMode::Default {
-            // Only show the placeholder when idle — not while Claude is working.
             "How can I help you?".to_string()
         } else {
             String::new()
@@ -1777,60 +2104,111 @@ pub fn render_prompt_input(
         state.text.clone()
     };
 
-    if content.contains('\n') {
-        let lines: Vec<&str> = content.lines().collect();
-        content = lines.last().copied().unwrap_or_default().to_string();
+    // Top separator line (matches bottom underline — visual "box" around the prompt).
+    if area.height > 0 {
+        Paragraph::new(Line::from(vec![Span::styled(
+            "\u{2500}".repeat(area.width as usize),
+            Style::default().fg(accent),
+        )]))
+        .render(Rect { x: area.x, y: area.y, width: area.width, height: 1 }, buf);
     }
 
-    let visible_content: String = content
-        .chars()
-        .rev()
-        .take(available_width)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+    // Text rows start 1 row below the top separator.
+    let text_start_y = area.y + 1;
 
-        let mut line_spans = vec![Span::styled(
-        prompt_prefix,
-        Style::default().fg(accent).add_modifier(Modifier::BOLD),
-    )];
-    line_spans.push(Span::styled(
-        visible_content,
-        if state.text.is_empty() && !focused {
-            Style::default().fg(Color::DarkGray)
+    // Split into logical lines; guarantee at least one.
+    let logical_lines: Vec<String> = {
+        let collected: Vec<String> = full_content.lines().map(|l| l.to_string()).collect();
+        if collected.is_empty() { vec![String::new()] } else { collected }
+    };
+
+    let text_style = if state.text.is_empty() && !focused {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(Color::White)
+    };
+
+    // Render each logical line (truncated to available width from the right).
+    // Reserve 1 row at top (separator) + 1 at bottom (underline).
+    let max_text_rows = area.height.saturating_sub(2) as usize;
+    for (i, line_text) in logical_lines.iter().enumerate() {
+        if i >= max_text_rows {
+            break;
+        }
+        let row_y = text_start_y + i as u16;
+
+        let visible: String = line_text
+            .chars()
+            .rev()
+            .take(available_width)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
+        let spans: Vec<Span<'static>> = if i == 0 {
+            vec![
+                Span::styled(prompt_prefix.clone(), Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                Span::styled(visible, text_style),
+            ]
         } else {
-            Style::default().fg(Color::White)
-        },
-    ));
+            // Continuation lines: indent to align with text after prefix
+            vec![
+                Span::raw(" ".repeat(prefix_width as usize)),
+                Span::styled(visible, text_style),
+            ]
+        };
 
-    Paragraph::new(Line::from(line_spans)).render(
-        Rect {
-            x: area.x,
-            y: area.y,
-            width: area.width,
-            height: 1,
-        },
-        buf,
-    );
+        Paragraph::new(Line::from(spans)).render(
+            Rect { x: area.x, y: row_y, width: area.width, height: 1 },
+            buf,
+        );
+    }
 
-    if area.height > 1 {
+    // Vim command / search row (shown below text lines, before underline).
+    let text_rows_rendered = logical_lines.len().min(max_text_rows);
+    let cmd_line: Option<Line<'static>> = match state.vim_mode {
+        VimMode::Command => {
+            let buf_text = format!(":{}\u{2588}", state.vim_command_buf);
+            Some(Line::from(vec![Span::styled(buf_text, Style::default().fg(Color::Cyan))]))
+        }
+        VimMode::Search => {
+            let buf_text = format!("/{}\u{2588}", state.vim_search_buf);
+            Some(Line::from(vec![Span::styled(buf_text, Style::default().fg(Color::Yellow))]))
+        }
+        _ => None,
+    };
+
+    let (cmdline_row, underline_row) = if let Some(ref _cl) = cmd_line {
+        let cmd_y = text_start_y + text_rows_rendered as u16;
+        let ul_y = cmd_y + 1;
+        (Some(cmd_y), ul_y)
+    } else {
+        (None, text_start_y + text_rows_rendered as u16)
+    };
+
+    if let (Some(row), Some(cl)) = (cmdline_row, cmd_line) {
+        if row < area.y + area.height {
+            Paragraph::new(cl).render(
+                Rect { x: area.x, y: row, width: area.width, height: 1 },
+                buf,
+            );
+        }
+    }
+
+    if underline_row < area.y + area.height {
         Paragraph::new(Line::from(vec![Span::styled(
             "\u{2500}".repeat(area.width as usize),
             Style::default().fg(accent),
         )]))
         .render(
-            Rect {
-                x: area.x,
-                y: area.y + 1,
-                width: area.width,
-                height: 1,
-            },
+            Rect { x: area.x, y: underline_row, width: area.width, height: 1 },
             buf,
         );
     }
 
-    if state.text.len() > 1000 && area.height > 0 {
+    // Token estimate overlay on the first text row (top-right corner).
+    if state.text.len() > 1000 && area.height > 1 {
         let count_str = format!("~{}t", state.token_estimate);
         let x = area.x + area.width.saturating_sub(count_str.len() as u16);
         Paragraph::new(Line::from(vec![Span::styled(
@@ -1840,7 +2218,7 @@ pub fn render_prompt_input(
         .render(
             Rect {
                 x,
-                y: area.y,
+                y: text_start_y,
                 width: area.width.saturating_sub(x.saturating_sub(area.x)),
                 height: 1,
             },
@@ -2758,5 +3136,201 @@ mod tests {
         s.vim_command(".");
         // The text should be shorter
         assert!(s.text.len() < "lo world".len());
+    }
+
+    // ---- Visual line mode (V) -------------------------------------------
+
+    #[test]
+    fn visual_line_mode_enter() {
+        let mut s = PromptInputState::new();
+        s.vim_mode = VimMode::Normal;
+        s.text = "line one\nline two".to_string();
+        s.cursor = 0;
+        s.vim_command("V");
+        assert_eq!(s.vim_mode, VimMode::VisualLine);
+        assert!(s.visual_anchor.is_some());
+    }
+
+    #[test]
+    fn visual_line_yank() {
+        let mut s = PromptInputState::new();
+        s.vim_mode = VimMode::Normal;
+        s.text = "line one\nline two".to_string();
+        s.cursor = 0;
+        s.vim_command("V");
+        s.vim_command("y");
+        assert_eq!(s.vim_mode, VimMode::Normal);
+        assert_eq!(s.yank_buf, "line one\n");
+    }
+
+    #[test]
+    fn visual_line_delete() {
+        let mut s = PromptInputState::new();
+        s.vim_mode = VimMode::Normal;
+        s.text = "line one\nline two".to_string();
+        s.cursor = 0;
+        s.vim_command("V");
+        s.vim_command("d");
+        assert_eq!(s.vim_mode, VimMode::Normal);
+        assert_eq!(s.text, "line two");
+    }
+
+    #[test]
+    fn visual_line_escape_returns_normal() {
+        let mut s = PromptInputState::new();
+        s.vim_mode = VimMode::Normal;
+        s.text = "hello".to_string();
+        s.vim_command("V");
+        assert_eq!(s.vim_mode, VimMode::VisualLine);
+        s.vim_command("Escape");
+        assert_eq!(s.vim_mode, VimMode::Normal);
+    }
+
+    // ---- Command-line mode (:) ------------------------------------------
+
+    #[test]
+    fn command_line_mode_enter() {
+        let mut s = PromptInputState::new();
+        s.vim_mode = VimMode::Normal;
+        s.vim_command(":");
+        assert_eq!(s.vim_mode, VimMode::Command);
+        assert!(s.vim_command_buf.is_empty());
+    }
+
+    #[test]
+    fn command_line_accumulates_chars() {
+        let mut s = PromptInputState::new();
+        s.vim_mode = VimMode::Normal;
+        s.vim_command(":");
+        s.vim_command("q");
+        assert_eq!(s.vim_command_buf, "q");
+        s.vim_command("!");
+        assert_eq!(s.vim_command_buf, "q!");
+    }
+
+    #[test]
+    fn command_line_backspace_pops() {
+        let mut s = PromptInputState::new();
+        s.vim_mode = VimMode::Normal;
+        s.vim_command(":");
+        s.vim_command("q");
+        s.vim_command("w");
+        s.vim_command("Backspace");
+        assert_eq!(s.vim_command_buf, "q");
+    }
+
+    #[test]
+    fn command_line_empty_backspace_cancels() {
+        let mut s = PromptInputState::new();
+        s.vim_mode = VimMode::Normal;
+        s.vim_command(":");
+        s.vim_command("Backspace");
+        assert_eq!(s.vim_mode, VimMode::Normal);
+    }
+
+    #[test]
+    fn command_q_sets_quit_flag() {
+        let mut s = PromptInputState::new();
+        s.vim_mode = VimMode::Normal;
+        s.vim_command(":");
+        s.vim_command("q");
+        s.vim_command("Enter");
+        assert!(s.vim_quit_requested);
+        assert_eq!(s.vim_mode, VimMode::Normal);
+    }
+
+    #[test]
+    fn command_noh_clears_search() {
+        let mut s = PromptInputState::new();
+        s.vim_search_last = Some("foo".to_string());
+        s.vim_mode = VimMode::Normal;
+        s.vim_command(":");
+        for c in "noh".chars() {
+            s.vim_command(&c.to_string());
+        }
+        s.vim_command("Enter");
+        assert!(s.vim_search_last.is_none());
+    }
+
+    #[test]
+    fn command_escape_cancels() {
+        let mut s = PromptInputState::new();
+        s.vim_mode = VimMode::Normal;
+        s.vim_command(":");
+        s.vim_command("q");
+        s.vim_command("Escape");
+        assert_eq!(s.vim_mode, VimMode::Normal);
+    }
+
+    // ---- In-prompt search (/) -------------------------------------------
+
+    #[test]
+    fn search_mode_enter() {
+        let mut s = PromptInputState::new();
+        s.vim_mode = VimMode::Normal;
+        s.vim_command("/");
+        assert_eq!(s.vim_mode, VimMode::Search);
+        assert!(s.vim_search_buf.is_empty());
+    }
+
+    #[test]
+    fn search_finds_match_and_moves_cursor() {
+        let mut s = PromptInputState::new();
+        s.vim_mode = VimMode::Normal;
+        s.text = "hello world hello".to_string();
+        s.cursor = 0;
+        s.vim_command("/");
+        for c in "world".chars() {
+            s.vim_command(&c.to_string());
+        }
+        s.vim_command("Enter");
+        assert_eq!(s.vim_mode, VimMode::Normal);
+        assert_eq!(s.cursor, 6); // "world" starts at byte 6
+        assert_eq!(s.vim_search_last.as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn search_n_finds_next() {
+        let mut s = PromptInputState::new();
+        s.vim_mode = VimMode::Normal;
+        s.text = "aa bb aa".to_string();
+        s.cursor = 0;
+        s.vim_command("/");
+        s.vim_command("a");
+        s.vim_command("a");
+        s.vim_command("Enter");
+        assert_eq!(s.cursor, 0); // first 'aa'
+        s.vim_command("n");
+        assert_eq!(s.cursor, 6); // second 'aa'
+    }
+
+    #[test]
+    fn search_N_finds_prev() {
+        let mut s = PromptInputState::new();
+        s.vim_mode = VimMode::Normal;
+        s.text = "aa bb aa".to_string();
+        s.cursor = 7; // at second 'aa'
+        s.vim_search_last = Some("aa".to_string());
+        s.vim_command("N");
+        assert_eq!(s.cursor, 0); // wraps to first 'aa'
+    }
+
+    #[test]
+    fn search_escape_cancels() {
+        let mut s = PromptInputState::new();
+        s.vim_mode = VimMode::Normal;
+        s.vim_command("/");
+        s.vim_command("f");
+        s.vim_command("Escape");
+        assert_eq!(s.vim_mode, VimMode::Normal);
+    }
+
+    // ---- VimMode labels -------------------------------------------------
+
+    #[test]
+    fn vim_mode_new_labels() {
+        assert_eq!(VimMode::VisualLine.label(), "VISUAL LINE");
+        assert_eq!(VimMode::Command.label(), "COMMAND");
+        assert_eq!(VimMode::Search.label(), "SEARCH");
     }
 }

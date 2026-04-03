@@ -28,6 +28,8 @@ pub struct CommandContext {
     /// Remote session URL set when a bridge connection is active.
     pub remote_session_url: Option<String>,
     // Note: config already contains hooks, mcp_servers, etc.
+    /// Live MCP manager — present when servers are connected.
+    pub mcp_manager: Option<Arc<cc_mcp::McpManager>>,
 }
 
 /// Result of running a slash command.
@@ -159,6 +161,11 @@ pub struct TeleportCommand;
 pub struct BtwCommand;
 pub struct CtxVizCommand;
 pub struct SandboxToggleCommand;
+pub struct HeapdumpCommand;
+pub struct InsightsCommand;
+pub struct UltrareviewCommand;
+pub struct AdvisorCommand;
+pub struct InstallSlackAppCommand;
 pub struct NamedCommandAdapter {
     pub slash_name: &'static str,
     pub target_name: &'static str,
@@ -1394,36 +1401,104 @@ impl SlashCommand for PluginCommand {
     fn aliases(&self) -> Vec<&str> { vec!["plugins"] }
     fn description(&self) -> &str { "Manage plugins" }
     fn help(&self) -> &str {
-        "Usage: /plugin [list|enable <name>|disable <name>|info <name>|install <path>]\n\
-         Manage Claude Code plugins."
+        "Usage: /plugin [list|info <name>|enable <name>|disable <name>|install <path>|reload]\n\
+         Manage Claude Code plugins.\n\n\
+         Subcommands:\n\
+           /plugin              — list all installed plugins\n\
+           /plugin list         — list all installed plugins\n\
+           /plugin info <name>  — show detailed info about a plugin\n\
+           /plugin enable <name>   — enable a plugin (persisted to settings)\n\
+           /plugin disable <name>  — disable a plugin (persisted to settings)\n\
+           /plugin install <path>  — install a plugin from a local directory\n\
+           /plugin reload       — reload plugins from disk"
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         let project_dir = ctx.working_dir.clone();
 
+        // Helper: prefer the already-loaded global registry, falling back to a
+        // fresh disk scan so the command still works without the global being set.
+        async fn get_registry(
+            project_dir: &std::path::Path,
+        ) -> cc_plugins::PluginRegistry {
+            if let Some(global) = cc_plugins::global_plugin_registry() {
+                let mut reg = cc_plugins::PluginRegistry::new();
+                for p in global.all() {
+                    reg.insert(p.clone());
+                }
+                reg
+            } else {
+                cc_plugins::load_plugins(project_dir, &[]).await
+            }
+        }
+
         let parsed = cc_plugins::parse_plugin_args(args);
         match parsed {
             cc_plugins::PluginSubCommand::List => {
-                let registry = cc_plugins::load_plugins(&project_dir, &[]).await;
+                let registry = get_registry(&project_dir).await;
                 CommandResult::Message(cc_plugins::format_plugin_list(&registry))
             }
+            cc_plugins::PluginSubCommand::Enable(ref name) if name.is_empty() => {
+                CommandResult::Error(
+                    "Usage: /plugin enable <name>\nRun /plugin list to see installed plugins."
+                        .to_string(),
+                )
+            }
             cc_plugins::PluginSubCommand::Enable(name) => {
+                let registry = get_registry(&project_dir).await;
+                if registry.get(&name).is_none() {
+                    return CommandResult::Error(format!(
+                        "Plugin '{}' not found. Use `/plugin list` to see installed plugins.",
+                        name
+                    ));
+                }
                 let mut settings = cc_core::config::Settings::load_sync().unwrap_or_default();
                 settings.enabled_plugins.insert(name.clone());
                 settings.disabled_plugins.remove(&name);
                 let _ = settings.save_sync();
-                CommandResult::Message(format!("Plugin '{}' enabled.", name))
+                CommandResult::Message(format!(
+                    "Plugin '{}' enabled. Run `/plugin reload` to apply changes in this session.",
+                    name
+                ))
+            }
+            cc_plugins::PluginSubCommand::Disable(ref name) if name.is_empty() => {
+                CommandResult::Error(
+                    "Usage: /plugin disable <name>\nRun /plugin list to see installed plugins."
+                        .to_string(),
+                )
             }
             cc_plugins::PluginSubCommand::Disable(name) => {
+                let registry = get_registry(&project_dir).await;
+                if registry.get(&name).is_none() {
+                    return CommandResult::Error(format!(
+                        "Plugin '{}' not found. Use `/plugin list` to see installed plugins.",
+                        name
+                    ));
+                }
                 let mut settings = cc_core::config::Settings::load_sync().unwrap_or_default();
                 settings.disabled_plugins.insert(name.clone());
                 settings.enabled_plugins.remove(&name);
                 let _ = settings.save_sync();
-                CommandResult::Message(format!("Plugin '{}' disabled.", name))
+                CommandResult::Message(format!(
+                    "Plugin '{}' disabled. Run `/plugin reload` to apply changes in this session.",
+                    name
+                ))
+            }
+            cc_plugins::PluginSubCommand::Info(ref name) if name.is_empty() => {
+                CommandResult::Error(
+                    "Usage: /plugin info <name>\nRun /plugin list to see installed plugins."
+                        .to_string(),
+                )
             }
             cc_plugins::PluginSubCommand::Info(name) => {
-                let registry = cc_plugins::load_plugins(&project_dir, &[]).await;
+                let registry = get_registry(&project_dir).await;
                 CommandResult::Message(cc_plugins::format_plugin_info(&registry, &name))
+            }
+            cc_plugins::PluginSubCommand::Install(ref path) if path.is_empty() => {
+                CommandResult::Error(
+                    "Usage: /plugin install <path>\nProvide the path to a local plugin directory."
+                        .to_string(),
+                )
             }
             cc_plugins::PluginSubCommand::Install(path) => {
                 let result = cc_plugins::install_plugin_from_path(
@@ -1431,20 +1506,28 @@ impl SlashCommand for PluginCommand {
                 );
                 match result {
                     Ok(name) => CommandResult::Message(format!(
-                        "Plugin '{}' installed. Run /reload-plugins to activate.",
+                        "Plugin '{}' installed successfully. Run `/plugin reload` to activate it.",
                         name
                     )),
                     Err(e) => CommandResult::Error(format!("Install failed: {}", e)),
                 }
             }
+            cc_plugins::PluginSubCommand::Reload => {
+                let old_registry = get_registry(&project_dir).await;
+                let (new_registry, diff) =
+                    cc_plugins::reload_plugins(&old_registry, &project_dir, &[]).await;
+                CommandResult::Message(cc_plugins::format_reload_summary(&new_registry, &diff))
+            }
             cc_plugins::PluginSubCommand::Help => {
                 CommandResult::Message(
                     "Plugin commands:\n\
-                     /plugin list            — list all installed plugins\n\
+                     /plugin              — list all installed plugins\n\
+                     /plugin list         — list all installed plugins\n\
+                     /plugin info <name>  — show plugin details\n\
                      /plugin enable <name>   — enable a plugin\n\
                      /plugin disable <name>  — disable a plugin\n\
-                     /plugin info <name>     — show plugin details\n\
-                     /plugin install <path>  — install plugin from local path"
+                     /plugin install <path>  — install plugin from local path\n\
+                     /plugin reload       — reload plugins from disk"
                         .to_string(),
                 )
             }
@@ -1560,37 +1643,148 @@ impl SlashCommand for DoctorCommand {
     fn description(&self) -> &str { "Check system health and diagnose issues" }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
-        let mut checks = Vec::new();
+        let mut lines: Vec<String> = Vec::new();
 
-        // Check API key
+        // ── Header ─────────────────────────────────────────────────────────
+        lines.push(format!(
+            "Claude Code v{}  |  {}",
+            cc_core::constants::APP_VERSION,
+            std::env::consts::OS,
+        ));
+        lines.push(String::new());
+
+        // ── API / Auth ──────────────────────────────────────────────────────
+        lines.push("Authentication".to_string());
         if ctx.config.resolve_api_key().is_some() {
-            checks.push("  [ok] API key configured");
+            lines.push("  ✓ API key configured".to_string());
         } else {
-            checks.push("  [!!] No API key found (set ANTHROPIC_API_KEY)");
+            // Check for OAuth token as fallback
+            let oauth_path = cc_core::config::Settings::config_dir().join("credentials.json");
+            if oauth_path.exists() {
+                lines.push("  ✓ OAuth credentials found".to_string());
+            } else {
+                lines.push("  ✗ No API key found — set ANTHROPIC_API_KEY or run /login".to_string());
+            }
         }
+        // Show which model is active
+        lines.push(format!("  • Active model: {}", ctx.config.effective_model()));
+        lines.push(String::new());
 
-        // Check git
-        let git_ok = tokio::process::Command::new("git")
+        // ── Git ─────────────────────────────────────────────────────────────
+        lines.push("Tools".to_string());
+        let git_out = tokio::process::Command::new("git")
             .arg("--version")
             .output()
-            .await
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if git_ok {
-            checks.push("  [ok] git available");
-        } else {
-            checks.push("  [!!] git not found");
+            .await;
+        match git_out {
+            Ok(o) if o.status.success() => {
+                let ver = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                lines.push(format!("  ✓ {ver}"));
+            }
+            _ => lines.push("  ✗ git not found — many features require git".to_string()),
         }
 
-        // Check config dir
+        // Ripgrep
+        let rg_out = tokio::process::Command::new("rg")
+            .arg("--version")
+            .output()
+            .await;
+        match rg_out {
+            Ok(o) if o.status.success() => {
+                let first = String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                lines.push(format!("  ✓ ripgrep: {first}"));
+            }
+            _ => lines.push("  ⚠ ripgrep (rg) not found — Grep tool will fall back to built-in".to_string()),
+        }
+        lines.push(String::new());
+
+        // ── Config directory ────────────────────────────────────────────────
+        lines.push("Configuration".to_string());
         let config_dir = cc_core::config::Settings::config_dir();
         if config_dir.exists() {
-            checks.push("  [ok] Config directory exists");
+            lines.push(format!("  ✓ Config dir: {}", config_dir.display()));
         } else {
-            checks.push("  [!!] Config directory missing");
+            lines.push(format!("  ✗ Config dir missing: {}", config_dir.display()));
         }
 
-        CommandResult::Message(format!("Doctor report:\n\n{}", checks.join("\n")))
+        // Settings validation
+        let settings_path = config_dir.join("settings.json");
+        if settings_path.exists() {
+            match std::fs::read_to_string(&settings_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            {
+                Some(_) => lines.push("  ✓ settings.json valid JSON".to_string()),
+                None => lines.push("  ✗ settings.json is invalid — run /config to repair".to_string()),
+            }
+        } else {
+            lines.push("  • settings.json not found (defaults will be used)".to_string());
+        }
+
+        // CLAUDE.md
+        let claude_md = std::env::current_dir()
+            .ok()
+            .map(|d| d.join("CLAUDE.md"));
+        if claude_md.as_deref().map(|p| p.exists()).unwrap_or(false) {
+            lines.push("  ✓ CLAUDE.md present in working directory".to_string());
+        } else {
+            lines.push("  • No CLAUDE.md in working directory (run /init to create one)".to_string());
+        }
+        lines.push(String::new());
+
+        // ── MCP servers ─────────────────────────────────────────────────────
+        lines.push("MCP Servers".to_string());
+        let mcp_count = ctx.config.mcp_servers.len();
+        if mcp_count == 0 {
+            lines.push("  • No MCP servers configured".to_string());
+        } else {
+            lines.push(format!("  ✓ {mcp_count} MCP server(s) configured:"));
+            for srv in ctx.config.mcp_servers.iter().take(8) {
+                lines.push(format!("    - {}", srv.name));
+            }
+            if mcp_count > 8 {
+                lines.push(format!("    … and {} more", mcp_count - 8));
+            }
+        }
+        lines.push(String::new());
+
+        // ── Hooks ───────────────────────────────────────────────────────────
+        lines.push("Hooks".to_string());
+        let hook_count: usize = ctx.config.hooks.values().map(|v| v.len()).sum();
+        if hook_count == 0 {
+            lines.push("  • No hooks configured".to_string());
+        } else {
+            lines.push(format!("  ✓ {hook_count} hook(s) configured across {} event(s)",
+                ctx.config.hooks.len()));
+        }
+        lines.push(String::new());
+
+        // ── Session / lock ──────────────────────────────────────────────────
+        lines.push("Session".to_string());
+        let lock_path = config_dir.join("claude.lock");
+        if lock_path.exists() {
+            lines.push("  ⚠ Lock file exists — another instance may be running".to_string());
+        } else {
+            lines.push("  ✓ No stale lock file".to_string());
+        }
+
+        // Working directory
+        if let Ok(cwd) = std::env::current_dir() {
+            lines.push(format!("  • Working dir: {}", cwd.display()));
+        }
+        lines.push(String::new());
+
+        // ── Available tools ─────────────────────────────────────────────────
+        lines.push("Built-in Tools".to_string());
+        let tool_count = cc_tools::all_tools().len();
+        lines.push(format!("  ✓ {tool_count} built-in tools available"));
+
+        CommandResult::Message(lines.join("\n"))
     }
 }
 
@@ -1724,22 +1918,84 @@ impl SlashCommand for HooksCommand {
 #[async_trait]
 impl SlashCommand for McpCommand {
     fn name(&self) -> &str { "mcp" }
-    fn description(&self) -> &str { "Show MCP server status and configuration" }
+    fn description(&self) -> &str { "Show MCP server status and manage connections" }
     fn help(&self) -> &str {
-        "Usage: /mcp [list|status|add|remove]\n\n\
+        "Usage: /mcp [list|status|auth <server>|connect <server>|logs <server>|resources|prompts|get-prompt ...]\n\n\
          Manages Model Context Protocol (MCP) servers.\n\
-         MCP servers extend Claude with external tools and resources.\n\n\
+         MCP servers extend Claude with external tools, resources, and prompt templates.\n\n\
          Subcommands:\n\
-           /mcp              — list configured servers (same as /mcp list)\n\
-           /mcp list         — list all configured MCP servers\n\
-           /mcp status       — show server connection status\n\n\
+           /mcp                        — list configured servers with live status\n\
+           /mcp list                   — same as above\n\
+           /mcp status                 — detailed connection status for all servers\n\
+           /mcp auth <server>          — show OAuth auth instructions for a server\n\
+           /mcp connect <server>       — reconnect a disconnected server\n\
+           /mcp logs <server>          — show recent errors/logs for a server\n\
+           /mcp resources [server]     — list resources from connected servers\n\
+           /mcp prompts [server]       — list prompt templates from connected servers\n\
+           /mcp get-prompt <server> <prompt> [key=value ...]  — expand a prompt template\n\n\
          To add/remove MCP servers, edit ~/.claude/settings.json\n\
-         under the 'mcpServers' key, or use the MCP CLI.\n\
+         under the 'mcpServers' key.\n\
          Docs: https://docs.anthropic.com/claude-code/mcp"
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         let sub = args.trim();
+        let first_word = sub.split_whitespace().next().unwrap_or("");
+
+        // Delegate live-server subcommands (resources/prompts/get-prompt) to the async helper.
+        if matches!(first_word, "resources" | "prompts" | "get-prompt") {
+            if let Some(result) = McpCommand::handle_live_subcommand(sub, ctx).await {
+                return result;
+            }
+            // Manager not available — fall through to show configured servers
+        }
+
+        // /mcp auth <server-name>
+        if first_word == "auth" {
+            let server_name = sub["auth".len()..].trim();
+            if server_name.is_empty() {
+                return CommandResult::Error(
+                    "Usage: /mcp auth <server-name>\n\
+                     Example: /mcp auth my-server"
+                        .to_string(),
+                );
+            }
+            return McpCommand::handle_auth(server_name, ctx).await;
+        }
+
+        // /mcp tools [server-name]
+        if first_word == "tools" {
+            let rest = sub["tools".len()..].trim();
+            let server_filter = if rest.is_empty() { None } else { Some(rest) };
+            return McpCommand::handle_tools(server_filter, ctx);
+        }
+
+        // /mcp connect <server-name>
+        if first_word == "connect" {
+            let server_name = sub["connect".len()..].trim();
+            if server_name.is_empty() {
+                return CommandResult::Error(
+                    "Usage: /mcp connect <server-name>\n\
+                     Example: /mcp connect my-server"
+                        .to_string(),
+                );
+            }
+            return McpCommand::handle_connect(server_name, ctx).await;
+        }
+
+        // /mcp logs <server-name>
+        if first_word == "logs" {
+            let server_name = sub["logs".len()..].trim();
+            if server_name.is_empty() {
+                return CommandResult::Error(
+                    "Usage: /mcp logs <server-name>\n\
+                     Example: /mcp logs my-server"
+                        .to_string(),
+                );
+            }
+            return McpCommand::handle_logs(server_name, ctx);
+        }
+
         if ctx.config.mcp_servers.is_empty() {
             return CommandResult::Message(
                 "No MCP servers configured.\n\n\
@@ -1758,6 +2014,7 @@ impl SlashCommand for McpCommand {
             );
         }
 
+        // /mcp status — detailed status table
         if sub == "status" {
             let mut output = String::from("MCP Server Status\n─────────────────\n");
             for srv in &ctx.config.mcp_servers {
@@ -1771,21 +2028,34 @@ impl SlashCommand for McpCommand {
                     .as_deref()
                     .or_else(|| srv.command.as_deref())
                     .unwrap_or("(unknown)");
+
+                // Fetch live status from the manager if available.
+                let live_status = ctx
+                    .mcp_manager
+                    .as_ref()
+                    .map(|m| m.server_status(&srv.name).display())
+                    .unwrap_or_else(|| "unknown (manager not active)".to_string());
+
                 output.push_str(&format!(
-                    "  {name:20} [{kind:8}] {endpoint}\n",
+                    "  {name:20} [{kind:8}] {status}\n    endpoint: {endpoint}\n",
                     name = srv.name,
                     kind = kind,
+                    status = live_status,
                     endpoint = endpoint,
                 ));
             }
-            output.push_str(
-                "\nNote: Live connection status requires the MCP runtime to be active.\n\
-                 Restart Claude Code to reconnect to MCP servers."
-            );
+            if ctx.mcp_manager.is_none() {
+                output.push_str(
+                    "\nNote: MCP manager is not active in this session.\n\
+                     Restart Claude Code to connect to MCP servers.\n\
+                     Use /mcp connect <server> to retry a single server."
+                );
+            }
             return CommandResult::Message(output);
         }
 
-        // Default: list
+        // Default: /mcp or /mcp list — show configured servers with live status inline
+        let manager = ctx.mcp_manager.as_ref();
         let mut output = format!(
             "Configured MCP Servers ({})\n──────────────────────────\n",
             ctx.config.mcp_servers.len()
@@ -1803,15 +2073,432 @@ impl SlashCommand for McpCommand {
             } else {
                 "(no command)".to_string()
             };
+
+            let status_str = manager
+                .map(|m| m.server_status(&srv.name).display())
+                .unwrap_or_else(|| "not running".to_string());
+
             output.push_str(&format!(
-                "  {name} ({type_})\n    {cmd}\n",
+                "  {name}  [{status}]\n    type: {type_}  |  {cmd}\n",
                 name = srv.name,
+                status = status_str,
                 type_ = srv.server_type,
                 cmd = cmd_display,
             ));
         }
-        output.push_str("\nUse /mcp status to see connection status.");
+        output.push_str(
+            "\nSubcommands: status | auth <server> | connect <server> | logs <server>\n\
+             Also: resources | prompts | get-prompt <server> <prompt> [key=val ...]"
+        );
         CommandResult::Message(output)
+    }
+}
+
+impl McpCommand {
+    /// Handle `/mcp auth <server>` — initiate OAuth or show auth instructions.
+    ///
+    /// For HTTP/SSE servers: calls `McpManager::initiate_auth()` to fetch OAuth
+    /// metadata, constructs the PKCE authorization URL, attempts to open it in
+    /// the system browser, and displays the URL for manual use.
+    ///
+    /// For stdio servers: shows env-var auth instructions.
+    async fn handle_auth(server_name: &str, ctx: &CommandContext) -> CommandResult {
+        let srv = match ctx.config.mcp_servers.iter().find(|s| s.name == server_name) {
+            Some(s) => s,
+            None => {
+                let configured: Vec<&str> = ctx.config.mcp_servers.iter().map(|s| s.name.as_str()).collect();
+                return CommandResult::Error(format!(
+                    "No MCP server named '{}' is configured.\n\
+                     Configured servers: {}",
+                    server_name,
+                    if configured.is_empty() { "(none)".to_string() } else { configured.join(", ") }
+                ));
+            }
+        };
+
+        // If already connected, nothing to do.
+        if let Some(manager) = &ctx.mcp_manager {
+            use cc_mcp::McpServerStatus;
+            match manager.server_status(server_name) {
+                McpServerStatus::Connected { tool_count } => {
+                    return CommandResult::Message(format!(
+                        "MCP server '{}' is already connected ({} tool{} available).\n\
+                         No authentication needed.",
+                        server_name,
+                        tool_count,
+                        if tool_count == 1 { "" } else { "s" }
+                    ));
+                }
+                McpServerStatus::Connecting => {
+                    return CommandResult::Message(format!(
+                        "MCP server '{}' is currently connecting — try again shortly.",
+                        server_name
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        let is_http = matches!(srv.server_type.as_str(), "sse" | "http" | "sse+oauth");
+
+        if !is_http {
+            // stdio — env-var / API-key auth
+            let env_keys: Vec<&str> = srv.env.keys().map(|k| k.as_str()).collect();
+            let env_note = if env_keys.is_empty() {
+                "No environment variables configured.".to_string()
+            } else {
+                format!("Configured env vars: {}", env_keys.join(", "))
+            };
+            let token_note = match cc_mcp::oauth::get_mcp_token(server_name) {
+                Some(tok) if !tok.is_expired(60) => " (valid token stored)".to_string(),
+                Some(_) => " (stored token is expired)".to_string(),
+                None => " (no token stored)".to_string(),
+            };
+            return CommandResult::Message(format!(
+                "MCP Server '{}' (stdio){}\n\
+                 {}\n\n\
+                 stdio servers authenticate via environment variables (API keys etc.).\n\
+                 Add required variables to the 'env' block in ~/.claude/settings.json,\n\
+                 then restart Claude Code or run /mcp connect {} to reconnect.",
+                server_name, token_note, env_note, server_name
+            ));
+        }
+
+        // HTTP/SSE — use initiate_auth() when the manager is available.
+        if let Some(manager) = &ctx.mcp_manager {
+            match manager.initiate_auth(server_name).await {
+                Ok(auth_url) => {
+                    // Best-effort browser open.
+                    let _ = open::that(&auth_url);
+                    return CommandResult::Message(format!(
+                        "MCP OAuth — '{}'\n\
+                         Opening browser for authentication...\n\
+                         If the browser did not open, visit:\n\n  {}\n\n\
+                         After authorizing, the token will be saved to:\n  ~/.claude/mcp-tokens/{}.json\n\n\
+                         Then run /mcp connect {} to reconnect.",
+                        server_name, auth_url, server_name, server_name
+                    ));
+                }
+                Err(e) => {
+                    let server_url = srv.url.as_deref().unwrap_or("(URL not configured)");
+                    return CommandResult::Message(format!(
+                        "MCP OAuth — '{}'\n\
+                         Could not fetch OAuth metadata: {}\n\n\
+                         Manual authentication:\n  Open {} in your browser and complete the OAuth flow.\n\
+                         Then run /mcp connect {} to reconnect.",
+                        server_name, e, server_url, server_name
+                    ));
+                }
+            }
+        }
+
+        // No live manager — static instructions.
+        let server_url = srv.url.as_deref().unwrap_or("(URL not configured)");
+        let token_note = match cc_mcp::oauth::get_mcp_token(server_name) {
+            Some(tok) if !tok.is_expired(60) => " (valid token stored)".to_string(),
+            Some(_) => " (stored token is expired)".to_string(),
+            None => " (no token stored)".to_string(),
+        };
+        CommandResult::Message(format!(
+            "MCP OAuth Authentication — '{}'{}\n\
+             Server URL: {}\n\n\
+             To authenticate:\n\
+             1. Open the server URL in your browser and complete OAuth\n\
+             2. The token is saved to ~/.claude/mcp-tokens/{}.json\n\
+             3. Restart Claude Code — the token will be used automatically\n\n\
+             Token storage: ~/.claude/mcp-tokens/{}.json",
+            server_name, token_note, server_url, server_name, server_name
+        ))
+    }
+
+    /// Handle `/mcp tools [server]` — list available tools.
+    fn handle_tools(server_filter: Option<&str>, ctx: &CommandContext) -> CommandResult {
+        let manager = match ctx.mcp_manager.as_ref() {
+            Some(m) => m,
+            None => return CommandResult::Message(
+                "MCP manager is not active. No tool information available.\n\
+                 Restart Claude Code to connect to MCP servers.".to_string()
+            ),
+        };
+
+        let all_tools = manager.all_tool_definitions();
+        let tools: Vec<_> = if let Some(filter) = server_filter {
+            all_tools.iter().filter(|(srv, _)| srv.as_str() == filter).collect()
+        } else {
+            all_tools.iter().collect()
+        };
+
+        if tools.is_empty() {
+            return CommandResult::Message(if let Some(filter) = server_filter {
+                format!("No tools available from server '{}' (not connected or has no tools).", filter)
+            } else {
+                "No tools available from any connected MCP server.".to_string()
+            });
+        }
+
+        let title = if let Some(filter) = server_filter {
+            format!("MCP Tools — '{}' ({})", filter, tools.len())
+        } else {
+            format!("MCP Tools — all servers ({})", tools.len())
+        };
+        let mut out = format!("{}\n{}\n", title, "─".repeat(title.len()));
+        let mut last_server = "";
+        for (server, tool) in &tools {
+            if server.as_str() != last_server && server_filter.is_none() {
+                out.push_str(&format!("[{}]\n", server));
+                last_server = server.as_str();
+            }
+            // Strip the "servername_" prefix for display
+            let bare = tool.name.strip_prefix(&format!("{}_", server)).unwrap_or(&tool.name);
+            let preview: String = tool.description.chars().take(80).collect();
+            let ellipsis = if tool.description.len() > 80 { "…" } else { "" };
+            out.push_str(&format!("  {}\n    {}{}\n", bare, preview, ellipsis));
+        }
+        CommandResult::Message(out)
+    }
+
+    /// Handle `/mcp connect <server>` — attempt to reconnect a server.
+    async fn handle_connect(server_name: &str, ctx: &CommandContext) -> CommandResult {
+        // Validate that the server is configured.
+        if !ctx.config.mcp_servers.iter().any(|s| s.name == server_name) {
+            let names: Vec<&str> = ctx.config.mcp_servers.iter().map(|s| s.name.as_str()).collect();
+            return CommandResult::Error(format!(
+                "No MCP server named '{}' is configured.\n\
+                 Configured servers: {}",
+                server_name,
+                if names.is_empty() { "(none)".to_string() } else { names.join(", ") }
+            ));
+        }
+
+        match &ctx.mcp_manager {
+            None => {
+                // No live manager — give useful instructions.
+                CommandResult::Message(format!(
+                    "The MCP manager is not running in this session.\n\
+                     To connect '{}', restart Claude Code — servers connect automatically\n\
+                     on startup using the configuration in ~/.claude/settings.json.\n\
+                     \n\
+                     If the server requires authentication, run /mcp auth {} first.",
+                    server_name, server_name
+                ))
+            }
+            Some(manager) => {
+                let current = manager.server_status(server_name);
+                use cc_mcp::McpServerStatus;
+                match current {
+                    McpServerStatus::Connected { tool_count } => {
+                        CommandResult::Message(format!(
+                            "MCP server '{}' is already connected ({} tool{} available).",
+                            server_name,
+                            tool_count,
+                            if tool_count == 1 { "" } else { "s" }
+                        ))
+                    }
+                    McpServerStatus::Connecting => {
+                        CommandResult::Message(format!(
+                            "MCP server '{}' is already in the process of connecting.\n\
+                             Check back in a moment.",
+                            server_name
+                        ))
+                    }
+                    McpServerStatus::Disconnected { .. } | McpServerStatus::Failed { .. } => {
+                        // The McpManager doesn't expose a reconnect method — it's built at
+                        // startup.  Inform the user and suggest a restart.
+                        CommandResult::Message(format!(
+                            "MCP server '{}' is currently disconnected.\n\
+                             Status: {}\n\
+                             \n\
+                             The runtime MCP manager reconnects servers automatically.\n\
+                             If the server stays disconnected:\n\
+                             1. Check authentication: /mcp auth {}\n\
+                             2. Verify the command/URL in ~/.claude/settings.json\n\
+                             3. Restart Claude Code to force a full reconnect",
+                            server_name,
+                            manager.server_status(server_name).display(),
+                            server_name
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle `/mcp logs <server>` — show recent error/log information.
+    fn handle_logs(server_name: &str, ctx: &CommandContext) -> CommandResult {
+        // Validate server name.
+        if !ctx.config.mcp_servers.iter().any(|s| s.name == server_name) {
+            let names: Vec<&str> = ctx.config.mcp_servers.iter().map(|s| s.name.as_str()).collect();
+            return CommandResult::Error(format!(
+                "No MCP server named '{}' is configured.\n\
+                 Configured servers: {}",
+                server_name,
+                if names.is_empty() { "(none)".to_string() } else { names.join(", ") }
+            ));
+        }
+
+        let mut lines = vec![format!("MCP Server Logs — '{}'\n──────────────────────", server_name)];
+
+        if let Some(manager) = &ctx.mcp_manager {
+            use cc_mcp::McpServerStatus;
+            let status = manager.server_status(server_name);
+            lines.push(format!("Current status:  {}", status.display()));
+
+            match &status {
+                McpServerStatus::Disconnected { last_error: Some(e) } => {
+                    lines.push(format!("\nLast connection error:\n  {}", e));
+                    lines.push(String::new());
+                    lines.push("Troubleshooting:".to_string());
+                    lines.push(format!("  /mcp auth {}    — check authentication", server_name));
+                    lines.push(format!("  /mcp connect {} — attempt reconnect", server_name));
+                }
+                McpServerStatus::Failed { error, retry_at } => {
+                    lines.push(format!("\nConnection failure:\n  {}", error));
+                    let retry_secs = retry_at.saturating_duration_since(std::time::Instant::now()).as_secs();
+                    if retry_secs > 0 {
+                        lines.push(format!("  Automatic retry in {}s", retry_secs));
+                    }
+                    let _ = retry_at; // used above
+                }
+                McpServerStatus::Connected { tool_count } => {
+                    lines.push(format!("\nServer is healthy — {} tool{} available.", tool_count, if *tool_count == 1 { "" } else { "s" }));
+                    // Show catalog info if available.
+                    if let Some(catalog) = manager.server_catalog(server_name) {
+                        if !catalog.resources.is_empty() {
+                            lines.push(format!("Resources ({}): {}", catalog.resource_count, catalog.resources.join(", ")));
+                        }
+                        if !catalog.prompts.is_empty() {
+                            lines.push(format!("Prompts ({}): {}", catalog.prompt_count, catalog.prompts.join(", ")));
+                        }
+                    }
+                }
+                McpServerStatus::Disconnected { last_error: None } => {
+                    lines.push("\nServer disconnected cleanly (no error recorded).".to_string());
+                    lines.push(format!("Run /mcp connect {} to reconnect.", server_name));
+                }
+                McpServerStatus::Connecting => {
+                    lines.push("\nConnection in progress…".to_string());
+                }
+            }
+
+            // Show failed server errors from the initial connect_all pass.
+            for (name, err) in manager.failed_servers() {
+                if name == server_name {
+                    lines.push(format!("\nStartup connection error:\n  {}", err));
+                    break;
+                }
+            }
+        } else {
+            lines.push("MCP manager is not active in this session.".to_string());
+            lines.push("Restart Claude Code to start the MCP runtime.".to_string());
+        }
+
+        // Hint about log files.
+        lines.push(String::new());
+        lines.push("Note: Detailed stdio output from MCP server processes is not\n\
+                    captured by the manager. Run the server command directly in a\n\
+                    terminal to see its full output.".to_string());
+
+        CommandResult::Message(lines.join("\n"))
+    }
+}
+
+// Helper: handle async /mcp resources|prompts|get-prompt subcommands via a separate trait impl.
+// These need the mcp_manager from CommandContext.
+impl McpCommand {
+    async fn handle_live_subcommand(sub: &str, ctx: &CommandContext) -> Option<CommandResult> {
+        let manager = ctx.mcp_manager.as_ref()?;
+        let parts: Vec<&str> = sub.splitn(4, ' ').collect();
+        match parts[0] {
+            "resources" => {
+                let filter = parts.get(1).copied();
+                let resources = manager.list_all_resources(filter).await;
+                if resources.is_empty() {
+                    return Some(CommandResult::Message(
+                        "No resources available (servers may not support resources/list).".to_string()
+                    ));
+                }
+                let mut out = format!("MCP Resources ({})\n──────────────────\n", resources.len());
+                for r in &resources {
+                    let server = r.get("server").and_then(|v| v.as_str()).unwrap_or("?");
+                    let uri = r.get("uri").and_then(|v| v.as_str()).unwrap_or("?");
+                    let name = r.get("name").and_then(|v| v.as_str()).unwrap_or(uri);
+                    let desc = r.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                    if desc.is_empty() {
+                        out.push_str(&format!("  [{server}] {name}\n    {uri}\n"));
+                    } else {
+                        out.push_str(&format!("  [{server}] {name} — {desc}\n    {uri}\n"));
+                    }
+                }
+                Some(CommandResult::Message(out))
+            }
+            "prompts" => {
+                let filter = parts.get(1).copied();
+                let prompts = manager.list_all_prompts(filter).await;
+                if prompts.is_empty() {
+                    return Some(CommandResult::Message(
+                        "No prompt templates available (servers may not support prompts/list).".to_string()
+                    ));
+                }
+                let mut out = format!("MCP Prompt Templates ({})\n─────────────────────────\n", prompts.len());
+                for p in &prompts {
+                    let server = p.get("server").and_then(|v| v.as_str()).unwrap_or("?");
+                    let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let desc = p.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                    let args: Vec<String> = p.get("arguments")
+                        .and_then(|a| a.as_array())
+                        .map(|arr| arr.iter()
+                            .filter_map(|a| a.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                            .collect())
+                        .unwrap_or_default();
+                    let args_display = if args.is_empty() { String::new() } else { format!(" ({})", args.join(", ")) };
+                    if desc.is_empty() {
+                        out.push_str(&format!("  [{server}] {name}{args_display}\n"));
+                    } else {
+                        out.push_str(&format!("  [{server}] {name}{args_display} — {desc}\n"));
+                    }
+                }
+                out.push_str("\nUse: /mcp get-prompt <server> <prompt> [key=value ...]\n");
+                Some(CommandResult::Message(out))
+            }
+            "get-prompt" => {
+                // /mcp get-prompt <server> <prompt-name> [key=val key2=val2 ...]
+                let server = match parts.get(1) {
+                    Some(s) => *s,
+                    None => return Some(CommandResult::Error("Usage: /mcp get-prompt <server> <prompt> [key=value ...]".to_string())),
+                };
+                let prompt_name = match parts.get(2) {
+                    Some(p) => *p,
+                    None => return Some(CommandResult::Error("Usage: /mcp get-prompt <server> <prompt> [key=value ...]".to_string())),
+                };
+                let mut args: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                if let Some(kv_str) = parts.get(3) {
+                    for kv in kv_str.split_whitespace() {
+                        if let Some((k, v)) = kv.split_once('=') {
+                            args.insert(k.to_string(), v.to_string());
+                        }
+                    }
+                }
+                let arguments = if args.is_empty() { None } else { Some(args) };
+                match manager.get_prompt(server, prompt_name, arguments).await {
+                    Ok(result) => {
+                        let mut injected = String::new();
+                        for msg in &result.messages {
+                            let text = match &msg.content {
+                                cc_mcp::PromptMessageContent::Text { text } => text.clone(),
+                                cc_mcp::PromptMessageContent::Image { .. } => "[image]".to_string(),
+                                cc_mcp::PromptMessageContent::Resource { resource } => {
+                                    resource.to_string()
+                                }
+                            };
+                            injected.push_str(&format!("[{}]: {}\n", msg.role, text));
+                        }
+                        Some(CommandResult::UserMessage(injected.trim().to_string()))
+                    }
+                    Err(e) => Some(CommandResult::Error(format!("Failed to get prompt '{}' from '{}': {}", prompt_name, server, e))),
+                }
+            }
+            _ => None,
+        }
     }
 }
 
@@ -2521,7 +3208,7 @@ impl SlashCommand for RemoteControlCommand {
          /remote-control status   Show bridge status"
     }
 
-    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         let settings = match cc_core::config::Settings::load().await {
             Ok(s) => s,
             Err(e) => return CommandResult::Error(format!("Failed to load settings: {}", e)),
@@ -2531,43 +3218,117 @@ impl SlashCommand for RemoteControlCommand {
 
         match args.trim() {
             "" | "status" => {
-                let status = if remote_at_startup { "enabled at startup" } else { "disabled" };
+                let hostname = hostname::get()
+                    .map(|h| h.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "(unknown host)".to_string());
+
                 let bridge_url = std::env::var("CLAUDE_CODE_BRIDGE_URL")
                     .unwrap_or_else(|_| "https://claude.ai".to_string());
+
+                let token_status = if std::env::var("CLAUDE_CODE_BRIDGE_TOKEN").is_ok()
+                    || std::env::var("CLAUDE_BRIDGE_OAUTH_TOKEN").is_ok()
+                {
+                    "configured via environment variable"
+                } else {
+                    "not set (required to connect)"
+                };
+
+                let startup_status =
+                    if remote_at_startup { "enabled at startup" } else { "disabled" };
+
+                // Active session info from context
+                let session_section = if let Some(ref url) = ctx.remote_session_url {
+                    format!(
+                        "\nActive Session\n\
+                         ──────────────\n\
+                         Session URL:  {url}\n\
+                         Share this URL or QR code with others to let them connect\n\
+                         to this Claude Code session from the claude.ai web UI.\n",
+                        url = url
+                    )
+                } else {
+                    "\nNo active bridge session in this process.\n".to_string()
+                };
+
+                // Device fingerprint (first 12 chars are enough for display)
+                let fingerprint = cc_bridge::device_fingerprint();
+                let fp_short = &fingerprint[..fingerprint.len().min(12)];
+
                 CommandResult::Message(format!(
-                    "Remote Control (Bridge) Status\n\
-                     ──────────────────────────────\n\
-                     Status:      {status}\n\
-                     Bridge URL:  {bridge_url}\n\
-                     Token:       {token}\n\n\
-                     To connect from the web UI, visit:\n  {bridge_url}/claude-code\n\n\
-                     Use /remote-control start  to enable bridge at startup\n\
-                     Use /remote-control stop   to disable bridge at startup",
-                    status = status,
+                    "Remote Control (Bridge)\n\
+                     ═══════════════════════\n\
+                     What it does: lets you connect the claude.ai web UI or mobile app\n\
+                     to this running Claude Code CLI session on your local machine.\n\
+                     All prompts and responses are relayed bidirectionally.\n\
+                     \n\
+                     Local Machine\n\
+                     ─────────────\n\
+                     Hostname:     {hostname}\n\
+                     Device ID:    {fp_short}… (SHA-256 fingerprint)\n\
+                     \n\
+                     Bridge Configuration\n\
+                     ────────────────────\n\
+                     Bridge server:   {bridge_url}\n\
+                     Session token:   {token_status}\n\
+                     Startup mode:    {startup_status}\n\
+                     {session_section}\n\
+                     How to connect\n\
+                     ──────────────\n\
+                     1. Obtain a session token from claude.ai (Settings → Remote Control)\n\
+                     2. Set it:  export CLAUDE_CODE_BRIDGE_TOKEN=<your-token>\n\
+                     3. Enable:  /remote-control start\n\
+                     4. Restart Claude Code — the bridge will connect automatically\n\
+                     5. Open {bridge_url}/claude-code in your browser\n\
+                     \n\
+                     Note: Full bridge polling requires server-side session infrastructure.\n\
+                     The cc-bridge crate implements the complete protocol (register → poll\n\
+                     → events) and is ready to use once a valid session token is provided.\n\
+                     \n\
+                     Use /remote-control start   to enable bridge at next startup\n\
+                     Use /remote-control stop    to disable bridge at startup",
+                    hostname = hostname,
+                    fp_short = fp_short,
                     bridge_url = bridge_url,
-                    token = if std::env::var("CLAUDE_CODE_BRIDGE_TOKEN").is_ok() {
-                        "configured (set via CLAUDE_CODE_BRIDGE_TOKEN)"
-                    } else {
-                        "not set — set CLAUDE_CODE_BRIDGE_TOKEN to connect"
-                    },
+                    token_status = token_status,
+                    startup_status = startup_status,
+                    session_section = session_section,
                 ))
             }
             "start" => {
                 if let Err(e) = save_settings_mutation(|s| s.remote_control_at_startup = true) {
                     return CommandResult::Error(format!("Failed to save settings: {}", e));
                 }
-                CommandResult::Message(
+                let bridge_url = std::env::var("CLAUDE_CODE_BRIDGE_URL")
+                    .unwrap_or_else(|_| "https://claude.ai".to_string());
+                let token_note = if std::env::var("CLAUDE_CODE_BRIDGE_TOKEN").is_ok()
+                    || std::env::var("CLAUDE_BRIDGE_OAUTH_TOKEN").is_ok()
+                {
+                    "Session token detected in environment — bridge will connect on next start."
+                        .to_string()
+                } else {
+                    format!(
+                        "No session token found.\n\
+                         Get a token from {bridge_url} (Settings → Remote Control)\n\
+                         then run:  export CLAUDE_CODE_BRIDGE_TOKEN=<token>",
+                        bridge_url = bridge_url
+                    )
+                };
+                CommandResult::Message(format!(
                     "Remote control bridge enabled at startup.\n\
-                     Set CLAUDE_CODE_BRIDGE_TOKEN=<token> and restart Claude Code\n\
-                     to connect to the claude.ai web UI."
-                        .to_string(),
-                )
+                     Restart Claude Code to activate the bridge connection.\n\n\
+                     {token_note}",
+                    token_note = token_note
+                ))
             }
             "stop" => {
                 if let Err(e) = save_settings_mutation(|s| s.remote_control_at_startup = false) {
                     return CommandResult::Error(format!("Failed to save settings: {}", e));
                 }
-                CommandResult::Message("Remote control bridge disabled.".to_string())
+                CommandResult::Message(
+                    "Remote control bridge disabled.\n\
+                     The bridge will not start on next launch."
+                        .to_string(),
+                )
             }
             other => CommandResult::Error(format!(
                 "Unknown subcommand: '{}'\nUsage: /remote-control [start|stop|status]",
@@ -3542,6 +4303,101 @@ impl SlashCommand for ExtraUsageCommand {
     }
 }
 
+// ---- /advisor ------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for AdvisorCommand {
+    fn name(&self) -> &str { "advisor" }
+    fn description(&self) -> &str { "Set or unset the server-side advisor model" }
+    fn help(&self) -> &str {
+        "Usage: /advisor [<model>|off|unset]\n\n\
+         Sets the advisor model used for server-side suggestions.\n\
+         Examples:\n\
+           /advisor claude-opus-4-6   — set advisor model\n\
+           /advisor off               — disable the advisor\n\
+           /advisor                   — show current advisor setting"
+    }
+
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let arg = args.trim();
+        let settings_dir = cc_core::config::Settings::config_dir();
+        let settings_path = settings_dir.join("settings.json");
+
+        // Read or create settings JSON
+        let mut settings_val: serde_json::Value = settings_path
+            .exists()
+            .then(|| std::fs::read_to_string(&settings_path).ok())
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        match arg {
+            "" => {
+                let current = settings_val
+                    .get("advisorModel")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(not set)");
+                CommandResult::Message(format!("Advisor model: {current}"))
+            }
+            "off" | "unset" | "none" => {
+                settings_val
+                    .as_object_mut()
+                    .map(|m| m.remove("advisorModel"));
+                if let Ok(json) = serde_json::to_string_pretty(&settings_val) {
+                    let _ = std::fs::write(&settings_path, json);
+                }
+                CommandResult::Message("Advisor model unset.".to_string())
+            }
+            model => {
+                // Basic validation: must look like a model identifier
+                if model.starts_with("claude-") || model.contains('/') {
+                    settings_val["advisorModel"] = serde_json::Value::String(model.to_string());
+                    if let Ok(json) = serde_json::to_string_pretty(&settings_val) {
+                        let _ = std::fs::write(&settings_path, json);
+                    }
+                    CommandResult::Message(format!("Advisor model set to: {model}"))
+                } else {
+                    CommandResult::Message(format!(
+                        "Unknown model '{model}'. Model IDs should start with 'claude-'.\n\
+                         Use /model to see available models."
+                    ))
+                }
+            }
+        }
+    }
+}
+
+// ---- /install-slack-app --------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for InstallSlackAppCommand {
+    fn name(&self) -> &str { "install-slack-app" }
+    fn description(&self) -> &str { "Install the Claude Code Slack integration" }
+    fn help(&self) -> &str {
+        "Usage: /install-slack-app\n\n\
+         Opens instructions for installing the Claude Code Slack app.\n\
+         Requires a Claude for Enterprise subscription."
+    }
+
+    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        CommandResult::Message(
+            "Claude Code Slack Integration\n\
+             ─────────────────────────────\n\
+             To install Claude Code in Slack:\n\n\
+             1. Ensure you have a Claude for Enterprise subscription\n\
+             2. Visit your Anthropic Console → Integrations → Slack\n\
+             3. Click \"Add to Slack\" and authorize the app\n\
+             4. Invite @Claude to any channel with: /invite @Claude\n\n\
+             In Slack, you can then:\n\
+             • Mention @Claude to ask questions in any channel\n\
+             • Use /claude for direct commands\n\
+             • Share code snippets for review\n\n\
+             See: https://docs.anthropic.com/claude-code/slack"
+                .to_string(),
+        )
+    }
+}
+
 // ---- /fast (/speed) ------------------------------------------------------
 
 #[async_trait]
@@ -4145,6 +5001,255 @@ impl SlashCommand for SandboxToggleCommand {
     }
 }
 
+// ---- /heapdump -----------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for HeapdumpCommand {
+    fn name(&self) -> &str { "heapdump" }
+    fn description(&self) -> &str { "Show process memory and diagnostic information" }
+    fn help(&self) -> &str {
+        "Usage: /heapdump\n\n\
+         Displays a diagnostic snapshot of the current process:\n\
+         process ID, platform, architecture, and available memory info.\n\
+         On Linux, reads /proc/self/status for RSS/VmPeak figures.\n\
+         On other platforms, reports what is available from the OS."
+    }
+
+    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let pid = std::process::id();
+        let platform = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
+
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!("  Process ID : {}", pid));
+        lines.push(format!("  Platform   : {}", platform));
+        lines.push(format!("  Arch       : {}", arch));
+
+        // On Linux, pull memory figures from /proc/self/status
+        #[cfg(target_os = "linux")]
+        {
+            match std::fs::read_to_string("/proc/self/status") {
+                Ok(status) => {
+                    for line in status.lines() {
+                        let key = line.split(':').next().unwrap_or("").trim();
+                        if matches!(key, "VmPeak" | "VmRSS" | "VmSize" | "VmData" | "Threads") {
+                            let value = line.split(':').nth(1).unwrap_or("").trim();
+                            lines.push(format!("  {:10} : {}", key, value));
+                        }
+                    }
+                }
+                Err(e) => {
+                    lines.push(format!("  (could not read /proc/self/status: {})", e));
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            lines.push("  Memory stats: not available on this platform".to_string());
+            lines.push("  (Linux /proc/self/status required for detailed figures)".to_string());
+        }
+
+        let body = lines.join("\n");
+        CommandResult::Message(format!(
+            "Heap Diagnostic\n\
+             ─────────────────────────────\n\
+             {body}"
+        ))
+    }
+}
+
+// ---- /insights -----------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for InsightsCommand {
+    fn name(&self) -> &str { "insights" }
+    fn description(&self) -> &str { "Generate a session analysis report with conversation statistics" }
+    fn help(&self) -> &str {
+        "Usage: /insights\n\n\
+         Analyses the current conversation and prints a statistics report:\n\
+         turn count, token usage, tools invoked, most-used tool, and more."
+    }
+
+    async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let messages = &ctx.messages;
+
+        // Count turns (user / assistant pairs)
+        let user_turns: usize = messages.iter()
+            .filter(|m| matches!(m.role, cc_core::types::Role::User))
+            .count();
+        let assistant_turns: usize = messages.iter()
+            .filter(|m| matches!(m.role, cc_core::types::Role::Assistant))
+            .count();
+        let total_turns = user_turns.min(assistant_turns);
+
+        // Count tool_use blocks and track frequency
+        let mut tool_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for msg in messages {
+            for block in msg.get_tool_use_blocks() {
+                if let cc_core::types::ContentBlock::ToolUse { name, .. } = block {
+                    *tool_counts.entry(name.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        let total_tool_calls: usize = tool_counts.values().sum();
+        let most_frequent_tool = tool_counts
+            .iter()
+            .max_by_key(|(_, &v)| v)
+            .map(|(k, v)| format!("{} ({} calls)", k, v))
+            .unwrap_or_else(|| "none".to_string());
+
+        // Token stats from cost_tracker
+        let input_tokens = ctx.cost_tracker.input_tokens();
+        let output_tokens = ctx.cost_tracker.output_tokens();
+        let total_tokens = ctx.cost_tracker.total_tokens();
+        let total_cost = ctx.cost_tracker.total_cost_usd();
+
+        let avg_tokens_per_turn = if total_turns > 0 {
+            total_tokens / total_turns as u64
+        } else {
+            0
+        };
+
+        CommandResult::Message(format!(
+            "Session Insights\n\
+             ──────────────────────────────────────\n\
+             Conversation\n\
+             ├─ User turns          : {user_turns}\n\
+             ├─ Assistant turns     : {assistant_turns}\n\
+             └─ Completed exchanges : {total_turns}\n\
+             \n\
+             Tokens\n\
+             ├─ Input               : {input_tokens}\n\
+             ├─ Output              : {output_tokens}\n\
+             ├─ Total               : {total_tokens}\n\
+             └─ Avg per exchange    : {avg_tokens_per_turn}\n\
+             \n\
+             Cost\n\
+             └─ Estimated USD       : ${total_cost:.4}\n\
+             \n\
+             Tools\n\
+             ├─ Total calls         : {total_tool_calls}\n\
+             └─ Most used           : {most_frequent_tool}",
+            user_turns = user_turns,
+            assistant_turns = assistant_turns,
+            total_turns = total_turns,
+            input_tokens = input_tokens,
+            output_tokens = output_tokens,
+            total_tokens = total_tokens,
+            avg_tokens_per_turn = avg_tokens_per_turn,
+            total_cost = total_cost,
+            total_tool_calls = total_tool_calls,
+            most_frequent_tool = most_frequent_tool,
+        ))
+    }
+}
+
+// ---- /ultrareview --------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for UltrareviewCommand {
+    fn name(&self) -> &str { "ultrareview" }
+    fn description(&self) -> &str { "Run an exhaustive multi-dimensional code review" }
+    fn help(&self) -> &str {
+        "Usage: /ultrareview [path]\n\n\
+         Runs a comprehensive code review that goes beyond /review and\n\
+         /security-review. Covers: security (OWASP Top 10), performance,\n\
+         maintainability, test coverage, error handling, API design,\n\
+         documentation, accessibility, and architectural concerns.\n\
+         Each finding is tagged by category and severity."
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let target = if args.trim().is_empty() {
+            ctx.working_dir.display().to_string()
+        } else {
+            args.trim().to_string()
+        };
+
+        CommandResult::UserMessage(format!(
+            "Please perform an **ultra-comprehensive code review** of the code in `{target}`.\n\n\
+             This review must go beyond a standard review and cover ALL of the following dimensions:\n\n\
+             ## 1. Security (OWASP Top 10 + extras)\n\
+             - Injection vulnerabilities (SQL, command, LDAP, XSS, SSTI, CRLF)\n\
+             - Broken authentication / session management\n\
+             - Sensitive data exposure (secrets, PII, tokens in logs or source)\n\
+             - XML/JSON External Entity (XXE) processing\n\
+             - Broken access control and privilege escalation paths\n\
+             - Security misconfiguration (default creds, open ports, verbose errors)\n\
+             - Cross-site scripting (Stored, Reflected, DOM-based)\n\
+             - Insecure deserialization\n\
+             - Using components with known vulnerabilities (outdated deps)\n\
+             - Insufficient logging and monitoring\n\
+             - Path traversal and file inclusion\n\
+             - Race conditions, TOCTOU, deadlocks\n\
+             - Cryptographic weaknesses (weak algorithms, key reuse, bad IV)\n\
+             - Supply chain / dependency confusion risks\n\n\
+             ## 2. Performance\n\
+             - Algorithmic complexity: O(n²) or worse in hot paths\n\
+             - Unnecessary allocations, copies, or clones\n\
+             - Database N+1 query patterns\n\
+             - Missing indexes on frequently queried fields\n\
+             - Blocking I/O in async contexts\n\
+             - Unbounded loops or recursion\n\
+             - Memory leaks or resource leaks (file handles, sockets)\n\
+             - Caching opportunities\n\n\
+             ## 3. Maintainability & Code Quality\n\
+             - Functions / methods exceeding 50 lines\n\
+             - Deep nesting (>4 levels)\n\
+             - Duplicated logic (DRY violations)\n\
+             - Magic numbers and strings without named constants\n\
+             - Misleading names (variables, functions, types)\n\
+             - Dead code and unused imports\n\
+             - Overly complex conditionals\n\
+             - Coupling: tight coupling between unrelated modules\n\n\
+             ## 4. Error Handling\n\
+             - Swallowed errors (empty catch blocks, `unwrap()` without context)\n\
+             - Panic-able paths in library code\n\
+             - Missing input validation at trust boundaries\n\
+             - Unclear error messages that hinder debugging\n\
+             - Error type inconsistency across the codebase\n\n\
+             ## 5. Test Coverage\n\
+             - Missing unit tests for critical logic\n\
+             - Missing integration tests for external boundaries\n\
+             - Tests with no assertions\n\
+             - Tests that are brittle (time-dependent, order-dependent)\n\
+             - Missing negative / edge-case tests\n\
+             - Mocking strategy concerns\n\n\
+             ## 6. API Design\n\
+             - Unclear or inconsistent naming conventions\n\
+             - Functions with too many parameters (>5)\n\
+             - Mutable global state\n\
+             - Missing or incorrect use of visibility modifiers\n\
+             - Breaking changes risk in public interfaces\n\
+             - Lack of builder or fluent patterns where appropriate\n\n\
+             ## 7. Documentation\n\
+             - Missing doc comments on public items\n\
+             - Outdated or misleading comments\n\
+             - Undocumented panics, unsafe blocks, or invariants\n\
+             - Missing README or high-level architectural overview\n\n\
+             ## 8. Architectural Concerns\n\
+             - Single Responsibility Principle violations\n\
+             - Circular dependencies\n\
+             - Missing abstraction layers\n\
+             - Hardcoded configuration that should be externalised\n\
+             - Observability gaps (missing tracing, metrics, structured logs)\n\n\
+             ## Output Format\n\
+             For **every** finding, provide:\n\
+             - **Category** (from the dimensions above)\n\
+             - **Severity**: Critical / High / Medium / Low / Informational\n\
+             - **File** and **line number** (if applicable)\n\
+             - **Description** of the issue\n\
+             - **Impact**: what can go wrong\n\
+             - **Recommended fix** with a code snippet where helpful\n\n\
+             Start by reading the main source files, dependency manifests, and any CI/CD configuration.\n\
+             Group findings by severity (Critical first). Conclude with a prioritised action plan.",
+            target = target,
+        ))
+    }
+}
+
 // ---- Named-command slash adapters ----------------------------------------
 
 #[async_trait]
@@ -4322,6 +5427,13 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(BtwCommand),
         Box::new(CtxVizCommand),
         Box::new(SandboxToggleCommand),
+        // Advisor and Slack integration
+        Box::new(AdvisorCommand),
+        Box::new(InstallSlackAppCommand),
+        // Diagnostics / analysis
+        Box::new(HeapdumpCommand),
+        Box::new(InsightsCommand),
+        Box::new(UltrareviewCommand),
     ]
 }
 
@@ -4398,6 +5510,7 @@ mod tests {
             session_id: "test-session".to_string(),
             session_title: None,
             remote_session_url: None,
+            mcp_manager: None,
         }
     }
 

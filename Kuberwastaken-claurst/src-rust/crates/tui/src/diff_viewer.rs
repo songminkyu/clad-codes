@@ -5,6 +5,7 @@
 //! Keyboard: ↑↓ navigate files, Tab switch pane, t toggle diff type, Esc close.
 
 use cc_core::file_history::FileHistory;
+use once_cell::sync::Lazy;
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
@@ -14,6 +15,12 @@ use ratatui::{
 };
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashMap;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::SyntaxSet;
+
+static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(SyntaxSet::load_defaults_newlines);
+static THEME_SET: Lazy<ThemeSet> = Lazy::new(ThemeSet::load_defaults);
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -109,6 +116,8 @@ pub struct DiffViewerState {
     render_cache: HashMap<(usize, u16), Vec<String>>,
     /// Whether the dialog is open.
     pub open: bool,
+    /// Per-file collapsed state (indexed by file position in `files`).
+    pub collapsed: Vec<bool>,
 }
 
 impl DiffViewerState {
@@ -122,6 +131,15 @@ impl DiffViewerState {
             detail_scroll: 0,
             render_cache: HashMap::new(),
             open: false,
+            collapsed: Vec::new(),
+        }
+    }
+
+    /// Toggle collapsed state for the currently selected file.
+    pub fn toggle_file_collapse(&mut self) {
+        if let Some(c) = self.collapsed.get_mut(self.selected_file) {
+            *c = !*c;
+            self.detail_scroll = 0;
         }
     }
 
@@ -183,6 +201,7 @@ impl DiffViewerState {
             self.selected_file = 0;
             self.detail_scroll = 0;
             self.render_cache.clear();
+            self.collapsed = vec![false; self.files.len()];
         }
     }
 
@@ -200,6 +219,7 @@ impl DiffViewerState {
         self.selected_file = 0;
         self.detail_scroll = 0;
         self.render_cache.clear();
+        self.collapsed = vec![false; self.files.len()];
     }
 }
 
@@ -522,8 +542,8 @@ pub fn render_diff_dialog(state: &mut DiffViewerState, area: Rect, buf: &mut Buf
 
     // Outer border
     let title = match state.diff_type {
-        DiffType::GitDiff => " Diff (git) [d: toggle, Tab: pane, Esc: close] ",
-        DiffType::TurnDiff => " Diff (turn) [d: toggle, Tab: pane, Esc: close] ",
+        DiffType::GitDiff => " Diff (git) [Space: collapse, d: toggle, Tab: pane, Esc: close] ",
+        DiffType::TurnDiff => " Diff (turn) [Space: collapse, d: toggle, Tab: pane, Esc: close] ",
     };
     Block::default()
         .title(title)
@@ -605,7 +625,8 @@ fn render_file_list(state: &DiffViewerState, area: Rect, buf: &mut Buffer) {
             file.path.clone()
         };
 
-        let prefix = if selected { "> " } else { "  " };
+        let is_collapsed = *state.collapsed.get(abs_idx).unwrap_or(&false);
+        let collapse_char = if is_collapsed { "\u{25b8}" } else { "\u{25be}" }; // ▸ / ▾
         let (stats, stats_color) = if file.binary {
             ("[binary]".to_string(), Color::DarkGray)
         } else if file.is_new_file {
@@ -624,8 +645,20 @@ fn render_file_list(state: &DiffViewerState, area: Rect, buf: &mut Buffer) {
         let y = inner.y + i as u16;
         if y >= area.y + area.height { break; }
 
+        let collapse_style = if is_collapsed {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
         let line = Line::from(vec![
-            Span::styled(prefix, base_style),
+            Span::styled(
+                if selected { "> " } else { "  " },
+                base_style,
+            ),
+            Span::styled(
+                format!("{} ", collapse_char),
+                collapse_style,
+            ),
             Span::styled(path, base_style.fg(if selected { Color::White } else { Color::Gray })),
         ]);
         let row_area = Rect { x: inner.x, y, width: inner.width, height: 1 };
@@ -684,6 +717,18 @@ fn render_diff_detail(state: &DiffViewerState, area: Rect, buf: &mut Buffer) {
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
     };
+
+    if *state.collapsed.get(state.selected_file).unwrap_or(&false) {
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "  [collapsed]  press Space to expand",
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            )]),
+        ])
+        .render(inner, buf);
+        return;
+    }
 
     if file.binary {
         Paragraph::new("Binary file — no diff available")
@@ -813,6 +858,66 @@ fn build_inline_diff_spans(old: &str, new: &str) -> (Vec<Span<'static>>, Vec<Spa
     (old_spans, new_spans)
 }
 
+/// Highlight a line of source code using syntect, returning ratatui Spans.
+/// Falls back to plain styling if the language is not recognised.
+fn highlight_code_line(line: &str, path: &str, base_style: Style) -> Vec<Span<'static>> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+
+    let ss = &*SYNTAX_SET;
+    let ts = &*THEME_SET;
+
+    let syntax = if let Some(s) = ss.find_syntax_by_extension(ext) {
+        s
+    } else {
+        return vec![Span::styled(line.to_string(), base_style)];
+    };
+
+    let theme = ts
+        .themes
+        .get("base16-ocean.dark")
+        .or_else(|| ts.themes.values().next());
+
+    let theme = match theme {
+        Some(t) => t,
+        None => return vec![Span::styled(line.to_string(), base_style)],
+    };
+
+    let mut h = HighlightLines::new(syntax, theme);
+    match h.highlight_line(line, ss) {
+        Ok(ranges) => {
+            let mut result = Vec::new();
+            for (style, text) in ranges {
+                if text.is_empty() {
+                    continue;
+                }
+                // Blend syntect foreground with the diff color (added=green, removed=red)
+                let fg = style.foreground;
+                // Only apply syntect color when it's not a "default" near-white color
+                let is_default = fg.r > 200 && fg.g > 200 && fg.b > 200;
+                let color = if is_default {
+                    // Use the diff marker color (passed in base_style)
+                    base_style.fg.unwrap_or(Color::White)
+                } else {
+                    Color::Rgb(fg.r, fg.g, fg.b)
+                };
+                result.push(Span::styled(
+                    text.to_string(),
+                    Style::default().fg(color),
+                ));
+            }
+            if result.is_empty() {
+                vec![Span::styled(line.to_string(), base_style)]
+            } else {
+                result
+            }
+        }
+        Err(_) => vec![Span::styled(line.to_string(), base_style)],
+    }
+}
+
 fn build_diff_lines(file: &FileDiffStats, width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     // Gutter = 10 chars ("dddd dddd "), prefix marker = 3 chars ("+  " etc.)
@@ -882,11 +987,20 @@ fn build_diff_lines(file: &FileDiffStats, width: u16) -> Vec<Line<'static>> {
             let ln_str = format_gutter(diff_line.old_line_no, diff_line.new_line_no);
             let content: String = diff_line.content.chars().take(avail).collect();
 
-            lines.push(Line::from(vec![
+            let mut row = vec![
                 Span::styled(ln_str, Style::default().fg(Color::DarkGray)),
                 marker,
-                Span::styled(content, content_style),
-            ]));
+            ];
+
+            // Apply syntax highlighting for code lines (not headers)
+            if diff_line.kind == DiffLineKind::Header {
+                row.push(Span::styled(content, content_style));
+            } else {
+                let highlighted = highlight_code_line(&content, &file.path, content_style);
+                row.extend(highlighted);
+            }
+
+            lines.push(Line::from(row));
 
             i += 1;
         }
@@ -1106,5 +1220,78 @@ mod tests {
         };
         assert_eq!(stats, "[new] +42");
         assert_eq!(color, ratatui::style::Color::Yellow);
+    }
+
+    #[test]
+    fn diff_viewer_collapse_initializes_false() {
+        let mut state = DiffViewerState::new();
+        // Directly set files to simulate reload
+        state.files = vec![
+            make_file("a.rs", 1, 0, false),
+            make_file("b.rs", 2, 1, false),
+        ];
+        state.collapsed = vec![false; state.files.len()];
+        assert_eq!(state.collapsed.len(), 2);
+        assert!(state.collapsed.iter().all(|&c| !c));
+    }
+
+    #[test]
+    fn diff_viewer_toggle_collapse_selected() {
+        let mut state = DiffViewerState::new();
+        state.files = vec![make_file("a.rs", 1, 0, false), make_file("b.rs", 2, 1, false)];
+        state.collapsed = vec![false; 2];
+        state.selected_file = 1;
+        state.toggle_file_collapse();
+        assert!(!state.collapsed[0], "file 0 should remain expanded");
+        assert!(state.collapsed[1], "file 1 should now be collapsed");
+        assert_eq!(state.detail_scroll, 0, "scroll resets on collapse");
+    }
+
+    #[test]
+    fn diff_viewer_toggle_collapse_twice_restores() {
+        let mut state = DiffViewerState::new();
+        state.files = vec![make_file("a.rs", 1, 0, false)];
+        state.collapsed = vec![false];
+        state.toggle_file_collapse();
+        assert!(state.collapsed[0]);
+        state.toggle_file_collapse();
+        assert!(!state.collapsed[0]);
+    }
+
+    #[test]
+    fn diff_viewer_toggle_collapse_empty_files_no_panic() {
+        let mut state = DiffViewerState::new();
+        // No files — toggle should not panic
+        state.toggle_file_collapse();
+    }
+
+    #[test]
+    fn diff_viewer_set_turn_diff_resets_collapsed() {
+        let mut state = DiffViewerState::new();
+        state.diff_type = DiffType::TurnDiff;
+        state.files = vec![make_file("x.rs", 1, 0, false)];
+        state.collapsed = vec![true]; // manually set collapsed
+        let new_files = vec![make_file("y.rs", 2, 0, false), make_file("z.rs", 3, 0, false)];
+        state.set_turn_diff(new_files);
+        assert_eq!(state.collapsed.len(), 2, "collapsed should match new file count");
+        assert!(state.collapsed.iter().all(|&c| !c), "new files start uncollapsed");
+    }
+
+    #[test]
+    fn diff_viewer_collapse_renders_without_panic() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let mut state = DiffViewerState::new();
+        state.open = true;
+        state.files = vec![make_file("src/lib.rs", 5, 2, false)];
+        state.collapsed = vec![true]; // collapsed
+        terminal.draw(|frame| {
+            let area = frame.area();
+            render_diff_dialog(&mut state, area, frame.buffer_mut());
+        }).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let content: String = buf.content().iter().map(|c| c.symbol().chars().next().unwrap_or(' ')).collect();
+        assert!(content.contains("collapsed") || content.contains("Space"));
     }
 }

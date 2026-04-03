@@ -64,6 +64,8 @@ pub enum QueryOutcome {
     Cancelled,
     /// An unrecoverable error occurred.
     Error(ClaudeError),
+    /// The configured USD budget was exceeded.
+    BudgetExceeded { cost_usd: f64, limit_usd: f64 },
 }
 
 /// Configuration for a single query-loop invocation.
@@ -101,6 +103,12 @@ pub struct QueryConfig {
     /// the resulting index is used to inject a skill listing attachment into
     /// the conversation context.
     pub skill_index: Option<SharedSkillIndex>,
+    /// Optional USD spend cap. The query loop checks accumulated cost after
+    /// each turn and aborts with `QueryOutcome::BudgetExceeded` when exceeded.
+    pub max_budget_usd: Option<f64>,
+    /// Fallback model name. Used when the primary model returns overloaded /
+    /// rate-limit errors (mirrors TS `--fallback-model`).
+    pub fallback_model: Option<String>,
 }
 
 impl Default for QueryConfig {
@@ -120,6 +128,8 @@ impl Default for QueryConfig {
             effort_level: None,
             command_queue: None,
             skill_index: None,
+            max_budget_usd: None,
+            fallback_model: None,
         }
     }
 }
@@ -409,6 +419,9 @@ pub async fn run_query_loop(
     // Tracks how many consecutive max_tokens recoveries we've attempted so
     // we don't loop forever on a model that can't finish within any budget.
     let mut max_tokens_recovery_count: u32 = 0;
+    // Active model — may switch to fallback on overloaded errors.
+    let mut effective_model = config.model.clone();
+    let mut used_fallback = false;
 
     loop {
         turn += 1;
@@ -498,7 +511,7 @@ pub async fn run_query_loop(
 
         let system = build_system_prompt(config);
 
-        let mut req_builder = CreateMessageRequest::builder(&config.model, config.max_tokens)
+        let mut req_builder = CreateMessageRequest::builder(&effective_model, config.max_tokens)
             .messages(api_messages)
             .system(system)
             .tools(api_tools);
@@ -516,6 +529,14 @@ pub async fn run_query_loop(
             req_builder = req_builder.thinking(ThinkingConfig::enabled(budget));
         }
 
+        // Apply temperature: explicit config value takes precedence, then effort-level override.
+        let effective_temperature = config.temperature.or_else(|| {
+            config.effort_level.and_then(|el| el.temperature())
+        });
+        if let Some(t) = effective_temperature {
+            req_builder = req_builder.temperature(t);
+        }
+
         let request = req_builder.build();
 
         // Create a stream handler that forwards to the event channel
@@ -527,10 +548,33 @@ pub async fn run_query_loop(
         };
 
         // Send to API
-        debug!(turn, model = %config.model, "Sending API request");
+        debug!(turn, model = %effective_model, "Sending API request");
         let mut stream_rx = match client.create_message_stream(request, handler).await {
             Ok(rx) => rx,
             Err(e) => {
+                // On overloaded/rate-limit errors, attempt one switch to the fallback model.
+                let err_str = e.to_string().to_lowercase();
+                if !used_fallback
+                    && (err_str.contains("overloaded") || err_str.contains("529") || err_str.contains("rate_limit"))
+                {
+                    if let Some(ref fb) = config.fallback_model {
+                        warn!(
+                            primary = %effective_model,
+                            fallback = %fb,
+                            "Primary model unavailable — switching to fallback"
+                        );
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::Status(format!(
+                                "Model unavailable — switching to fallback ({})",
+                                fb
+                            )));
+                        }
+                        effective_model = fb.clone();
+                        used_fallback = true;
+                        turn -= 1; // don't count this attempt against max_turns
+                        continue;
+                    }
+                }
                 error!(error = %e, "API request failed");
                 return QueryOutcome::Error(e);
             }
@@ -551,7 +595,7 @@ pub async fn run_query_loop(
                             match &evt {
                                 StreamEvent::Error { error_type, message } => {
                                     if error_type == "overloaded_error" {
-                                        warn!("API overloaded, should retry");
+                                        warn!(model = %effective_model, "API overloaded");
                                     }
                                     error!(error_type, message, "Stream error");
                                 }
@@ -574,6 +618,23 @@ pub async fn run_query_loop(
             usage.cache_creation_input_tokens,
             usage.cache_read_input_tokens,
         );
+
+        // Budget guard: abort the loop if the configured USD cap is exceeded.
+        if let Some(limit) = config.max_budget_usd {
+            let spent = cost_tracker.total_cost_usd();
+            if spent >= limit {
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(QueryEvent::Status(format!(
+                        "Budget limit ${:.4} exceeded (spent ${:.4}) — stopping.",
+                        limit, spent
+                    )));
+                }
+                return QueryOutcome::BudgetExceeded {
+                    cost_usd: spent,
+                    limit_usd: limit,
+                };
+            }
+        }
 
         // Append assistant message to conversation
         messages.push(assistant_msg.clone());
@@ -679,6 +740,7 @@ pub async fn run_query_loop(
                     client,
                     config,
                     cancel_token.clone(),
+                    &[],
                 )
                 .await
                 {
@@ -1064,6 +1126,8 @@ mod tests {
             effort_level: None,
             command_queue: None,
             skill_index: None,
+            max_budget_usd: None,
+            fallback_model: None,
         }
     }
 

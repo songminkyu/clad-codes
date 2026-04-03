@@ -3,6 +3,8 @@
 use std::cell::RefCell;
 
 use crate::agents_view::render_agents_menu;
+use crate::context_viz::render_context_viz;
+use crate::export_dialog::render_export_dialog;
 use crate::app::{App, SystemAnnotation, SystemMessageStyle, ToolStatus};
 use crate::clawd::{clawd_lines, ClawdPose};
 use crate::diff_viewer::render_diff_dialog;
@@ -14,6 +16,9 @@ use crate::overage_upsell::render_overage_upsell;
 use crate::voice_mode_notice::render_voice_mode_notice;
 use crate::desktop_upsell_startup::render_desktop_upsell_startup;
 use crate::memory_update_notification::render_memory_update_notification;
+use crate::invalid_config_dialog::render_invalid_config_dialog;
+use crate::bypass_permissions_dialog::render_bypass_permissions_dialog;
+use crate::onboarding_dialog::render_onboarding_dialog;
 use crate::elicitation_dialog::render_elicitation_dialog;
 use crate::figures;
 use crate::hooks_config_menu::render_hooks_config_menu;
@@ -26,7 +31,7 @@ use crate::overlays::{
 };
 use crate::plugin_views::render_plugin_hints;
 use crate::privacy_screen::render_privacy_screen;
-use crate::prompt_input::{InputMode, TypeaheadSource, VimMode, render_prompt_input};
+use crate::prompt_input::{InputMode, TypeaheadSource, VimMode, input_height, render_prompt_input};
 use crate::settings_screen::render_settings_screen;
 use crate::stats_dialog::render_stats_dialog;
 use crate::theme_screen::render_theme_screen;
@@ -49,7 +54,7 @@ const SPINNER: &[char] = &['\u{00b7}', '\u{2722}', '*', '\u{2736}', '\u{273b}', 
 #[cfg(not(target_os = "windows"))]
 const SPINNER: &[char] = &['\u{00b7}', '\u{2722}', '\u{2733}', '\u{2736}', '\u{273b}', '\u{273d}',
                             '\u{273d}', '\u{273b}', '\u{2736}', '\u{2733}', '\u{2722}', '\u{00b7}'];
-const CLAUDE_ORANGE: Color = Color::Rgb(215, 119, 87);
+const CLAUDE_ORANGE: Color = Color::Rgb(233, 30, 99);
 const WELCOME_BOX_HEIGHT: u16 = 11;
 
 fn spinner_char(frame_count: u64) -> char {
@@ -200,6 +205,34 @@ fn startup_notice_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         ]));
     }
 
+    // Home-directory warning: mirrors TS feedConfigs.tsx warningText.
+    // "Note: You have launched claude in your home directory. For the best
+    //  experience, launch it in a project directory instead."
+    if app.home_dir_warning {
+        lines.push(Line::from(vec![
+            Span::styled(" note ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                truncate_end(
+                    "You have launched claude in your home directory. \
+                     For the best experience, launch it in a project directory instead.",
+                    max_width,
+                ),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    }
+
+    // Additional directories (from --add-dir)
+    for dir in &app.config.additional_dirs {
+        lines.push(Line::from(vec![
+            Span::styled(" +dir ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                truncate_end(&dir.display().to_string(), max_width),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+
     lines
 }
 
@@ -218,6 +251,7 @@ fn render_startup_notices(frame: &mut Frame, app: &App, area: Rect) {
 struct RenderedLineItem {
     line: Line<'static>,
     search_text: String,
+    is_header: bool,
 }
 
 impl VirtualItem for RenderedLineItem {
@@ -231,6 +265,10 @@ impl VirtualItem for RenderedLineItem {
 
     fn search_text(&self) -> String {
         self.search_text.clone()
+    }
+
+    fn is_section_header(&self) -> bool {
+        self.is_header
     }
 }
 
@@ -249,6 +287,7 @@ struct MessageLinesCacheKey {
     messages_len: usize,
     annotations_ptr: usize,
     annotations_len: usize,
+    thinking_expanded_len: usize,
 }
 
 #[derive(Clone)]
@@ -263,6 +302,7 @@ struct CompletedMsgCacheKey {
     width: u16,
     messages_len: usize,
     annotations_len: usize,
+    thinking_expanded_len: usize,
 }
 
 #[derive(Clone)]
@@ -304,6 +344,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     } else {
         0
     };
+    let prompt_height = input_height(&app.prompt_input);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -311,7 +352,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
             Constraint::Min(1),
             Constraint::Length(separator_height),
             Constraint::Length(status_height),
-            Constraint::Length(3),
+            Constraint::Length(prompt_height),
             Constraint::Length(suggestions_height),
             Constraint::Length(1),
         ])
@@ -442,9 +483,24 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         }
     }
 
-    // Desktop upsell startup modal (rendered on top of everything else)
+    // Desktop upsell startup modal
     if app.desktop_upsell.visible {
         render_desktop_upsell_startup(&app.desktop_upsell, size, frame.buffer_mut());
+    }
+
+    // Invalid config/settings dialog (shown when settings.json or CLAUDE.md is malformed)
+    if app.invalid_config_dialog.visible {
+        render_invalid_config_dialog(frame, &app.invalid_config_dialog, size);
+    }
+
+    // Bypass-permissions confirmation dialog (topmost — rendered last so it sits above all)
+    if app.bypass_permissions_dialog.visible {
+        render_bypass_permissions_dialog(frame, &app.bypass_permissions_dialog, size);
+    }
+
+    // First-launch onboarding dialog (shown after bypass dialog, below elicitation)
+    if app.onboarding_dialog.visible {
+        render_onboarding_dialog(frame, &app.onboarding_dialog, size);
     }
 
     // MCP elicitation dialog (highest priority modal — rendered last to sit on top)
@@ -462,6 +518,25 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_session_browser(&app.session_browser, size, frame.buffer_mut());
     }
 
+    // Export format picker dialog
+    if app.export_dialog.visible {
+        render_export_dialog(frame, &app.export_dialog, size);
+    }
+
+    // Context visualization overlay
+    if app.context_viz.visible {
+        render_context_viz(
+            frame,
+            &app.context_viz,
+            size,
+            app.context_used_tokens,
+            app.context_window_size,
+            app.rate_limit_5h_pct,
+            app.rate_limit_7day_pct,
+            app.cost_usd,
+        );
+    }
+
     // MCP approval dialog
     if app.mcp_approval.visible {
         render_mcp_approval_dialog(&app.mcp_approval, size, frame.buffer_mut());
@@ -471,6 +546,65 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     if !app.notifications.is_empty() {
         render_notification_banner(frame, &app.notifications, size);
     }
+
+    // ---- Text selection highlight (topmost post-pass) ---------------------
+    // Only show selection when no full-screen modal overlay is active.
+    let modal_active = app.settings_screen.visible
+        || app.theme_screen.visible
+        || app.privacy_screen.visible
+        || app.bypass_permissions_dialog.visible
+        || app.rewind_flow.visible
+        || app.help_overlay.visible
+        || app.global_search.open;
+    if !modal_active {
+        apply_selection_highlight(frame, app, size);
+    }
+}
+
+/// Post-render pass: invert colours on selected cells and extract the
+/// selection text into `app.selection_text`.
+fn apply_selection_highlight(frame: &mut Frame, app: &App, size: Rect) {
+    let (anchor, focus) = match (app.selection_anchor, app.selection_focus) {
+        (Some(a), Some(f)) => (a, f),
+        _ => return,
+    };
+    if anchor == focus {
+        return;
+    }
+
+    // Normalise so start ≤ end (row-major order).
+    let (start, end) = if (anchor.1, anchor.0) <= (focus.1, focus.0) {
+        (anchor, focus)
+    } else {
+        (focus, anchor)
+    };
+
+    let buf = frame.buffer_mut();
+    let mut text = String::new();
+    let last_row = end.1.min(size.y + size.height - 1);
+    for row in start.1..=last_row {
+        let col_from = if row == start.1 { start.0 } else { 0 };
+        let col_to = if row == end.1 { end.0 } else { size.x + size.width - 1 };
+        let col_to = col_to.min(size.x + size.width - 1);
+        for col in col_from..=col_to {
+            if let Some(cell) = buf.cell_mut((col, row)) {
+                let sym = cell.symbol().to_owned();
+                text.push_str(if sym.is_empty() || sym == "\0" { " " } else { &sym });
+                // Highlight: white background, black foreground
+                let new_style = Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(200, 200, 200));
+                cell.set_style(new_style);
+            }
+        }
+        if row < last_row {
+            // Trim trailing spaces from line before newline
+            while text.ends_with(' ') { text.pop(); }
+            text.push('\n');
+        }
+    }
+    while text.ends_with(|c: char| c.is_whitespace()) { text.pop(); }
+    *app.selection_text.borrow_mut() = text;
 }
 
 // -----------------------------------------------------------------------
@@ -624,6 +758,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         messages_len: app.messages.len(),
         annotations_ptr: app.system_annotations.as_ptr() as usize,
         annotations_len: app.system_annotations.len(),
+        thinking_expanded_len: app.thinking_expanded.len(),
     };
     if cacheable {
         if let Some(lines) = MESSAGE_LINES_CACHE.with(|cache| {
@@ -645,6 +780,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         width,
         messages_len: app.messages.len(),
         annotations_len: app.system_annotations.len(),
+        thinking_expanded_len: app.thinking_expanded.len(),
     };
     let completed_lines: Vec<RenderedLineItem> =
         if let Some(lines) = COMPLETED_MSG_CACHE.with(|cache| {
@@ -658,19 +794,27 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         } else {
             let tool_names = build_tool_names(&app.messages);
             let mut raw: Vec<Line> = Vec::new();
+            let mut header_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
             let total = app.messages.len();
             for i in 0..=total {
                 for ann in app.system_annotations.iter().filter(|a| a.after_index == i) {
                     render_system_annotation_lines(&mut raw, ann, width as usize);
                 }
                 if i < total {
-                    render_message_lines(&mut raw, &app.messages[i], width as usize, &tool_names);
+                    // Mark the first line of each message as a section header
+                    let msg_start = raw.len();
+                    render_message_lines(&mut raw, &app.messages[i], width as usize, &tool_names, &app.thinking_expanded);
+                    if raw.len() > msg_start {
+                        header_indices.insert(msg_start);
+                    }
                 }
             }
             let items: Vec<RenderedLineItem> = raw
                 .into_iter()
-                .map(|line| RenderedLineItem {
+                .enumerate()
+                .map(|(idx, line)| RenderedLineItem {
                     search_text: flatten_line_text(&line),
+                    is_header: header_indices.contains(&idx),
                     line,
                 })
                 .collect();
@@ -723,6 +867,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
 
     items.extend(live.into_iter().map(|line| RenderedLineItem {
         search_text: flatten_line_text(&line),
+        is_header: false,
         line,
     }));
     items
@@ -764,7 +909,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     }
     let box_area = Rect { x: area.x, y: area.y, width: box_width, height: box_height };
 
-    // Outer orange rounded border with title "Claude Code vX.Y"
+    // Outer border with title "Claude Code vX.Y"
     let outer_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -803,7 +948,15 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(divider_lines), h_chunks[1]);
 
     // --- Left column ---
-    let welcome_msg = "Welcome back!";
+    let username = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+        .filter(|u| !u.is_empty());
+    let welcome_msg = if let Some(ref name) = username {
+        format!("Welcome back {}!", name)
+    } else {
+        "Welcome back!".to_string()
+    };
     let clawd = clawd_lines(&ClawdPose::Default);
     let model_line = format!("{} \u{00b7} API Usage Billing", app.model_name);
 
@@ -882,6 +1035,7 @@ fn render_message_lines(
     msg: &cc_core::types::Message,
     width: usize,
     tool_names: &std::collections::HashMap<String, String>,
+    expanded_thinking: &std::collections::HashSet<u64>,
 ) {
     let rendered = render_message(
         msg,
@@ -890,6 +1044,7 @@ fn render_message_lines(
             highlight: true,
             show_thinking: false,
             tool_names: tool_names.clone(),
+            expanded_thinking: expanded_thinking.clone(),
         },
     );
 
@@ -1209,23 +1364,51 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
-        // PR badge
+        // PR badge — shows "PR #<n>" in cyan, with optional state in brackets.
+        // State color: approved=green, changes_requested=red,
+        //              review_required=yellow, else=gray.
         if let Some(pr_num) = app.pr_number {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            let pr_label = match &app.pr_state {
+                Some(state) => format!("PR #{} [{}]", pr_num, state),
+                None => format!("PR #{}", pr_num),
+            };
+            let pr_color = match app.pr_state.as_deref() {
+                Some("approved") => Color::Green,
+                Some("changes_requested") => Color::Red,
+                Some("review_required") => Color::Yellow,
+                Some(_) => Color::Gray,
+                None => Color::Cyan,
+            };
             spans.push(Span::styled(
-                format!(" #{}", pr_num),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                pr_label,
+                Style::default().fg(pr_color).add_modifier(Modifier::BOLD),
             ));
         }
 
-        // Background task status pill
-        if let Some(ref task_status) = app.background_task_status {
+        // Background task status pill — shows "⟳ N tasks" when count > 0.
+        // Falls back to background_task_status pre-formatted string if set.
+        if app.background_task_count > 0 {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            let label = if app.background_task_count == 1 {
+                "\u{27f3} 1 task".to_string()
+            } else {
+                format!("\u{27f3} {} tasks", app.background_task_count)
+            };
+            spans.push(Span::styled(
+                label,
+                Style::default().fg(Color::Yellow),
+            ));
+        } else if let Some(ref task_status) = app.background_task_status {
             if !spans.is_empty() {
                 spans.push(Span::raw("  "));
             }
             spans.push(Span::styled(
-                format!("⟳ {}", task_status),
+                format!("\u{27f3} {}", task_status),
                 Style::default().fg(Color::Yellow),
             ));
         }
@@ -1241,12 +1424,60 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
-        // "? for shortcuts" hint only when prompt is empty and no other badges
-        if spans.is_empty() && app.prompt_input.text.is_empty() {
+        // Bash prefix indicator — shown when prompt starts with '!'
+        if app.prompt_input.text.starts_with('!') {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
             spans.push(Span::styled(
-                "? for shortcuts",
-                Style::default().fg(Color::DarkGray),
+                "[BASH]",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ));
+        }
+
+        // Permission mode badge (left side, mirrors TS bottom-left indicator).
+        // Default mode is silent; non-default modes show a badge.
+        {
+            use cc_core::config::PermissionMode;
+            match &app.config.permission_mode {
+                PermissionMode::BypassPermissions => {
+                    if !spans.is_empty() { spans.push(Span::raw("  ")); }
+                    spans.push(Span::styled(
+                        "\u{23f5}\u{23f5} bypass",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                PermissionMode::AcceptEdits => {
+                    if !spans.is_empty() { spans.push(Span::raw("  ")); }
+                    spans.push(Span::styled(
+                        "accept-edits",
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+                PermissionMode::Plan => {
+                    if !spans.is_empty() { spans.push(Span::raw("  ")); }
+                    spans.push(Span::styled(
+                        "plan",
+                        Style::default().fg(Color::Blue),
+                    ));
+                }
+                PermissionMode::Default => {}
+            }
+        }
+
+        // During streaming show "esc to interrupt"; otherwise "? for shortcuts" when idle
+        if spans.is_empty() {
+            if app.is_streaming {
+                spans.push(Span::styled(
+                    "esc to interrupt",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            } else if app.prompt_input.text.is_empty() {
+                spans.push(Span::styled(
+                    "? for shortcuts",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
         }
 
         spans
@@ -1334,15 +1565,19 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 
         // 5. Vim mode indicator
         if app.prompt_input.vim_enabled {
-            let mode_str = match app.prompt_input.vim_mode {
-                VimMode::Insert => "[INSERT]",
-                VimMode::Normal => "[NORMAL]",
-                VimMode::Visual => "[VISUAL]",
+            let (mode_str, mode_color) = match app.prompt_input.vim_mode {
+                VimMode::Insert => ("[INSERT]", Color::Blue),
+                VimMode::Normal => ("[NORMAL]", Color::Green),
+                VimMode::Visual => ("[VISUAL]", Color::Magenta),
+                VimMode::VisualLine => ("[VISUAL LINE]", Color::Magenta),
+                VimMode::VisualBlock => ("[VISUAL BLOCK]", Color::Magenta),
+                VimMode::Command => ("[COMMAND]", Color::Cyan),
+                VimMode::Search => ("[SEARCH]", Color::Yellow),
             };
             if !parts.is_empty() {
                 parts.push(Span::raw("  "));
             }
-            parts.push(Span::styled(mode_str, Style::default().fg(Color::DarkGray)));
+            parts.push(Span::styled(mode_str, Style::default().fg(mode_color)));
         }
 
         // 6. Agent type badge
@@ -1366,6 +1601,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Green),
             ));
         }
+
 
         // Output style indicator (only when non-default)
         if app.output_style != "auto" {
@@ -1801,3 +2037,160 @@ pub fn render_full_status_line(data: &StatusLineData, area: Rect, buf: &mut rata
         .render(area, buf);
 }
 
+
+// ---------------------------------------------------------------------------
+// Multi-agent UI components
+// ---------------------------------------------------------------------------
+
+/// Render a single progress-indicator row for a sub-agent.
+///
+/// Format: `[agent-<id>]` in cyan dim · space · status in colour · ` · ` · tool in dim gray
+///
+/// # Arguments
+/// * `agent_id`    — short agent identifier (e.g. `"abc123"`)
+/// * `status`      — current status string: `"working"`, `"done"`, `"error"`, or other
+/// * `current_tool` — tool the agent is currently executing, if any
+pub fn render_agent_progress_line(
+    agent_id: &str,
+    status: &str,
+    current_tool: Option<&str>,
+) -> Line<'static> {
+    let status_color = match status {
+        "working" | "running" => Color::Yellow,
+        "done" | "complete" | "completed" => Color::Green,
+        "error" | "failed" => Color::Red,
+        _ => Color::DarkGray,
+    };
+
+    let mut spans = vec![
+        Span::styled(
+            format!("[agent-{}]", agent_id),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            status.to_string(),
+            Style::default().fg(status_color),
+        ),
+    ];
+
+    if let Some(tool) = current_tool {
+        spans.push(Span::styled(
+            " · ".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            tool.to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ));
+    }
+
+    Line::from(spans)
+}
+
+/// Render a multi-line coordinator status block for a multi-agent session.
+///
+/// Returns a `Vec<Line>` containing:
+/// 1. A header: `Coordinator · N agents (M active)` in cyan bold
+/// 2. One compact row per entry in `active_agents` using [`render_agent_progress_line`]
+///
+/// # Arguments
+/// * `agent_count`   — total number of sub-agents spawned
+/// * `completed`     — number of agents that have finished
+/// * `active_agents` — slice of agent ID strings currently running
+pub fn render_coordinator_status_lines(
+    agent_count: usize,
+    completed: usize,
+    active_agents: &[&str],
+) -> Vec<Line<'static>> {
+    let active_count = active_agents.len();
+
+    let header = Line::from(vec![
+        Span::styled(
+            "Coordinator".to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " · ".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!("{} agent{}", agent_count, if agent_count == 1 { "" } else { "s" }),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled(
+            format!(" ({} active)", active_count),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            if completed > 0 {
+                format!("  ✔ {} done", completed)
+            } else {
+                String::new()
+            },
+            Style::default().fg(Color::Green),
+        ),
+    ]);
+
+    let mut lines = vec![header];
+
+    for agent_id in active_agents {
+        let row = render_agent_progress_line(agent_id, "working", None);
+        // Indent agent rows by two spaces
+        let mut indented_spans = vec![Span::raw("  ")];
+        indented_spans.extend(row.spans);
+        lines.push(Line::from(indented_spans));
+    }
+
+    lines
+}
+
+/// Render a single header line for a teammate's message block.
+///
+/// Format: `┤ teammate: <id> ├` in magenta, optional `· <session_info>` in dim
+///
+/// # Arguments
+/// * `teammate_id`  — teammate identifier string
+/// * `session_info` — optional session info snippet to append
+pub fn render_teammate_header(
+    teammate_id: &str,
+    session_info: Option<&str>,
+) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(
+            "┤ teammate: ".to_string(),
+            Style::default().fg(Color::Magenta),
+        ),
+        Span::styled(
+            teammate_id.to_string(),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " ├".to_string(),
+            Style::default().fg(Color::Magenta),
+        ),
+    ];
+
+    if let Some(info) = session_info {
+        spans.push(Span::styled(
+            "  · ".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            info.to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ));
+    }
+
+    Line::from(spans)
+}

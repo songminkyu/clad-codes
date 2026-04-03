@@ -8,7 +8,7 @@ name = "claude"
 path = "src/main.rs"
 
 [dependencies]
-cc-core = { workspace = true }
+cc-core = { workspace = true, features = ["voice"] }
 cc-api = { workspace = true }
 cc-tools = { workspace = true }
 cc-query = { workspace = true }
@@ -32,4 +32,6 @@ reqwest = { workspace = true }
 url = { workspace = true }
 crossterm = { workspace = true }
 parking_lot = { workspace = true }
+dirs = { workspace = true }
+nix = { workspace = true }
 

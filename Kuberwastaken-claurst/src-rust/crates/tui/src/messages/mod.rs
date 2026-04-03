@@ -28,6 +28,8 @@ pub struct RenderContext {
     /// Maps `tool_use_id` → `tool_name` so ToolResult blocks can dispatch to
     /// the correct specialized renderer (e.g. Bash output vs. generic result).
     pub tool_names: HashMap<String, String>,
+    /// Set of thinking block content hashes that are expanded per-block.
+    pub expanded_thinking: std::collections::HashSet<u64>,
 }
 
 impl Default for RenderContext {
@@ -37,6 +39,7 @@ impl Default for RenderContext {
             highlight: true,
             show_thinking: false,
             tool_names: HashMap::new(),
+            expanded_thinking: std::collections::HashSet::new(),
         }
     }
 }
@@ -49,7 +52,7 @@ const TRUNCATE_USER_PROMPT_HEAD_CHARS: usize = 2_500;
 const TRUNCATE_USER_PROMPT_TAIL_CHARS: usize = 2_500;
 
 /// Claude orange: Rgb(215, 119, 87)
-const CLAUDE_ORANGE: Color = Color::Rgb(215, 119, 87);
+const CLAUDE_ORANGE: Color = Color::Rgb(233, 30, 99);
 
 const TOOL_RESULT_MAX_LINES: usize = 30;
 
@@ -604,7 +607,7 @@ fn prefix_message_lines(
         Role::User => (
             "› ",
             Style::default()
-                .fg(Color::Rgb(215, 119, 87))
+                .fg(Color::Rgb(233, 30, 99))
                 .add_modifier(Modifier::BOLD),
             Style::default().fg(Color::White),
         ),
@@ -706,8 +709,17 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
             }
             ContentBlock::Thinking { thinking, .. } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
+                // Compute a stable hash of the thinking content for per-block expansion tracking
+                let thinking_hash = {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut h = DefaultHasher::new();
+                    thinking.hash(&mut h);
+                    h.finish()
+                };
+                let expanded = ctx.show_thinking || ctx.expanded_thinking.contains(&thinking_hash);
                 lines.extend(prefix_message_lines(
-                    render_thinking_block(&thinking, ctx.show_thinking),
+                    render_thinking_block(&thinking, expanded),
                     &msg.role,
                     ctx.width,
                 ));
@@ -776,6 +788,31 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
                     &msg.role,
                     ctx.width,
                 ));
+            }
+            ContentBlock::UserLocalCommandOutput { command, output } => {
+                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
+                lines.extend(render_user_local_command_output(&command, &output, 30));
+            }
+            ContentBlock::UserCommand { name, args } => {
+                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
+                lines.extend(render_user_command(&name, &args));
+            }
+            ContentBlock::UserMemoryInput { key, value } => {
+                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
+                lines.extend(render_user_memory_input(&key, &value));
+            }
+            ContentBlock::SystemAPIError { message, retry_secs } => {
+                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
+                lines.extend(render_system_api_error(&message, retry_secs));
+            }
+            ContentBlock::CollapsedReadSearch { tool_name, paths, n_hidden } => {
+                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
+                let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+                lines.extend(render_collapsed_read_search(&tool_name, &path_refs, n_hidden));
+            }
+            ContentBlock::TaskAssignment { id, subject, description } => {
+                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
+                lines.extend(render_task_assignment(&id, &subject, &description));
             }
         }
     }

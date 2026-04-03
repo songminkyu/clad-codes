@@ -163,6 +163,70 @@ struct Cli {
     /// Disable auto-compaction
     #[arg(long = "no-auto-compact", action = ArgAction::SetTrue)]
     no_auto_compact: bool,
+
+    /// Grant Claude access to an additional directory (can be repeated)
+    #[arg(long = "add-dir", value_name = "DIR", action = ArgAction::Append)]
+    add_dir: Vec<PathBuf>,
+
+    /// Input format for --print mode (text or stream-json)
+    #[arg(long = "input-format", value_enum, default_value_t = CliInputFormat::Text)]
+    input_format: CliInputFormat,
+
+    /// Session ID to tag this headless run (for tracking in logs/hooks)
+    #[arg(long = "session-id")]
+    session_id_flag: Option<String>,
+
+    /// Prefill the first assistant turn with this text
+    #[arg(long = "prefill")]
+    prefill: Option<String>,
+
+    /// Effort level for extended thinking (low, medium, high, max)
+    #[arg(long = "effort", value_name = "LEVEL")]
+    effort: Option<String>,
+
+    /// Extended thinking budget in tokens (enables extended thinking)
+    #[arg(long = "thinking", value_name = "TOKENS")]
+    thinking: Option<u32>,
+
+    /// Continue the most recent conversation
+    #[arg(short = 'c', long = "continue", action = ArgAction::SetTrue)]
+    continue_session: bool,
+
+    /// Override system prompt from a file
+    #[arg(long = "system-prompt-file")]
+    system_prompt_file: Option<PathBuf>,
+
+    /// Tools to allow (comma-separated, default: all)
+    #[arg(long = "allowed-tools", value_name = "TOOLS")]
+    allowed_tools: Option<String>,
+
+    /// Tools to disallow (comma-separated)
+    #[arg(long = "disallowed-tools", value_name = "TOOLS")]
+    disallowed_tools: Option<String>,
+
+    /// Extra beta feature headers to send (comma-separated)
+    #[arg(long = "betas", value_name = "HEADERS")]
+    betas: Option<String>,
+
+    /// Disable all slash commands
+    #[arg(long = "disable-slash-commands", action = ArgAction::SetTrue)]
+    disable_slash_commands: bool,
+
+    /// Run in bare mode (no hooks, no plugins, no CLAUDE.md)
+    #[arg(long = "bare", action = ArgAction::SetTrue)]
+    bare: bool,
+
+    /// Billing workload tag
+    #[arg(long = "workload", value_name = "TAG")]
+    workload: Option<String>,
+
+    /// Maximum spend in USD before aborting the query loop
+    #[arg(long = "max-budget-usd", value_name = "USD")]
+    max_budget_usd: Option<f64>,
+
+    /// Fallback model to use if the primary model is overloaded or unavailable
+    #[arg(long = "fallback-model")]
+    fallback_model: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -200,6 +264,15 @@ impl From<CliOutputFormat> for cc_core::config::OutputFormat {
             CliOutputFormat::StreamJson => cc_core::config::OutputFormat::StreamJson,
         }
     }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum CliInputFormat {
+    /// Plain text prompt (default)
+    Text,
+    /// Newline-delimited JSON messages — each line is {"role":"user"|"assistant","content":"..."}
+    #[value(name = "stream-json")]
+    StreamJson,
 }
 
 fn resolve_bridge_config(
@@ -261,6 +334,7 @@ async fn main() -> anyhow::Result<()> {
                     session_id: "pre-session".to_string(),
                     session_title: None,
                     remote_session_url: None,
+                    mcp_manager: None,
                 };
                 // Collect remaining args after the command name
                 let rest: Vec<&str> = raw_args[2..].iter().map(|s| s.as_str()).collect();
@@ -328,10 +402,18 @@ async fn main() -> anyhow::Result<()> {
         config.append_system_prompt = Some(asp);
     }
     if cli.dangerously_skip_permissions {
+        // Mirror TS setup.ts: block bypass mode when running as root/sudo.
+        #[cfg(unix)]
+        if nix::unistd::Uid::effective().is_root() {
+            anyhow::bail!(
+                "--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons"
+            );
+        }
         config.permission_mode = PermissionMode::BypassPermissions;
     } else {
         config.permission_mode = cli.permission_mode.into();
     }
+    config.additional_dirs = cli.add_dir.clone();
     if cli.no_auto_compact {
         config.auto_compact = false;
     }
@@ -425,7 +507,11 @@ async fn main() -> anyhow::Result<()> {
         })
     };
     let cost_tracker = CostTracker::new();
-    let session_id = uuid::Uuid::new_v4().to_string();
+    // Use --session-id if provided, otherwise generate a fresh UUID.
+    let session_id = cli
+        .session_id_flag
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let file_history = Arc::new(ParkingMutex::new(
         cc_core::file_history::FileHistory::new(),
     ));
@@ -489,6 +575,22 @@ async fn main() -> anyhow::Result<()> {
     query_config.system_prompt = Some(system_prompt);
     query_config.append_system_prompt = None;
     query_config.working_directory = Some(cwd.display().to_string());
+    if let Some(tokens) = cli.thinking {
+        query_config.thinking_budget = Some(tokens);
+    }
+    if let Some(ref level_str) = cli.effort {
+        if let Some(level) = cc_core::effort::EffortLevel::from_str(level_str) {
+            query_config.effort_level = Some(level);
+        } else {
+            eprintln!("Warning: unknown effort level '{}' — expected low/medium/high/max", level_str);
+        }
+    }
+    if let Some(usd) = cli.max_budget_usd {
+        query_config.max_budget_usd = Some(usd);
+    }
+    if let Some(ref fb) = cli.fallback_model {
+        query_config.fallback_model = Some(fb.clone());
+    }
 
     // Spawn the background cron scheduler (fires cron tasks at scheduled times).
     // Cancelled automatically when the process exits since we use a shared token.
@@ -515,6 +617,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         run_interactive(
             config,
+            settings,
             client,
             tools,
             tool_ctx,
@@ -579,20 +682,80 @@ async fn run_headless(
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
-    // Read prompt from positional arg or stdin
-    let prompt = if let Some(ref p) = cli.prompt {
-        p.clone()
+    // Build initial messages list from input.
+    // --input-format stream-json: stdin is newline-delimited JSON, each line is
+    //   {"role":"user"|"assistant","content":"..."} (mirrors TS --input-format stream-json).
+    // --input-format text (default): read prompt from positional arg or entire stdin as text.
+    let mut messages: Vec<cc_core::types::Message> = if cli.input_format == CliInputFormat::StreamJson {
+        use tokio::io::{self, AsyncBufReadExt, BufReader};
+        let stdin = io::stdin();
+        let mut reader = BufReader::new(stdin);
+        let mut line = String::new();
+        let mut parsed: Vec<cc_core::types::Message> = Vec::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                break;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<serde_json::Value>(trimmed) {
+                Ok(v) => {
+                    let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                    let content = v
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if role == "assistant" {
+                        parsed.push(cc_core::types::Message::assistant(content));
+                    } else {
+                        parsed.push(cc_core::types::Message::user(content));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Warning: skipping malformed JSON line: {} ({:?})", trimmed, e);
+                }
+            }
+        }
+        if parsed.is_empty() {
+            // Also check positional arg as fallback
+            if let Some(ref p) = cli.prompt {
+                parsed.push(cc_core::types::Message::user(p.clone()));
+            }
+        }
+        parsed
     } else {
-        // Read from stdin
-        use tokio::io::{self, AsyncReadExt};
-        let mut stdin = io::stdin();
-        let mut buf = String::new();
-        stdin.read_to_string(&mut buf).await?;
-        buf.trim().to_string()
+        // Plain text mode
+        let prompt = if let Some(ref p) = cli.prompt {
+            p.clone()
+        } else {
+            use tokio::io::{self, AsyncReadExt};
+            let mut stdin = io::stdin();
+            let mut buf = String::new();
+            stdin.read_to_string(&mut buf).await?;
+            buf.trim().to_string()
+        };
+
+        if prompt.is_empty() {
+            eprintln!("Error: No prompt provided. Use --print <prompt> or pipe text to stdin.");
+            std::process::exit(1);
+        }
+
+        vec![cc_core::types::Message::user(prompt)]
     };
 
-    if prompt.is_empty() {
-        eprintln!("Error: No prompt provided. Use --print <prompt> or pipe text to stdin.");
+    // --prefill: inject a partial assistant turn before the query so the model
+    // continues from that text (mirrors TS --prefill flag).
+    if let Some(ref prefill_text) = cli.prefill {
+        messages.push(cc_core::types::Message::assistant(prefill_text.clone()));
+    }
+
+    if messages.is_empty() {
+        eprintln!("Error: No messages provided.");
         std::process::exit(1);
     }
 
@@ -601,9 +764,6 @@ async fn run_headless(
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueryEvent>();
     let cancel = CancellationToken::new();
-
-    // Spawn the query loop in a background task so we can drain events concurrently
-    let mut messages = vec![cc_core::types::Message::user(prompt)];
     let client_clone = client.clone();
     let tool_ctx_clone = tool_ctx.clone();
     let qcfg = query_config.clone();
@@ -737,9 +897,19 @@ async fn run_headless(
                     cost_tracker.total_cost_usd(),
                 );
             }
-            if let QueryOutcome::Error(e) = outcome {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+            match outcome {
+                QueryOutcome::Error(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+                QueryOutcome::BudgetExceeded { cost_usd, limit_usd } => {
+                    eprintln!(
+                        "Budget limit ${:.4} reached (spent ${:.4}). Stopping.",
+                        limit_usd, cost_usd
+                    );
+                    std::process::exit(2);
+                }
+                _ => {}
             }
         }
     }
@@ -753,6 +923,7 @@ async fn run_headless(
 
 async fn run_interactive(
     config: Config,
+    settings: cc_core::config::Settings,
     client: Arc<cc_api::AnthropicClient>,
     tools: Arc<Vec<Box<dyn cc_tools::Tool>>>,
     tool_ctx: ToolContext,
@@ -813,12 +984,82 @@ async fn run_interactive(
     // Set up terminal
     let mut terminal = setup_terminal()?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    // Sync initial effort level (from --effort flag or /effort command) to TUI indicator.
+    if let Some(level) = base_query_config.effort_level {
+        use cc_tui::EffortLevel as TuiEL;
+        app.effort_level = match level {
+            cc_core::effort::EffortLevel::Low    => TuiEL::Low,
+            cc_core::effort::EffortLevel::Medium => TuiEL::Normal,
+            cc_core::effort::EffortLevel::High   => TuiEL::High,
+            cc_core::effort::EffortLevel::Max    => TuiEL::Max,
+        };
+    }
     app.config.project_dir = Some(tool_ctx.working_dir.clone());
     app.attach_turn_diff_state(tool_ctx.file_history.clone(), tool_ctx.current_turn.clone());
     if let Some(manager) = tool_ctx.mcp_manager.clone() {
         app.attach_mcp_manager(manager);
     }
     app.replace_messages(initial_messages.clone());
+
+    // Home directory warning: mirror TS feedConfigs.tsx warningText
+    let home_dir = dirs::home_dir();
+    if home_dir.as_deref() == Some(tool_ctx.working_dir.as_path()) {
+        app.home_dir_warning = true;
+    }
+
+    // Bypass permissions confirmation dialog: must be accepted before any work
+    // Mirror TS BypassPermissionsModeDialog.tsx startup gate
+    use cc_core::config::PermissionMode;
+    if live_config.permission_mode == PermissionMode::BypassPermissions {
+        app.bypass_permissions_dialog.show();
+    }
+
+    // Version-upgrade notice: record the current version for future comparisons.
+    // (Actual upgrade notice UI is handled by the release-notes slash command.)
+    {
+        let current_version = cc_core::constants::APP_VERSION.to_string();
+        if settings.last_seen_version.as_deref() != Some(&current_version) {
+            // Persist asynchronously to avoid blocking startup.
+            let version_clone = current_version.clone();
+            tokio::spawn(async move {
+                if let Ok(mut s) = cc_core::config::Settings::load().await {
+                    s.last_seen_version = Some(version_clone);
+                    let _ = s.save().await;
+                }
+            });
+        }
+    }
+
+    // CLAUDE_STATUS_COMMAND: optional external command whose stdout replaces the
+    // left-side status bar text. Polled every 500ms (debounced) in the main loop.
+    // The command is run in a background task; results flow through a channel.
+    let status_cmd_str = std::env::var("CLAUDE_STATUS_COMMAND").ok();
+    let (status_cmd_tx, mut status_cmd_rx) = mpsc::channel::<String>(4);
+    if let Some(ref cmd_str) = status_cmd_str {
+        let cmd_str = cmd_str.clone();
+        let tx = status_cmd_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                // Run via shell so pipes/redirects in the command string work.
+                let output = if cfg!(target_os = "windows") {
+                    tokio::process::Command::new("cmd")
+                        .args(["/C", &cmd_str])
+                        .output()
+                        .await
+                } else {
+                    tokio::process::Command::new("sh")
+                        .args(["-c", &cmd_str])
+                        .output()
+                        .await
+                };
+                if let Ok(out) = output {
+                    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    let _ = tx.try_send(text);
+                }
+            }
+        });
+    }
 
     // Bridge runtime channels — Some when bridge is configured and started.
     //
@@ -864,6 +1105,7 @@ async fn run_interactive(
         session_id: session.id.clone(),
         session_title: session.title.clone(),
         remote_session_url: session.remote_session_url.clone(),
+        mcp_manager: tool_ctx.mcp_manager.clone(),
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
@@ -874,6 +1116,9 @@ async fn run_interactive(
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueryEvent>();
     type MessagesArc = Arc<tokio::sync::Mutex<Vec<cc_core::types::Message>>>;
     let mut current_query: Option<(tokio::task::JoinHandle<QueryOutcome>, MessagesArc)> = None;
+    // Active effort level (None = use model default / High).
+    // Tracks the user's /effort selection; flows into qcfg each turn.
+    let mut current_effort: Option<cc_core::effort::EffortLevel> = None;
 
     'main: loop {
         app.frame_count = app.frame_count.wrapping_add(1);
@@ -918,6 +1163,16 @@ async fn run_interactive(
 
                     // Enter => submit input
                     if key.code == KeyCode::Enter && !app.is_streaming {
+                        // If a slash-command suggestion is active, accept it
+                        // and wait for the next Enter to actually submit.
+                        if !app.prompt_input.suggestions.is_empty()
+                            && app.prompt_input.suggestion_index.is_some()
+                            && app.prompt_input.text.starts_with('/')
+                        {
+                            app.prompt_input.accept_suggestion();
+                            continue;
+                        }
+
                         let input = app.take_input();
                         if input.is_empty() {
                             continue;
@@ -925,8 +1180,67 @@ async fn run_interactive(
 
                         // Check for slash command
                         if input.starts_with('/') {
+                            let (cmd_name, cmd_args) =
+                                cc_tui::input::parse_slash_command(&input);
+                            let cmd_name = cmd_name.to_string();
+                            let cmd_args = cmd_args.to_string();
+
+                            // ── Step 1: TUI-layer intercept (overlays, toggles) ────────
+                            // Run first so we know whether a UI overlay opened, which
+                            // lets us suppress redundant CLI text output below.
+                            //
+                            // Skip TUI overlay for arg-bearing commands where the user
+                            // wants to SET state, not browse a picker:
+                            //   /model claude-haiku  → set model, don't open picker
+                            //   /theme dark          → set theme, don't open picker
+                            //   /resume <id>         → load session, don't open browser
+                            // Also skip TUI for /vim, /voice, /fast with explicit
+                            // on|off args so the blind-toggle doesn't misfire.
+                            let skip_tui_for_args = !cmd_args.is_empty()
+                                && matches!(
+                                    cmd_name.as_str(),
+                                    "model" | "theme" | "resume" | "session"
+                                        | "vim" | "vi" | "voice" | "fast" | "speed"
+                                );
+                            let handled_by_tui = if skip_tui_for_args {
+                                false
+                            } else {
+                                app.intercept_slash_command(&cmd_name)
+                            };
+
+                            // Sync effort level when TUI cycled the visual indicator
+                            // (no-args /effort → cycle Low→Med→High→Max→Low).
+                            if handled_by_tui && cmd_name == "effort" && cmd_args.is_empty() {
+                                current_effort = Some(match app.effort_level {
+                                    cc_tui::EffortLevel::Low =>
+                                        cc_core::effort::EffortLevel::Low,
+                                    cc_tui::EffortLevel::Normal =>
+                                        cc_core::effort::EffortLevel::Medium,
+                                    cc_tui::EffortLevel::High =>
+                                        cc_core::effort::EffortLevel::High,
+                                    cc_tui::EffortLevel::Max =>
+                                        cc_core::effort::EffortLevel::Max,
+                                });
+                            }
+
+                            // Honour exit/quit triggered by TUI intercept immediately.
+                            if app.should_quit {
+                                break 'main;
+                            }
+
+                            // ── Step 2: CLI-layer (real side effects) ──────────────────
+                            // Handles: config changes, session ops, file I/O, OAuth, etc.
+                            // Always runs — some commands need BOTH (e.g. /clear clears
+                            // app state via TUI AND the messages vec via CLI).
                             cmd_ctx.messages = messages.clone();
-                            match execute_command(&input, &mut cmd_ctx).await {
+                            let cli_result = execute_command(&input, &mut cmd_ctx).await;
+                            // Start optimistically true; set false for Silent/None below.
+                            let mut handled_by_cli = cli_result.is_some();
+
+                            // Whether we need to fall through and submit a user message.
+                            let mut submit_user_msg: Option<String> = None;
+
+                            match cli_result {
                                 Some(CommandResult::Exit) => break 'main,
                                 Some(CommandResult::ClearConversation) => {
                                     messages.clear();
@@ -937,7 +1251,8 @@ async fn run_interactive(
                                         Some("Conversation cleared.".to_string());
                                 }
                                 Some(CommandResult::SetMessages(new_msgs)) => {
-                                    let removed = messages.len().saturating_sub(new_msgs.len());
+                                    let removed =
+                                        messages.len().saturating_sub(new_msgs.len());
                                     messages = new_msgs.clone();
                                     app.replace_messages(new_msgs);
                                     session.messages = messages.clone();
@@ -964,17 +1279,21 @@ async fn run_interactive(
                                     tool_ctx.file_history = Arc::new(ParkingMutex::new(
                                         cc_core::file_history::FileHistory::new(),
                                     ));
-                                    tool_ctx.current_turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                                    tool_ctx.current_turn = Arc::new(
+                                        std::sync::atomic::AtomicUsize::new(0),
+                                    );
                                     cmd_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_title = session.title.clone();
                                     if let Some(saved_dir) = session.working_dir.as_ref() {
-                                        let saved_path = std::path::PathBuf::from(saved_dir);
+                                        let saved_path =
+                                            std::path::PathBuf::from(saved_dir);
                                         if saved_path.exists() {
                                             tool_ctx.working_dir = saved_path.clone();
                                             cmd_ctx.working_dir = saved_path;
                                         }
                                     }
-                                    app.config.project_dir = Some(tool_ctx.working_dir.clone());
+                                    app.config.project_dir =
+                                        Some(tool_ctx.working_dir.clone());
                                     app.attach_turn_diff_state(
                                         tool_ctx.file_history.clone(),
                                         tool_ctx.current_turn.clone(),
@@ -988,42 +1307,73 @@ async fn run_interactive(
                                     session.title = Some(title.clone());
                                     session.updated_at = chrono::Utc::now();
                                     cmd_ctx.session_title = session.title.clone();
-                                    let _ = cc_core::history::save_session(&session).await;
-                                    app.status_message =
-                                        Some(format!("Session renamed to \"{}\".", title));
+                                    let _ =
+                                        cc_core::history::save_session(&session).await;
+                                    app.status_message = Some(format!(
+                                        "Session renamed to \"{}\".",
+                                        title
+                                    ));
                                 }
                                 Some(CommandResult::Message(msg)) => {
-                                    app.push_message(cc_core::types::Message::assistant(msg));
+                                    // Suppress text output when TUI already opened an
+                                    // overlay for this command (e.g. /stats opens dialog
+                                    // AND would push a text message — drop the text).
+                                    if !handled_by_tui {
+                                        app.push_message(
+                                            cc_core::types::Message::assistant(msg),
+                                        );
+                                    }
                                 }
                                 Some(CommandResult::ConfigChange(new_cfg)) => {
                                     cmd_ctx.config = new_cfg.clone();
-                                    app.config = new_cfg;
+                                    app.config = new_cfg.clone();
+                                    // Sync model name shown in the TUI header.
+                                    if let Some(ref model) = new_cfg.model {
+                                        app.model_name = model.clone();
+                                    }
+                                    // Sync fast_mode visual indicator.
+                                    app.fast_mode = new_cfg.model
+                                        .as_deref()
+                                        .map(|m| m.contains("haiku"))
+                                        .unwrap_or(false);
+                                    // Sync plan_mode visual indicator.
+                                    app.plan_mode = matches!(
+                                        new_cfg.permission_mode,
+                                        cc_core::config::PermissionMode::Plan
+                                    );
                                     app.status_message =
                                         Some("Configuration updated.".to_string());
                                 }
                                 Some(CommandResult::ConfigChangeMessage(new_cfg, msg)) => {
                                     cmd_ctx.config = new_cfg.clone();
+                                    // Sync model name + fast_mode visual indicator.
+                                    if let Some(ref model) = new_cfg.model {
+                                        app.model_name = model.clone();
+                                        app.fast_mode = model.contains("haiku");
+                                    } else {
+                                        // model reset to None means fast mode off.
+                                        app.fast_mode = false;
+                                    }
                                     app.config = new_cfg;
                                     app.status_message = Some(msg);
                                 }
                                 Some(CommandResult::UserMessage(msg)) => {
-                                    // Inject as user turn
-                                    messages.push(cc_core::types::Message::user(msg.clone()));
-                                    app.push_message(cc_core::types::Message::user(msg));
-                                    // Fall through to send to model
+                                    // Queue a user-visible turn for the model.
+                                    submit_user_msg = Some(msg);
                                 }
                                 Some(CommandResult::StartOAuthFlow(with_claude_ai)) => {
-                                    // Temporarily restore the terminal so the OAuth flow
-                                    // can print URLs and read stdin interactively.
                                     cc_tui::restore_terminal(&mut terminal).ok();
-                                    match oauth_flow::run_oauth_login_flow(with_claude_ai).await {
-                                        Ok(_result) => {
+                                    match oauth_flow::run_oauth_login_flow(
+                                        with_claude_ai,
+                                    )
+                                    .await
+                                    {
+                                        Ok(_) => {
                                             app.status_message =
                                                 Some("Login successful!".to_string());
-                                            // Note: updating the live client with new credentials
-                                            // requires a restart; inform the user.
                                             eprintln!(
-                                                "\nLogin successful! Please restart claude to use the new credentials."
+                                                "\nLogin successful! Please restart \
+                                                 claude to use the new credentials."
                                             );
                                             break 'main;
                                         }
@@ -1031,15 +1381,68 @@ async fn run_interactive(
                                             eprintln!("\nLogin failed: {}", e);
                                         }
                                     }
-                                    // Re-setup terminal
                                     terminal = cc_tui::setup_terminal()?;
                                 }
                                 Some(CommandResult::Error(e)) => {
                                     app.status_message = Some(format!("Error: {}", e));
                                 }
-                                Some(CommandResult::Silent) | None => {}
+                                Some(CommandResult::Silent) | None => {
+                                    handled_by_cli = false;
+                                }
                             }
-                            continue;
+
+                            // Sync effort visual + API level when CLI handled
+                            // /effort with explicit args (/effort high).
+                            if handled_by_cli
+                                && cmd_name == "effort"
+                                && !cmd_args.is_empty()
+                            {
+                                if let Some(level) =
+                                    cc_core::effort::EffortLevel::from_str(&cmd_args)
+                                {
+                                    current_effort = Some(level);
+                                    app.effort_level = match level {
+                                        cc_core::effort::EffortLevel::Low =>
+                                            cc_tui::EffortLevel::Low,
+                                        cc_core::effort::EffortLevel::Medium =>
+                                            cc_tui::EffortLevel::Normal,
+                                        cc_core::effort::EffortLevel::High =>
+                                            cc_tui::EffortLevel::High,
+                                        cc_core::effort::EffortLevel::Max =>
+                                            cc_tui::EffortLevel::Max,
+                                    };
+                                    app.status_message = Some(format!(
+                                        "Effort: {} {}",
+                                        app.effort_level.symbol(),
+                                        app.effort_level.label(),
+                                    ));
+                                }
+                            }
+
+                            // Sync vim mode when CLI handled /vim with explicit args.
+                            if handled_by_cli
+                                && matches!(cmd_name.as_str(), "vim" | "vi")
+                                && !cmd_args.is_empty()
+                            {
+                                app.prompt_input.vim_enabled =
+                                    matches!(cmd_args.trim(), "on" | "vim");
+                            }
+
+                            if !handled_by_cli && !handled_by_tui {
+                                app.status_message = Some(format!(
+                                    "Unknown command: /{}",
+                                    cmd_name
+                                ));
+                            }
+
+                            // If a UserMessage was queued (e.g. /compact), submit it.
+                            if let Some(msg) = submit_user_msg {
+                                messages.push(cc_core::types::Message::user(msg.clone()));
+                                app.push_message(cc_core::types::Message::user(msg));
+                                // Fall through to the send path below.
+                            } else {
+                                continue;
+                            }
                         }
 
                         // Fire UserPromptSubmit hook (non-blocking)
@@ -1061,9 +1464,30 @@ async fn run_interactive(
                             .await;
                         }
 
-                        // Regular user message
-                        messages.push(cc_core::types::Message::user(input.clone()));
-                        app.push_message(cc_core::types::Message::user(input.clone()));
+                        // Regular user message (with optional image attachments)
+                        let pending_imgs = app.prompt_input.clear_images();
+                        let user_msg = if pending_imgs.is_empty() {
+                            cc_core::types::Message::user(input.clone())
+                        } else {
+                            let mut blocks: Vec<cc_core::types::ContentBlock> = pending_imgs
+                                .iter()
+                                .filter_map(|img| {
+                                    cc_tui::image_paste::encode_image_base64(&img.path)
+                                        .map(|b64| cc_core::types::ContentBlock::Image {
+                                            source: cc_core::types::ImageSource {
+                                                source_type: "base64".to_string(),
+                                                media_type: Some("image/png".to_string()),
+                                                data: Some(b64),
+                                                url: None,
+                                            },
+                                        })
+                                })
+                                .collect();
+                            blocks.push(cc_core::types::ContentBlock::Text { text: input.clone() });
+                            cc_core::types::Message::user_blocks(blocks)
+                        };
+                        messages.push(user_msg.clone());
+                        app.push_message(user_msg);
                         session.messages = messages.clone();
                         session.updated_at = chrono::Utc::now();
 
@@ -1089,6 +1513,10 @@ async fn run_interactive(
                         qcfg.output_style = cmd_ctx.config.effective_output_style();
                         qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();
                         qcfg.working_directory = Some(tool_ctx.working_dir.display().to_string());
+                        // Apply active effort level (set via /effort command).
+                        if let Some(level) = current_effort {
+                            qcfg.effort_level = Some(level);
+                        }
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
                         let client_clone = client.clone();
@@ -1325,6 +1753,18 @@ async fn run_interactive(
         }
         if disconnect_bridge {
             bridge_runtime = None;
+        }
+
+        // Drain CLAUDE_STATUS_COMMAND results (most recent wins)
+        if status_cmd_str.is_some() {
+            loop {
+                match status_cmd_rx.try_recv() {
+                    Ok(text) => {
+                        app.status_line_override = if text.is_empty() { None } else { Some(text) };
+                    }
+                    Err(_) => break,
+                }
+            }
         }
 
         // Check if query task is done; sync messages from the task

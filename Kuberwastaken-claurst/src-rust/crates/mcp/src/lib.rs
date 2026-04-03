@@ -16,6 +16,7 @@
 use async_trait::async_trait;
 use cc_core::config::McpServerConfig;
 use cc_core::types::ToolDefinition;
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -355,6 +356,31 @@ pub mod types {
     pub struct ListPromptsResult {
         pub prompts: Vec<McpPrompt>,
     }
+
+    /// A single message returned by prompts/get.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct PromptMessage {
+        /// "user" or "assistant"
+        pub role: String,
+        pub content: PromptMessageContent,
+    }
+
+    /// Content inside a PromptMessage.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "lowercase")]
+    pub enum PromptMessageContent {
+        Text { text: String },
+        Image { data: String, mime_type: String },
+        Resource { resource: serde_json::Value },
+    }
+
+    /// prompts/get response.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct GetPromptResult {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+        pub messages: Vec<PromptMessage>,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -479,6 +505,7 @@ pub mod client {
         pub tools: Vec<McpTool>,
         pub resources: Vec<McpResource>,
         pub prompts: Vec<McpPrompt>,
+        pub instructions: Option<String>,
         transport: Arc<dyn transport::McpTransport>,
         next_id: AtomicU64,
         #[allow(dead_code)]
@@ -498,6 +525,7 @@ pub mod client {
                 tools: vec![],
                 resources: vec![],
                 prompts: vec![],
+                instructions: None,
                 transport: Arc::new(transport),
                 next_id: AtomicU64::new(1),
                 pending: Arc::new(Mutex::new(HashMap::new())),
@@ -526,6 +554,7 @@ pub mod client {
                 .map_err(|e| anyhow::anyhow!("MCP server '{}' initialize failed: {}", self.server_name, e))?;
 
             self.server_info = Some(result.server_info);
+            self.instructions = result.instructions;
             self.capabilities = result.capabilities.clone();
 
             // Send initialized notification
@@ -614,6 +643,23 @@ pub mod client {
             Ok(result.prompts)
         }
 
+        /// Invoke `prompts/get` with the given name and optional arguments map.
+        ///
+        /// Returns the expanded prompt messages that should be injected into the
+        /// conversation as-is (mirrors TS `getMCPPrompt`).
+        pub async fn get_prompt(
+            &self,
+            name: &str,
+            arguments: Option<std::collections::HashMap<String, String>>,
+        ) -> anyhow::Result<GetPromptResult> {
+            let mut params = serde_json::json!({ "name": name });
+            if let Some(args) = arguments {
+                params["arguments"] = serde_json::to_value(args)?;
+            }
+            let result: GetPromptResult = self.call("prompts/get", Some(params)).await?;
+            Ok(result)
+        }
+
         /// Get all tools as `ToolDefinition` objects suitable for the API.
         pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
             self.tools.iter().map(|t| t.into()).collect()
@@ -622,7 +668,7 @@ pub mod client {
         // ---- Internal RPC machinery ---------------------------------------
 
         /// Send a request and wait for the response, deserializing into T.
-        async fn call<T: for<'de> Deserialize<'de>>(
+        pub(crate) async fn call<T: for<'de> Deserialize<'de>>(
             &self,
             method: &str,
             params: Option<Value>,
@@ -668,6 +714,23 @@ pub mod client {
 }
 
 // ---------------------------------------------------------------------------
+// MCP Auth State
+// ---------------------------------------------------------------------------
+
+/// Authentication state for a single MCP server.
+#[derive(Debug, Clone)]
+pub enum McpAuthState {
+    /// Server does not require OAuth authentication.
+    NotRequired,
+    /// OAuth required; `auth_url` is where the user should go.
+    Required { auth_url: String },
+    /// Successfully authenticated; token may have an expiry.
+    Authenticated { token_expiry: Option<chrono::DateTime<chrono::Utc>> },
+    /// An error occurred reading / initiating auth.
+    Error(String),
+}
+
+// ---------------------------------------------------------------------------
 // MCP Manager: manages multiple server connections
 // ---------------------------------------------------------------------------
 
@@ -676,6 +739,10 @@ pub struct McpManager {
     clients: HashMap<String, McpClient>,
     /// Servers that failed to connect during `connect_all`.
     failed_servers: Vec<(String, String)>, // (name, error)
+    /// Original (unexpanded) server configs — needed for OAuth initiation.
+    server_configs: HashMap<String, McpServerConfig>,
+    /// Active resource subscriptions: (server_name, uri) → change event sender.
+    pub resource_subscriptions: DashMap<(String, String), tokio::sync::mpsc::Sender<ResourceChangedEvent>>,
 }
 
 #[derive(Debug, Clone)]
@@ -692,6 +759,8 @@ impl McpManager {
         Self {
             clients: HashMap::new(),
             failed_servers: Vec::new(),
+            server_configs: HashMap::new(),
+            resource_subscriptions: DashMap::new(),
         }
     }
 
@@ -704,6 +773,8 @@ impl McpManager {
     pub async fn connect_all(configs: &[McpServerConfig]) -> Self {
         let mut manager = Self::new();
         for config in configs {
+            // Store original config for later OAuth use
+            manager.server_configs.insert(config.name.clone(), config.clone());
             // Expand env vars before using the config
             let expanded = expand_server_config(config);
 
@@ -865,8 +936,12 @@ impl McpManager {
 
     /// Get server instructions (from initialize response).
     pub fn server_instructions(&self) -> Vec<(String, String)> {
-        // McpClient doesn't store instructions yet; placeholder
-        vec![]
+        self.clients
+            .iter()
+            .filter_map(|(name, client)| {
+                client.instructions.as_ref().map(|instr| (name.clone(), instr.clone()))
+            })
+            .collect()
     }
 
     /// List all resources from all (or a specific) connected server.
@@ -914,6 +989,220 @@ impl McpManager {
 
         let contents = client.read_resource(uri).await?;
         Ok(serde_json::to_value(&contents)?)
+    }
+
+    /// List all prompts from all (or a specific) connected server.
+    pub async fn list_all_prompts(
+        &self,
+        server_filter: Option<&str>,
+    ) -> Vec<serde_json::Value> {
+        let mut all = vec![];
+        for (name, client) in &self.clients {
+            if let Some(filter) = server_filter {
+                if name != filter {
+                    continue;
+                }
+            }
+            match client.list_prompts().await {
+                Ok(prompts) => {
+                    for p in prompts {
+                        all.push(serde_json::json!({
+                            "name": p.name,
+                            "description": p.description,
+                            "arguments": p.arguments,
+                            "server": name,
+                        }));
+                    }
+                }
+                Err(e) => {
+                    warn!(server = %name, error = %e, "Failed to list prompts");
+                }
+            }
+        }
+        all
+    }
+
+    /// Get an expanded prompt from a named server by prompt name and arguments.
+    ///
+    /// Returns the `GetPromptResult` with fully-rendered messages suitable for
+    /// injection into the conversation (mirrors TS `getMCPPrompt`).
+    pub async fn get_prompt(
+        &self,
+        server_name: &str,
+        prompt_name: &str,
+        arguments: Option<std::collections::HashMap<String, String>>,
+    ) -> anyhow::Result<GetPromptResult> {
+        let client = self
+            .clients
+            .get(server_name)
+            .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found or not connected", server_name))?;
+        client.get_prompt(prompt_name, arguments).await
+    }
+
+    // -----------------------------------------------------------------------
+    // OAuth / authentication helpers
+    // -----------------------------------------------------------------------
+
+    /// Return the current authentication state for a server.
+    ///
+    /// - Returns `Authenticated` if a valid (non-expired) token exists on disk.
+    /// - Returns `NotRequired` for stdio servers (they don't use OAuth).
+    /// - Returns `Required` for HTTP servers that lack a valid token.
+    pub fn auth_state(&self, server_name: &str) -> McpAuthState {
+        // Check whether a token is already stored
+        if let Some(token) = oauth::get_mcp_token(server_name) {
+            if !token.is_expired(60) {
+                let token_expiry = token.expires_at.map(|ts| {
+                    chrono::DateTime::<chrono::Utc>::from(
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(ts),
+                    )
+                });
+                return McpAuthState::Authenticated { token_expiry };
+            }
+        }
+
+        // Determine server type from stored configs
+        let config = match self.server_configs.get(server_name) {
+            Some(c) => c,
+            None => return McpAuthState::NotRequired,
+        };
+
+        match config.server_type.as_str() {
+            "http" | "sse" => McpAuthState::Required {
+                auth_url: config
+                    .url
+                    .clone()
+                    .unwrap_or_else(|| "(unknown URL)".to_string()),
+            },
+            _ => McpAuthState::NotRequired,
+        }
+    }
+
+    /// Initiate OAuth 2.0 + PKCE for an HTTP MCP server.
+    ///
+    /// 1. GETs `<server_url>/.well-known/oauth-authorization-server`
+    /// 2. Parses `authorization_endpoint`
+    /// 3. Generates PKCE challenge
+    /// 4. Returns the full auth URL (browser opening done at the command layer)
+    ///
+    /// The PKCE verifier is *not* persisted here; it is embedded in the URL
+    /// so the command layer can display it.  A full end-to-end exchange would
+    /// store the verifier and wait for the callback — that is handled by
+    /// `oauth::exchange_code` once the code is received.
+    pub async fn initiate_auth(&self, server_name: &str) -> anyhow::Result<String> {
+        let config = self
+            .server_configs
+            .get(server_name)
+            .ok_or_else(|| anyhow::anyhow!("Unknown MCP server: {}", server_name))?;
+
+        let base_url = config
+            .url
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MCP server '{}' has no URL configured (required for OAuth)",
+                    server_name
+                )
+            })?
+            .trim_end_matches('/');
+
+        // 1. Fetch OAuth Authorization Server Metadata (RFC 8414)
+        let metadata_url = format!("{}/.well-known/oauth-authorization-server", base_url);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?;
+
+        let authorization_endpoint = match client.get(&metadata_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let meta: serde_json::Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("OAuth metadata parse error: {}", e))?;
+                meta.get("authorization_endpoint")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "OAuth metadata for '{}' missing 'authorization_endpoint'",
+                            server_name
+                        )
+                    })?
+            }
+            Ok(resp) => {
+                // Metadata endpoint not found — fall back to <base_url>/oauth/authorize
+                let status = resp.status();
+                debug!(
+                    server = %server_name,
+                    status = %status,
+                    "OAuth metadata endpoint returned non-success; using fallback"
+                );
+                format!("{}/oauth/authorize", base_url)
+            }
+            Err(e) => {
+                // Network error — fall back
+                debug!(server = %server_name, error = %e, "Failed to fetch OAuth metadata; using fallback");
+                format!("{}/oauth/authorize", base_url)
+            }
+        };
+
+        // 2. Allocate a redirect port
+        let redirect_port = oauth::oauth_port_alloc()
+            .map_err(|e| anyhow::anyhow!("Failed to allocate OAuth redirect port: {}", e))?;
+        let redirect_uri = format!("http://127.0.0.1:{}/callback", redirect_port);
+
+        // 3. Generate PKCE
+        let verifier = oauth::pkce_verifier();
+        let challenge = oauth::pkce_challenge(&verifier);
+
+        // 4. Build auth URL
+        let auth_url = format!(
+            "{}?client_id=claude-code&redirect_uri={}&response_type=code&code_challenge={}&code_challenge_method=S256",
+            authorization_endpoint,
+            urlencoding::encode(&redirect_uri),
+            challenge,
+        );
+
+        Ok(auth_url)
+    }
+
+    /// Store an OAuth access token for an MCP server.
+    ///
+    /// `expires_in` is the lifetime in seconds (as returned by the token endpoint).
+    pub fn store_token(
+        &self,
+        server_name: &str,
+        token: &str,
+        expires_in: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let expires_at = expires_in.map(|secs| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                + secs
+        });
+        let mcp_token = oauth::McpToken {
+            access_token: token.to_string(),
+            refresh_token: None,
+            expires_at,
+            scope: None,
+            server_name: server_name.to_string(),
+        };
+        oauth::store_mcp_token(&mcp_token)
+            .map_err(|e| anyhow::anyhow!("Failed to store MCP token for '{}': {}", server_name, e))
+    }
+
+    /// Load the stored OAuth access token for an MCP server, if any.
+    ///
+    /// Returns `None` if no token is stored or the token is expired.
+    pub fn load_token(&self, server_name: &str) -> Option<String> {
+        let token = oauth::get_mcp_token(server_name)?;
+        if token.is_expired(60) {
+            None
+        } else {
+            Some(token.access_token)
+        }
     }
 }
 
@@ -1186,14 +1475,44 @@ pub struct ResourceSubscription {
 }
 
 /// Subscribe to resource changes on an MCP server.
-/// Stubs the subscription request — real dispatch requires server notification stream.
-pub async fn subscribe_resource_stub(
+///
+/// Sends the `resources/subscribe` JSON-RPC request to the named server and
+/// returns a channel receiver that will deliver [`ResourceChangedEvent`] values
+/// whenever the server fires a `notifications/resources/updated` notification.
+/// The notification dispatch loop (elsewhere) looks up the tx in
+/// `manager.resource_subscriptions` and forwards events.
+///
+/// If the server is not connected or the RPC fails, a dead receiver is returned
+/// (no events will ever be delivered).
+pub async fn subscribe_resource(
+    manager: &McpManager,
     server_name: &str,
     uri: &str,
 ) -> tokio_mpsc::Receiver<ResourceChangedEvent> {
-    let (_tx, rx) = tokio_mpsc::channel(32);
-    // In production: send resources/subscribe RPC; store tx in connection state
-    tracing::info!(server_name, uri, "MCP resource subscription registered (stub)");
+    let make_dead = || {
+        let (_tx, rx) = tokio_mpsc::channel::<ResourceChangedEvent>(1);
+        rx
+    };
+
+    let client = match manager.clients.get(server_name) {
+        Some(c) => c,
+        None => {
+            tracing::warn!(server_name, uri, "subscribe_resource: server not connected");
+            return make_dead();
+        }
+    };
+
+    let params = serde_json::json!({ "uri": uri });
+    if let Err(e) = client.call::<serde_json::Value>("resources/subscribe", Some(params)).await {
+        tracing::warn!(server_name, uri, error = %e, "subscribe_resource RPC failed");
+        return make_dead();
+    }
+
+    let (tx, rx) = tokio_mpsc::channel(32);
+    manager
+        .resource_subscriptions
+        .insert((server_name.to_string(), uri.to_string()), tx);
+    tracing::info!(server_name, uri, "MCP resource subscription registered");
     rx
 }
 

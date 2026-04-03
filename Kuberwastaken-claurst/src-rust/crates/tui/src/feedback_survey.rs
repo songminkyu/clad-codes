@@ -206,7 +206,7 @@ pub fn render_feedback_survey(
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(Style::default().fg(Color::Rgb(215, 119, 87)));
+        .border_style(Style::default().fg(Color::Rgb(233, 30, 99)));
 
     let para = Paragraph::new(body_lines)
         .block(block)

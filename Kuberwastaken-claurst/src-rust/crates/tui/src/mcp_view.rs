@@ -92,6 +92,8 @@ pub struct McpViewState {
     pub tool_search: String,
     pub server_scroll: usize,
     pub tool_scroll: usize,
+    /// Whether the full error detail for the selected server is expanded.
+    pub error_expanded: bool,
 }
 
 impl McpViewState {
@@ -105,6 +107,7 @@ impl McpViewState {
             tool_search: String::new(),
             server_scroll: 0,
             tool_scroll: 0,
+            error_expanded: false,
         }
     }
 
@@ -114,7 +117,13 @@ impl McpViewState {
         self.selected_tool = 0;
         self.tool_search.clear();
         self.active_pane = McpViewPane::ServerList;
+        self.error_expanded = false;
         self.open = true;
+    }
+
+    /// Toggle full error detail for the currently selected server.
+    pub fn toggle_error_detail(&mut self) {
+        self.error_expanded = !self.error_expanded;
     }
 
     pub fn close(&mut self) { self.open = false; }
@@ -199,7 +208,7 @@ pub fn render_mcp_view(state: &McpViewState, area: Rect, buf: &mut Buffer) {
 
     Clear.render(dialog, buf);
     Block::default()
-        .title(" MCP Servers [Tab: pane, ↑↓: navigate, r: reconnect, Esc: close] ")
+        .title(" MCP Servers [Tab: pane, ↑↓: navigate, e: error detail, r: reconnect, Esc: close] ")
         .borders(Borders::ALL)
         .style(Style::default().fg(Color::Cyan))
         .render(dialog, buf);
@@ -329,6 +338,34 @@ fn render_tool_list(state: &McpViewState, area: Rect, buf: &mut Buffer) {
 fn render_tool_detail(state: &McpViewState, area: Rect, buf: &mut Buffer) {
     let focused = state.active_pane == McpViewPane::ToolDetail;
     let border_style = if focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) };
+
+    // If error is expanded, show full error text in this pane
+    if state.error_expanded {
+        if let Some(server) = state.servers.get(state.selected_server) {
+            if let Some(ref err_msg) = server.error_message {
+                Block::default()
+                    .title(" Error Detail [e: close] ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red))
+                    .render(area, buf);
+                let inner = Rect {
+                    x: area.x + 1,
+                    y: area.y + 1,
+                    width: area.width.saturating_sub(2),
+                    height: area.height.saturating_sub(2),
+                };
+                let lines: Vec<Line> = err_msg
+                    .lines()
+                    .map(|l| Line::from(vec![Span::styled(l.to_string(), Style::default().fg(Color::White))]))
+                    .collect();
+                Paragraph::new(lines)
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .render(inner, buf);
+                return;
+            }
+        }
+    }
+
     Block::default().title(" Tool Detail ").borders(Borders::ALL).border_style(border_style).render(area, buf);
 
     let inner = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: area.height.saturating_sub(2) };
@@ -400,6 +437,107 @@ fn render_tool_detail(state: &McpViewState, area: Rect, buf: &mut Buffer) {
     Paragraph::new(lines)
         .wrap(ratatui::widgets::Wrap { trim: false })
         .render(inner, buf);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn make_server(name: &str, status: McpViewStatus, error: Option<&str>) -> McpServerView {
+        McpServerView {
+            name: name.to_string(),
+            transport: "stdio".to_string(),
+            status,
+            tool_count: 2,
+            resource_count: 0,
+            prompt_count: 0,
+            resources: Vec::new(),
+            prompts: Vec::new(),
+            error_message: error.map(|e| e.to_string()),
+            tools: vec![
+                McpToolView {
+                    name: "tool_a".to_string(),
+                    server: name.to_string(),
+                    description: "Does A".to_string(),
+                    input_schema: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn mcp_view_state_defaults() {
+        let state = McpViewState::new();
+        assert!(!state.open);
+        assert!(!state.error_expanded);
+        assert_eq!(state.selected_server, 0);
+    }
+
+    #[test]
+    fn mcp_view_open_resets_error_expanded() {
+        let mut state = McpViewState::new();
+        state.error_expanded = true;
+        state.open(vec![make_server("test", McpViewStatus::Connected, None)]);
+        assert!(!state.error_expanded, "open() should reset error_expanded");
+        assert!(state.open);
+    }
+
+    #[test]
+    fn mcp_view_toggle_error_detail() {
+        let mut state = McpViewState::new();
+        assert!(!state.error_expanded);
+        state.toggle_error_detail();
+        assert!(state.error_expanded);
+        state.toggle_error_detail();
+        assert!(!state.error_expanded);
+    }
+
+    #[test]
+    fn mcp_view_renders_without_panic() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let mut state = McpViewState::new();
+        state.open(vec![
+            make_server("fs-server", McpViewStatus::Connected, None),
+            make_server("err-server", McpViewStatus::Error, Some("connection refused")),
+        ]);
+        terminal.draw(|frame| {
+            render_mcp_view(&state, frame.area(), frame.buffer_mut());
+        }).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let content: String = buf.content().iter().map(|c| c.symbol().chars().next().unwrap_or(' ')).collect();
+        assert!(content.contains("MCP") || content.contains("Servers"));
+    }
+
+    #[test]
+    fn mcp_view_error_expanded_renders_error_detail() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let mut state = McpViewState::new();
+        state.open(vec![make_server("broken", McpViewStatus::Error, Some("timeout: no response"))]);
+        state.error_expanded = true;
+        terminal.draw(|frame| {
+            render_mcp_view(&state, frame.area(), frame.buffer_mut());
+        }).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let content: String = buf.content().iter().map(|c| c.symbol().chars().next().unwrap_or(' ')).collect();
+        assert!(content.contains("timeout") || content.contains("Error Detail"));
+    }
+
+    #[test]
+    fn mcp_view_closed_renders_nothing() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let state = McpViewState::new(); // open = false
+        let before = terminal.backend().buffer().clone();
+        terminal.draw(|frame| {
+            render_mcp_view(&state, frame.area(), frame.buffer_mut());
+        }).unwrap();
+        assert_eq!(terminal.backend().buffer().content(), before.content());
+    }
 }
 
 

@@ -338,24 +338,28 @@ fn current_unix_secs() -> u64 {
         .as_secs()
 }
 
-/// A single history entry with an optional Unix timestamp.
+/// A single history entry with an optional Unix timestamp and pinned state.
 #[derive(Debug, Clone)]
 pub struct HistoryEntry {
     pub text: String,
     /// Unix timestamp (seconds since epoch) when this entry was recorded.
     /// `None` for legacy entries without timestamps.
     pub timestamp: Option<u64>,
+    /// Whether this entry has been pinned by the user.  Pinned entries always
+    /// appear at the top of the history overlay list and are persisted to
+    /// `~/.claude/history_pins.json`.
+    pub pinned: bool,
 }
 
 impl HistoryEntry {
     /// Create a new entry stamped with the current time.
     pub fn new(text: String) -> Self {
-        Self { text, timestamp: Some(current_unix_secs()) }
+        Self { text, timestamp: Some(current_unix_secs()), pinned: false }
     }
 
     /// Create a legacy entry without a timestamp.
     pub fn legacy(text: String) -> Self {
-        Self { text, timestamp: None }
+        Self { text, timestamp: None, pinned: false }
     }
 
     /// Human-readable relative time: "just now", "2m ago", "3h ago", "2d ago", etc.
@@ -375,6 +379,41 @@ impl HistoryEntry {
         } else {
             format!("{}d ago", delta / 86400)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pinned-entry persistence  (~/.claude/history_pins.json)
+// ---------------------------------------------------------------------------
+
+fn pins_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".claude")
+        .join("history_pins.json")
+}
+
+/// Load the set of pinned entry texts from `~/.claude/history_pins.json`.
+/// Returns an empty set if the file does not exist or cannot be parsed.
+pub fn load_pinned_texts() -> std::collections::HashSet<String> {
+    let path = pins_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return std::collections::HashSet::new(),
+    };
+    serde_json::from_str::<std::collections::HashSet<String>>(&content)
+        .unwrap_or_default()
+}
+
+/// Persist `pinned_texts` to `~/.claude/history_pins.json`.
+/// Failures are silently ignored (best-effort).
+pub fn save_pinned_texts(pinned_texts: &std::collections::HashSet<String>) {
+    let path = pins_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(pinned_texts) {
+        let _ = std::fs::write(&path, json);
     }
 }
 
@@ -530,7 +569,20 @@ impl HistorySearchOverlay {
     }
 
     /// Open with a pre-built `Vec<HistoryEntry>` (timestamp-aware callers).
+    ///
+    /// Pinned state is loaded from `~/.claude/history_pins.json` and applied
+    /// to any matching entries.
     pub fn open_with_entries(entries: Vec<HistoryEntry>) -> Self {
+        let pinned_texts = load_pinned_texts();
+        let entries = entries
+            .into_iter()
+            .map(|mut e| {
+                if pinned_texts.contains(&e.text) {
+                    e.pinned = true;
+                }
+                e
+            })
+            .collect();
         let mut s = Self {
             visible: true,
             query: String::new(),
@@ -540,6 +592,29 @@ impl HistorySearchOverlay {
         };
         s.recompute_matches();
         s
+    }
+
+    /// Toggle the pinned state of the currently selected entry.
+    ///
+    /// Persists the updated pin set to `~/.claude/history_pins.json` and
+    /// recomputes the match list so the entry moves to/from the pinned section.
+    pub fn toggle_pin(&mut self) {
+        let Some(m) = self.matches.get(self.selected_idx) else { return };
+        let snap_idx = m.snapshot_idx;
+        let Some(entry) = self.snapshot.get_mut(snap_idx) else { return };
+        entry.pinned = !entry.pinned;
+
+        // Rebuild the persisted pin set from the full snapshot.
+        let pinned_texts: std::collections::HashSet<String> = self
+            .snapshot
+            .iter()
+            .filter(|e| e.pinned)
+            .map(|e| e.text.clone())
+            .collect();
+        save_pinned_texts(&pinned_texts);
+
+        // Recompute without moving selected_idx so the cursor stays stable.
+        self.recompute_matches();
     }
 
     // ------------------------------------------------------------------
@@ -569,8 +644,17 @@ impl HistorySearchOverlay {
             })
             .collect();
 
-        // Sort best score first; stable sort preserves insertion order for ties.
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort: pinned entries always first, then by score descending.
+        // Stable sort preserves insertion order for ties within each group.
+        scored.sort_by(|a, b| {
+            let a_pinned = self.snapshot.get(a.snapshot_idx).map_or(false, |e| e.pinned);
+            let b_pinned = self.snapshot.get(b.snapshot_idx).map_or(false, |e| e.pinned);
+            match (b_pinned, a_pinned) {
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                _ => b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal),
+            }
+        });
 
         self.matches = scored;
         // Clamp selection
@@ -658,10 +742,11 @@ pub fn render_history_search_overlay(
     }
 
     const VISIBLE_MATCHES: usize = 8;
-    let dialog_width = 68u16.min(area.width.saturating_sub(4));
+    let dialog_width = 72u16.min(area.width.saturating_sub(4));
     let match_count = overlay.matches.len().max(1);
     let rows = VISIBLE_MATCHES.min(match_count) as u16;
-    let dialog_height = (4 + rows).min(area.height.saturating_sub(4));
+    // +2 for blank separator + hint footer line, +2 for block borders
+    let dialog_height = (6 + rows).min(area.height.saturating_sub(4));
     let dialog_area = centered_rect(dialog_width, dialog_height, area);
 
     frame.render_widget(Clear, dialog_area);
@@ -703,10 +788,12 @@ pub fn render_history_search_overlay(
             let real_i = start + display_i;
             let is_selected = real_i == overlay.selected_idx;
 
+            // Resolve snapshot entry (for text, timestamp, pinned state).
+            let snap_entry: Option<&HistoryEntry> =
+                overlay.snapshot.get(match_entry.snapshot_idx);
+
             // Resolve entry text: prefer snapshot, fall back to passed-in history.
-            let entry_text: &str = overlay
-                .snapshot
-                .get(match_entry.snapshot_idx)
+            let entry_text: &str = snap_entry
                 .map(|e| e.text.as_str())
                 .or_else(|| {
                     history
@@ -715,18 +802,20 @@ pub fn render_history_search_overlay(
                 })
                 .unwrap_or("");
 
+            let is_pinned = snap_entry.map_or(false, |e| e.pinned);
+
             // Relative timestamp (right-aligned suffix)
-            let time_suffix: String = overlay
-                .snapshot
-                .get(match_entry.snapshot_idx)
+            let time_suffix: String = snap_entry
                 .map(|e| {
                     let t = e.relative_time();
                     if t.is_empty() { t } else { format!(" · {}", t) }
                 })
                 .unwrap_or_default();
 
-            // Available width for the entry text (account for prefix + time suffix)
-            let prefix_width: usize = 4; // "    " or "  ► "
+            // Pin star shown to the left of pinned entries: "★ " (2 chars wide)
+            // Available width for the entry text
+            let pin_prefix_width: usize = if is_pinned { 2 } else { 0 };
+            let prefix_width: usize = 4 + pin_prefix_width; // "    " or "  ► " + optional "★ "
             let time_width = UnicodeWidthStr::width(time_suffix.as_str());
             let max_text_chars = (dialog_width as usize)
                 .saturating_sub(prefix_width + time_width + 2);
@@ -752,6 +841,17 @@ pub fn render_history_search_overlay(
             );
 
             let mut row_spans: Vec<Span> = vec![Span::raw(prefix)];
+
+            // Pin star badge (shown for all pinned entries)
+            if is_pinned {
+                row_spans.push(Span::styled(
+                    "\u{2605} ",  // ★
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+
             row_spans.extend(text_spans);
             if !time_suffix.is_empty() {
                 row_spans.push(Span::styled(
@@ -766,9 +866,18 @@ pub fn render_history_search_overlay(
         }
     }
 
+    // Footer hint bar (below the match list)
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  \u{2191}\u{2193} navigate  \u{00b7}  Enter select  \u{00b7}  p pin/unpin  \u{00b7}  Esc cancel",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        ),
+    ]));
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" History Search (Esc to cancel) ")
+        .title(" History Search ")
         .border_style(Style::default().fg(Color::Cyan));
 
     let para = Paragraph::new(lines).block(block);
@@ -1624,6 +1733,7 @@ mod tests {
         let entry = HistoryEntry {
             text: "cmd".to_string(),
             timestamp: Some(five_mins_ago),
+            pinned: false,
         };
         assert_eq!(entry.relative_time(), "5m ago");
     }
@@ -1634,6 +1744,7 @@ mod tests {
         let entry = HistoryEntry {
             text: "cmd".to_string(),
             timestamp: Some(two_hours_ago),
+            pinned: false,
         };
         assert_eq!(entry.relative_time(), "2h ago");
     }
@@ -1644,6 +1755,7 @@ mod tests {
         let entry = HistoryEntry {
             text: "cmd".to_string(),
             timestamp: Some(three_days_ago),
+            pinned: false,
         };
         assert_eq!(entry.relative_time(), "3d ago");
     }

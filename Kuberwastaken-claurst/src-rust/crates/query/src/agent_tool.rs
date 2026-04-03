@@ -200,6 +200,8 @@ impl Tool for AgentTool {
             effort_level: None,
             command_queue: None,
             skill_index: None,
+            max_budget_usd: None,
+            fallback_model: None,
         };
 
         // Run the sub-agent loop.
@@ -241,6 +243,12 @@ impl Tool for AgentTool {
             }
             QueryOutcome::Error(e) => {
                 ToolResult::error(format!("Sub-agent error: {}", e))
+            }
+            QueryOutcome::BudgetExceeded { cost_usd, limit_usd } => {
+                ToolResult::error(format!(
+                    "Sub-agent stopped: budget ${:.4} exceeded (limit ${:.4})",
+                    cost_usd, limit_usd
+                ))
             }
         }
     }

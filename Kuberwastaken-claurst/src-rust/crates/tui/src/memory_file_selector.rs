@@ -167,7 +167,7 @@ pub fn render_memory_file_selector(
                 Span::styled(
                     format!("  \u{203a} {type_label} {}", file.display_path),
                     Style::default()
-                        .fg(Color::Rgb(215, 119, 87))
+                        .fg(Color::Rgb(233, 30, 99))
                         .add_modifier(Modifier::BOLD),
                 ),
                 new_tag,
@@ -192,7 +192,7 @@ pub fn render_memory_file_selector(
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Memory Files ")
-        .border_style(Style::default().fg(Color::Rgb(215, 119, 87)));
+        .border_style(Style::default().fg(Color::Rgb(233, 30, 99)));
 
     let para = Paragraph::new(lines)
         .block(block)

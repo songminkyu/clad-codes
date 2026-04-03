@@ -878,6 +878,7 @@ pub async fn reactive_compact(
     client: &cc_api::AnthropicClient,
     config: &crate::QueryConfig,
     cancel: tokio_util::sync::CancellationToken,
+    recently_modified: &[std::path::PathBuf],
 ) -> Result<CompactResult, cc_core::error::ClaudeError> {
     if cancel.is_cancelled() {
         return Err(cc_core::error::ClaudeError::Cancelled);
@@ -910,7 +911,7 @@ pub async fn reactive_compact(
     let original_token_estimate =
         estimate_tokens_for_messages(&stripped[..split_at]) as u64;
 
-    let new_messages =
+    let mut new_messages =
         summarise_head(client, &stripped, split_at, &config.model, 20_000).await?;
 
     // The summary lives as the first message in new_messages.
@@ -919,8 +920,30 @@ pub async fn reactive_compact(
         .map(|m| m.get_all_text())
         .unwrap_or_default();
 
-    // Phase 4: re-inject recently modified file context.
-    // (Stub — file tracking belongs to the TUI/session layer.)
+    // Phase 4: re-inject recently modified file context (up to 5 files, skip >50KB).
+    const MAX_FILES: usize = 5;
+    const MAX_FILE_BYTES: u64 = 50 * 1024;
+    let mut injected = 0;
+    for path in recently_modified.iter().take(MAX_FILES * 3) {
+        if injected >= MAX_FILES {
+            break;
+        }
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.len() > MAX_FILE_BYTES {
+            continue;
+        }
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let file_name = path.display().to_string();
+        let text = format!("<file path=\"{}\">\n{}\n</file>", file_name, content);
+        new_messages.push(cc_core::types::Message::user(text));
+        injected += 1;
+    }
 
     let tokens_after = estimate_tokens_for_messages(&new_messages) as u64;
     let tokens_freed = original_token_estimate.saturating_sub(tokens_after);
