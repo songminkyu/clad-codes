@@ -1,22 +1,22 @@
 [package]
-name = "claude-code"
+name = "claurst"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "claude"
+name = "claurst"
 path = "src/main.rs"
 
 [dependencies]
-cc-core = { workspace = true, features = ["voice"] }
-cc-api = { workspace = true }
-cc-tools = { workspace = true }
-cc-query = { workspace = true }
-cc-tui = { workspace = true }
-cc-commands = { workspace = true }
-cc-mcp = { workspace = true }
-cc-bridge = { workspace = true }
-cc-plugins = { workspace = true }
+claurst-core = { workspace = true, features = ["voice"] }
+claurst-api = { workspace = true }
+claurst-tools = { workspace = true }
+claurst-query = { workspace = true }
+claurst-tui = { workspace = true }
+claurst-commands = { workspace = true }
+claurst-mcp = { workspace = true }
+claurst-bridge = { workspace = true }
+claurst-plugins = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }
@@ -34,4 +34,10 @@ crossterm = { workspace = true }
 parking_lot = { workspace = true }
 dirs = { workspace = true }
 nix = { workspace = true }
+base64 = "0.22"
+sha2 = "0.10"
+open = "5"
+urlencoding = "2"
 
+[build-dependencies]
+chrono = { workspace = true }

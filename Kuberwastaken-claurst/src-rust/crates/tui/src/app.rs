@@ -7,6 +7,7 @@ use crate::dialogs::PermissionRequest;
 use crate::diff_viewer::{DiffViewerState, build_turn_diff};
 use crate::model_picker::{EffortLevel, ModelPickerState, FAST_MODE_MODEL};
 use crate::session_browser::SessionBrowserState;
+use crate::tasks_overlay::TasksOverlay;
 use crate::dialogs::McpApprovalDialogState;
 use crate::mcp_view::{McpServerView, McpToolView, McpViewState, McpViewStatus};
 use crate::notifications::{NotificationKind, NotificationQueue};
@@ -22,15 +23,16 @@ use crate::settings_screen::SettingsScreen;
 use crate::stats_dialog::StatsDialogState;
 use crate::theme_screen::ThemeScreen;
 use crate::{agents_view::{AgentInfo, AgentStatus, AgentsMenuState, AgentsRoute}, diff_viewer::DiffPane};
-use cc_core::config::{Config, Settings, Theme};
-use cc_core::cost::CostTracker;
-use cc_core::file_history::FileHistory;
-use cc_core::keybindings::{
+use claurst_core::config::{Config, Settings, Theme};
+use claurst_core::cost::CostTracker;
+use claurst_core::file_history::FileHistory;
+use claurst_core::keybindings::{
     KeyContext, KeybindingResolver, KeybindingResult, ParsedKeystroke, UserKeybindings,
 };
-use cc_core::types::{Message, Role};
-use cc_query::QueryEvent;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+use claurst_core::types::{Message, Role};
+use claurst_query::QueryEvent;
+use claurst_tools;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::cell::{Cell, RefCell};
@@ -51,7 +53,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("diff", "Inspect the current git diff"),
     ("doctor", "Run diagnostics"),
     ("effort", "Set effort level (low/medium/high/max)"),
-    ("exit", "Quit Claude Code"),
+    ("exit", "Quit Claurst"),
     ("export", "Export conversation"),
     ("fast", "Toggle fast mode"),
     ("feedback", "Open session feedback survey"),
@@ -60,7 +62,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("hooks", "Browse configured hooks (read-only)"),
     ("init", "Initialize CLAUDE.md for this project"),
     ("insights", "Generate a session analysis report with conversation statistics"),
-    ("install-slack-app", "Install the Claude Code Slack integration"),
+    ("install-slack-app", "Install the Claurst Slack integration"),
     ("keybindings", "Show keybinding configuration"),
     ("login", "Log in to Claude"),
     ("logout", "Log out of Claude"),
@@ -70,7 +72,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("output-style", "Toggle output style (auto/stream/verbose)"),
     ("plugin", "Manage plugins (list/info/enable/disable/reload)"),
     ("privacy", "Open privacy settings"),
-    ("quit", "Quit Claude Code"),
+    ("quit", "Quit Claurst"),
     ("rename", "Rename this session"),
     ("resume", "Resume a previous session"),
     ("review", "Review changes (git diff)"),
@@ -118,6 +120,74 @@ pub enum DisplayMessage {
     Conversation(Message),
     /// An injected system notice (e.g. compact boundary).
     System { text: String, style: SystemMessageStyle },
+}
+
+/// Context menu state: position and currently selected item index.
+#[derive(Debug, Clone, Copy)]
+pub struct ContextMenuState {
+    /// X coordinate of the menu (column).
+    pub x: u16,
+    /// Y coordinate of the menu (row).
+    pub y: u16,
+    /// Currently selected menu item index (0-based).
+    pub selected_index: usize,
+}
+
+/// Available context menu items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextMenuItem {
+    Copy,
+    CopyAsMarkdown,
+    CopyAsPlaintext,
+    CopyCodeBlocks,
+    CopyAsJson,
+    Paste,
+    Cut,
+    SelectAll,
+    Clear,
+}
+
+/// State for the Go to Line dialog (Ctrl+G in message pane).
+#[derive(Debug, Clone)]
+pub struct GoToLineDialog {
+    /// Input field for line number.
+    pub input: String,
+    /// Whether the dialog is currently active.
+    pub active: bool,
+    /// Total number of lines (for validation feedback).
+    pub total_lines: usize,
+}
+
+impl GoToLineDialog {
+    pub fn new() -> Self {
+        Self {
+            input: String::new(),
+            active: false,
+            total_lines: 0,
+        }
+    }
+
+    pub fn open(&mut self, total_lines: usize) {
+        self.input.clear();
+        self.active = true;
+        self.total_lines = total_lines;
+    }
+
+    pub fn close(&mut self) {
+        self.active = false;
+        self.input.clear();
+    }
+
+    /// Parse the input as a line number (1-indexed).
+    /// Returns None if invalid or out of range.
+    pub fn parse_line_number(&self) -> Option<usize> {
+        let line_num: usize = self.input.trim().parse().ok()?;
+        if line_num >= 1 && line_num <= self.total_lines {
+            Some(line_num)
+        } else {
+            None
+        }
+    }
 }
 
 /// Status of an active or completed tool call.
@@ -308,6 +378,8 @@ pub struct App {
     pub permission_request: Option<PermissionRequest>,
     pub frame_count: u64,
     pub token_count: u32,
+    /// Maximum token budget (from env var or model context window) — P2 feature flag
+    pub token_budget: Option<u32>,
     pub cost_usd: f64,
     pub model_name: String,
     /// Current effort level (controls extended-thinking budget_tokens).
@@ -371,7 +443,7 @@ pub struct App {
     /// Remote session URL (set when bridge connects; readable by commands).
     pub remote_session_url: Option<String>,
     /// Live MCP manager snapshot source when available.
-    pub mcp_manager: Option<Arc<cc_mcp::McpManager>>,
+    pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
     /// Queued request for a real MCP reconnect from the interactive loop.
     pub pending_mcp_reconnect: bool,
     /// Shared file-history service used for turn diff reconstruction.
@@ -426,12 +498,18 @@ pub struct App {
     pub model_picker: ModelPickerState,
     /// Session browser overlay (/session, /resume, /rename, /export).
     pub session_browser: SessionBrowserState,
+    /// Session branching overlay (Ctrl+B) — create and switch branches.
+    pub session_branching: crate::session_branching::SessionBranchingState,
+    /// Task progress overlay (Ctrl+T) — shows task status with toggle capability.
+    pub tasks_overlay: TasksOverlay,
     /// Export format picker dialog (/export).
     pub export_dialog: ExportDialogState,
     /// Context window / rate limit visualization overlay (/context).
     pub context_viz: ContextVizState,
     /// MCP server approval dialog.
     pub mcp_approval: McpApprovalDialogState,
+    /// Go to Line dialog (Ctrl+G in message pane).
+    pub go_to_line_dialog: GoToLineDialog,
     /// Bypass-permissions startup confirmation dialog.
     /// Shown at startup when --dangerously-skip-permissions was passed.
     /// User must explicitly accept or the session exits.
@@ -463,11 +541,11 @@ pub struct App {
     // ---- Voice hold-to-talk ------------------------------------------------
 
     /// The global voice recorder, Some when voice is enabled in config.
-    pub voice_recorder: Option<Arc<Mutex<cc_core::voice::VoiceRecorder>>>,
+    pub voice_recorder: Option<Arc<Mutex<claurst_core::voice::VoiceRecorder>>>,
     /// True while recording is active (Alt+V toggled on).
     pub voice_recording: bool,
     /// Receiver for VoiceEvent messages produced by the recorder task.
-    pub voice_event_rx: Option<tokio::sync::mpsc::Receiver<cc_core::voice::VoiceEvent>>,
+    pub voice_event_rx: Option<tokio::sync::mpsc::Receiver<claurst_core::voice::VoiceEvent>>,
     /// Receiver for model-list results fetched in the background when the
     /// /model picker opens.  Drained each frame so models appear as soon as
     /// the fetch completes.
@@ -499,6 +577,8 @@ pub struct App {
     pub thinking_row_map: RefCell<std::collections::HashMap<u16, u64>>,
     /// Total message lines from the last render (used for virtual row mapping).
     pub total_message_lines: Cell<usize>,
+    /// Scroll offset from the last render frame (used for selection validation).
+    pub last_render_scroll_offset: Cell<u16>,
 
     // ---- Text selection state --------------------------------------------
     /// Selection drag anchor (col, row) — set on mouse-down.
@@ -507,6 +587,16 @@ pub struct App {
     pub selection_focus: Option<(u16, u16)>,
     /// Text extracted from the current selection (updated each render frame).
     pub selection_text: RefCell<String>,
+
+    // ---- Advanced mouse interaction state --------------------------------
+    /// Timestamp of the last left mouse click (for double/triple-click detection).
+    pub last_click_time: Option<std::time::Instant>,
+    /// Position of the last left mouse click (for double/triple-click detection).
+    pub last_click_position: Option<(u16, u16)>,
+    /// Count of consecutive clicks: 1 = single, 2 = double, 3+ = triple.
+    pub click_count: u32,
+    /// Context menu state: position and selected index.
+    pub context_menu_state: Option<ContextMenuState>,
 
     // ---- Scroll acceleration state (trackpad feel) -----------------------
     /// Current acceleration multiplier for scroll events.
@@ -606,6 +696,7 @@ impl App {
             permission_request: None,
             frame_count: 0,
             token_count: 0,
+            token_budget: Self::load_token_budget(),
             cost_usd: 0.0,
             model_name,
             effort_level: EffortLevel::Normal,
@@ -657,9 +748,12 @@ impl App {
             elicitation: crate::elicitation_dialog::ElicitationDialogState::new(),
             model_picker: ModelPickerState::new(),
             session_browser: SessionBrowserState::new(),
+            session_branching: crate::session_branching::SessionBranchingState::new(),
+            tasks_overlay: TasksOverlay::new(),
             export_dialog: ExportDialogState::new(),
             context_viz: ContextVizState::new(),
             mcp_approval: McpApprovalDialogState::new(),
+            go_to_line_dialog: GoToLineDialog::new(),
             bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
             onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState::new(),
             home_dir_warning: false,
@@ -675,12 +769,12 @@ impl App {
             voice_recorder: {
                 // Check whether voice input has been enabled via the /voice command
                 // (stored in ~/.claude/ui-settings.json).  We also accept
-                // CLAUDE_CODE_VOICE_ENABLED=1 as an override for easier testing.
-                let voice_on = std::env::var("CLAUDE_CODE_VOICE_ENABLED")
+                // CLAURST_VOICE_ENABLED=1 as an override for easier testing.
+                let voice_on = std::env::var("CLAURST_VOICE_ENABLED")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false)
                     || {
-                        let path = cc_core::config::Settings::config_dir()
+                        let path = claurst_core::config::Settings::config_dir()
                             .join("ui-settings.json");
                         std::fs::read_to_string(&path)
                             .ok()
@@ -689,7 +783,7 @@ impl App {
                             .unwrap_or(false)
                     };
                 if voice_on {
-                    let recorder = cc_core::voice::global_voice_recorder();
+                    let recorder = claurst_core::voice::global_voice_recorder();
                     if let Ok(mut r) = recorder.lock() {
                         r.set_enabled(true);
                     }
@@ -712,13 +806,38 @@ impl App {
             last_msg_area: Cell::new(ratatui::layout::Rect::default()),
             thinking_row_map: RefCell::new(std::collections::HashMap::new()),
             total_message_lines: Cell::new(0),
+            last_render_scroll_offset: Cell::new(0),
             selection_anchor: None,
             selection_focus: None,
             selection_text: RefCell::new(String::new()),
+            last_click_time: None,
+            last_click_position: None,
+            click_count: 0,
+            context_menu_state: None,
             scroll_accel: 3.0,
             scroll_last_time: None,
             bash_prefix_allowlist: std::collections::HashSet::new(),
         }
+    }
+
+    /// Load token budget from environment or model defaults.
+    /// Returns Some(max_tokens) if available, None otherwise.
+    /// Only enabled when the `token_budget` feature flag is active.
+    #[cfg(feature = "token_budget")]
+    fn load_token_budget() -> Option<u32> {
+        // First check CLAURST_TOKEN_BUDGET env var
+        if let Ok(budget_str) = std::env::var("CLAURST_TOKEN_BUDGET") {
+            if let Ok(budget) = budget_str.parse::<u32>() {
+                return Some(budget);
+            }
+        }
+        // Could extend this to check model defaults, but for now just env var
+        None
+    }
+
+    #[cfg(not(feature = "token_budget"))]
+    fn load_token_budget() -> Option<u32> {
+        None
     }
 
     /// Update the active model name (also updates cost tracker).
@@ -733,6 +852,7 @@ impl App {
             "dark" => Theme::Dark,
             "light" => Theme::Light,
             "default" => Theme::Default,
+            "deuteranopia" => Theme::Deuteranopia,
             other => Theme::Custom(other.to_string()),
         };
         self.config.theme = theme;
@@ -757,6 +877,7 @@ impl App {
                     Theme::Dark => "dark",
                     Theme::Light => "light",
                     Theme::Default => "default",
+                    Theme::Deuteranopia => "deuteranopia",
                     Theme::Custom(s) => s.as_str(),
                 };
                 self.theme_screen.open(current);
@@ -816,7 +937,7 @@ impl App {
                 // Kick off a background fetch of the model list if we don't
                 // already have a fresh list and aren't already loading.
                 if !self.model_picker.models_loaded && !self.model_picker.loading_models {
-                    if let Ok(client) = cc_api::AnthropicClient::from_config(&self.config) {
+                    if let Ok(client) = claurst_api::AnthropicClient::from_config(&self.config) {
                         let (tx, rx) = tokio::sync::mpsc::channel(1);
                         self.model_fetch_rx = Some(rx);
                         self.model_picker.loading_models = true;
@@ -863,7 +984,7 @@ impl App {
                 true
             }
             "plan" => {
-                use cc_core::config::PermissionMode;
+                use claurst_core::config::PermissionMode;
                 self.plan_mode = !self.plan_mode;
                 self.config.permission_mode = if self.plan_mode {
                     PermissionMode::Plan
@@ -944,7 +1065,7 @@ impl App {
                     self.voice_mode_notice.dismiss();
                     self.status_message = Some("Voice mode disabled.".to_string());
                 } else {
-                    let recorder = cc_core::voice::global_voice_recorder();
+                    let recorder = claurst_core::voice::global_voice_recorder();
                     if let Ok(mut r) = recorder.lock() {
                         r.set_enabled(true);
                     }
@@ -1082,20 +1203,20 @@ impl App {
                         .collect();
 
                     let (status, error_message) = match manager.server_status(&server.name) {
-                        cc_mcp::McpServerStatus::Connected { .. } => {
+                        claurst_mcp::McpServerStatus::Connected { .. } => {
                             (McpViewStatus::Connected, None)
                         }
-                        cc_mcp::McpServerStatus::Connecting => {
+                        claurst_mcp::McpServerStatus::Connecting => {
                             (McpViewStatus::Connecting, None)
                         }
-                        cc_mcp::McpServerStatus::Disconnected { last_error } => {
+                        claurst_mcp::McpServerStatus::Disconnected { last_error } => {
                             if last_error.is_some() {
                                 (McpViewStatus::Error, last_error)
                             } else {
                                 (McpViewStatus::Disconnected, None)
                             }
                         }
-                        cc_mcp::McpServerStatus::Failed { error, .. } => {
+                        claurst_mcp::McpServerStatus::Failed { error, .. } => {
                             (McpViewStatus::Error, Some(error))
                         }
                     };
@@ -1254,7 +1375,7 @@ impl App {
     /// appropriate.  Call this after updating `token_count`.
     pub fn check_token_warnings(&mut self) {
         let window =
-            cc_query::context_window_for_model(&self.model_name) as u32;
+            claurst_query::context_window_for_model(&self.model_name) as u32;
         if window == 0 {
             return;
         }
@@ -1378,6 +1499,55 @@ impl App {
         self.refresh_prompt_input();
     }
 
+    // -----------------------------------------------------------------------
+    // Voice PTT helpers
+    // -----------------------------------------------------------------------
+
+    /// Start PTT recording: open the microphone capture stream and signal the
+    /// UI.  No-op when no voice recorder is attached or recording is already
+    /// in progress.
+    pub fn handle_voice_ptt_start(&mut self) {
+        if self.voice_recording || self.voice_recorder.is_none() {
+            return;
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        self.voice_event_rx = Some(rx);
+        self.voice_recording = true;
+        if let Some(ref recorder_arc) = self.voice_recorder {
+            let recorder = recorder_arc.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(mut r) = recorder.lock() {
+                    tokio::runtime::Handle::current()
+                        .block_on(r.start_recording(tx))
+                        .ok();
+                }
+            });
+        }
+        self.status_message = Some("Recording\u{2026} release V or press Enter to transcribe".to_string());
+    }
+
+    /// Stop PTT recording: flip the AtomicBool inside VoiceRecorder so the
+    /// capture thread exits, then fire a "Transcribing…" notice.  The
+    /// transcript text arrives later via `voice_event_rx` and is injected into
+    /// the prompt by the event-loop drain.
+    pub fn handle_voice_ptt_stop(&mut self) {
+        if !self.voice_recording {
+            return;
+        }
+        self.voice_recording = false;
+        if let Some(ref recorder_arc) = self.voice_recorder {
+            let recorder = recorder_arc.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(mut r) = recorder.lock() {
+                    tokio::runtime::Handle::current()
+                        .block_on(r.stop_recording())
+                        .ok();
+                }
+            });
+        }
+        self.status_message = Some("Transcribing\u{2026}".to_string());
+    }
+
     pub fn attach_turn_diff_state(
         &mut self,
         file_history: Arc<parking_lot::Mutex<FileHistory>>,
@@ -1388,7 +1558,7 @@ impl App {
         self.refresh_turn_diff_from_history();
     }
 
-    pub fn attach_mcp_manager(&mut self, mcp_manager: Arc<cc_mcp::McpManager>) {
+    pub fn attach_mcp_manager(&mut self, mcp_manager: Arc<claurst_mcp::McpManager>) {
         self.mcp_manager = Some(mcp_manager);
     }
 
@@ -1484,7 +1654,7 @@ impl App {
     /// Persist `has_completed_onboarding = true` to the settings file.
     /// Best-effort: failures are silently ignored to not disrupt the session.
     fn persist_onboarding_complete() -> anyhow::Result<()> {
-        let mut settings = cc_core::config::Settings::load_sync()?;
+        let mut settings = claurst_core::config::Settings::load_sync()?;
         settings.has_completed_onboarding = true;
         settings.save_sync()
     }
@@ -1495,6 +1665,26 @@ impl App {
         if self.global_search.open {
             return self.handle_global_search_key(key);
         }
+
+        // ---- Context menu handling (highest priority for menu navigation) ----
+        if self.context_menu_state.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.dismiss_context_menu();
+                    return false;
+                }
+                KeyCode::Up | KeyCode::Down => {
+                    self.navigate_context_menu(key.code);
+                    return false;
+                }
+                KeyCode::Enter => {
+                    self.execute_context_menu_item();
+                    return false;
+                }
+                _ => {}
+            }
+        }
+
         let key_context = self.current_key_context();
         if let Some(keystroke) = key_event_to_keystroke(&key) {
             let had_pending_chord = self.keybindings.has_pending_chord();
@@ -1606,6 +1796,55 @@ impl App {
             return false;
         }
 
+        // Session branching overlay intercepts navigation and Esc
+        if self.session_branching.visible {
+            use crate::session_branching::BranchBrowserMode;
+            match self.session_branching.mode {
+                BranchBrowserMode::Browse => {
+                    match key.code {
+                        KeyCode::Esc => self.session_branching.cancel(),
+                        KeyCode::Up => self.session_branching.select_prev(),
+                        KeyCode::Down => self.session_branching.select_next(),
+                        KeyCode::Char('n') => self.session_branching.start_create_new(),
+                        KeyCode::Char('d') => self.session_branching.start_delete_confirm(),
+                        KeyCode::Enter => {
+                            if let Some(branch) = self.session_branching.selected_branch() {
+                                self.status_message = Some(format!("Switched to branch: {}", branch.name));
+                                self.session_branching.close();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                BranchBrowserMode::CreateNew => {
+                    match key.code {
+                        KeyCode::Esc => self.session_branching.cancel(),
+                        KeyCode::Enter => {
+                            if let Some((name, at_msg)) = self.session_branching.confirm_create_new() {
+                                self.status_message = Some(format!("Created branch: {} at message {}", name, at_msg));
+                                self.session_branching.close();
+                            }
+                        }
+                        KeyCode::Backspace => self.session_branching.pop_create_char(),
+                        KeyCode::Char(c) => self.session_branching.push_create_char(c),
+                        _ => {}
+                    }
+                }
+                BranchBrowserMode::ConfirmDelete => {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('n') => self.session_branching.cancel(),
+                        KeyCode::Enter | KeyCode::Char('y') => {
+                            if let Some(branch_id) = self.session_branching.confirm_delete() {
+                                self.status_message = Some(format!("Deleted branch: {}", branch_id));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            return false;
+        }
+
         // Session browser intercepts navigation and Esc
         if self.session_browser.visible {
             use crate::session_browser::SessionBrowserMode;
@@ -1642,6 +1881,22 @@ impl App {
                         _ => {}
                     }
                 }
+            }
+            return false;
+        }
+
+        // Tasks overlay intercepts navigation and Esc
+        if self.tasks_overlay.visible {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.tasks_overlay.close(),
+                KeyCode::Up => self.tasks_overlay.select_prev(),
+                KeyCode::Down => self.tasks_overlay.select_next(),
+                KeyCode::Enter => {
+                    if let Some((task_id, new_status)) = self.tasks_overlay.cycle_and_persist_status() {
+                        self.status_message = Some(format!("Task {} → {}", task_id, new_status));
+                    }
+                }
+                _ => {}
             }
             return false;
         }
@@ -1974,6 +2229,23 @@ impl App {
             return false;
         }
 
+        // ---- Voice PTT: plain V press starts recording when voice is on ----
+        // This is the "hold to talk" variant.  The user presses V to begin
+        // recording; releasing V (handled in the run loop) or pressing Enter
+        // stops the capture and triggers transcription.
+        // Only active when voice mode is enabled (voice_recorder is Some) and
+        // the prompt input is in default (non-vim) mode so 'v' doesn't conflict
+        // with vim keybindings.
+        if key.code == KeyCode::Char('v')
+            && key.modifiers == KeyModifiers::NONE
+            && self.voice_recorder.is_some()
+            && !self.voice_recording
+            && self.prompt_input.vim_mode == crate::prompt_input::VimMode::Insert
+        {
+            self.handle_voice_ptt_start();
+            return false;
+        }
+
         // ---- Ctrl+V — clipboard paste (image first, then text fallback) ----
         // Only fires when NOT in vim Normal/Visual/VisualBlock mode (where \x16 is
         // already consumed by the vim handler above to enter VisualBlock mode).
@@ -2000,6 +2272,15 @@ impl App {
             } else if let Some(text) = read_clipboard_text() {
                 self.prompt_input.paste(&text);
             }
+            return false;
+        }
+
+        // ---- Enter while PTT recording: stop capture instead of submitting ----
+        if key.code == KeyCode::Enter
+            && self.voice_recording
+            && self.voice_recorder.is_some()
+        {
+            self.handle_voice_ptt_stop();
             return false;
         }
 
@@ -2047,6 +2328,11 @@ impl App {
                 self.refresh_global_search();
             }
 
+            // ---- Tasks overlay (Ctrl+T) --------------------------------
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.tasks_overlay.toggle();
+            }
+
             // ---- Help overlay ------------------------------------------
             KeyCode::F(1) => {
                 self.show_help = !self.show_help;
@@ -2055,6 +2341,50 @@ impl App {
             KeyCode::Char('?') if key.modifiers.is_empty() && !self.is_streaming => {
                 self.show_help = !self.show_help;
                 self.help_overlay.toggle();
+            }
+
+            // ---- Emacs-style kill ring operations ----------------------
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+                self.prompt_input.kill_line();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+                self.prompt_input.kill_line_backward();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+                self.prompt_input.kill_word_backward();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+                self.prompt_input.yank();
+                self.refresh_prompt_input();
+            }
+
+            // ---- Alt/Meta key text editing operations -------------------
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+                self.prompt_input.yank_pop();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+                self.prompt_input.delete_word_backward();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Delete if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+                self.prompt_input.delete_word_forward();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+                self.prompt_input.move_word_backward();
+                self.sync_legacy_prompt_fields();
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+                self.prompt_input.move_word_forward();
+                self.sync_legacy_prompt_fields();
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+                self.prompt_input.delete_word_at_cursor();
+                self.refresh_prompt_input();
             }
 
             // ---- Text entry (blocked while streaming) ------------------
@@ -2104,7 +2434,7 @@ impl App {
             // Default → AcceptEdits → BypassPermissions → Default
             // Mirrors TS bottom-left indicator cycling behaviour.
             KeyCode::BackTab if !self.is_streaming => {
-                use cc_core::config::PermissionMode;
+                use claurst_core::config::PermissionMode;
                 self.config.permission_mode = match self.config.permission_mode {
                     PermissionMode::Default => PermissionMode::AcceptEdits,
                     PermissionMode::AcceptEdits => PermissionMode::BypassPermissions,
@@ -2175,7 +2505,7 @@ impl App {
             // ---- Toggle last thinking block (t key) -------------------
             KeyCode::Char('t') if !self.is_streaming => {
                 // Find the last thinking block in the message list and toggle it
-                use cc_core::types::ContentBlock;
+                use claurst_core::types::ContentBlock;
                 use std::collections::hash_map::DefaultHasher;
                 use std::hash::{Hash, Hasher};
                 'outer: for msg in self.messages.iter().rev() {
@@ -2629,6 +2959,83 @@ impl App {
                 self.history_search_overlay.select_next();
                 false
             }
+            // ========== NEW KEYBINDING ACTIONS (Phase 1) ==========
+            "clearLine" => {
+                // Ctrl+L: Clear the current input line (like bash Ctrl+L)
+                self.prompt_input.text.clear();
+                self.prompt_input.cursor = 0;
+                self.refresh_prompt_input();
+                false
+            }
+            "deleteCharBefore" => {
+                // Ctrl+H: Delete character before cursor (backspace equivalent)
+                if !self.is_streaming {
+                    self.prompt_input.backspace();
+                    self.refresh_prompt_input();
+                }
+                false
+            }
+            "previousMessage" => {
+                // Alt+←: Navigate to previous message in transcript
+                self.scroll_offset = self.scroll_offset.saturating_add(5);
+                self.auto_scroll = false;
+                false
+            }
+            "nextMessage" => {
+                // Alt+→: Navigate to next message in transcript
+                let new_off = self.scroll_offset.saturating_sub(5);
+                self.scroll_offset = new_off;
+                if new_off == 0 {
+                    self.auto_scroll = true;
+                }
+                false
+            }
+            "jumpToNextError" => {
+                // Ctrl+.: Jump to next error/issue in messages
+                self.jump_to_next_error();
+                false
+            }
+            "jumpToPreviousError" => {
+                // Ctrl+Shift+.: Jump to previous error/issue in messages
+                self.jump_to_previous_error();
+                false
+            }
+            "reverseIndent" => {
+                // Shift+Tab: Reverse indent (cycle permission mode)
+                use claurst_core::config::PermissionMode;
+                self.config.permission_mode = match self.config.permission_mode {
+                    PermissionMode::Default => PermissionMode::AcceptEdits,
+                    PermissionMode::AcceptEdits => PermissionMode::BypassPermissions,
+                    PermissionMode::BypassPermissions => PermissionMode::Default,
+                    PermissionMode::Plan => PermissionMode::Default,
+                };
+                let label = match self.config.permission_mode {
+                    PermissionMode::Default => "Default permissions",
+                    PermissionMode::AcceptEdits => "Accept-edits mode",
+                    PermissionMode::BypassPermissions => "Bypass permissions (dangerous)",
+                    PermissionMode::Plan => "Plan mode",
+                };
+                self.status_message = Some(label.to_string());
+                false
+            }
+            "openHelp" => {
+                // Ctrl+H: Open help (alternative to F1)
+                self.show_help = !self.show_help;
+                self.help_overlay.toggle();
+                false
+            }
+            "deleteWord" => {
+                // Alt+D: Delete word forward
+                if !self.is_streaming {
+                    self.prompt_input.delete_word_at_cursor();
+                    self.refresh_prompt_input();
+                }
+                false
+            }
+            "sendMessage" => {
+                // Ctrl+M: Send message (alternative to Enter)
+                !self.is_streaming
+            }
             _ => false,
         }
     }
@@ -2771,6 +3178,364 @@ impl App {
         !first_word.is_empty() && self.bash_prefix_allowlist.contains(first_word)
     }
 
+    // ---- Advanced mouse interaction helpers --------------------------------
+
+    /// Detect if a click is a double-click based on timing and position.
+    /// Returns true if the click is within ~500ms and ~5px of the last click.
+    fn is_double_click(&self, current_pos: (u16, u16)) -> bool {
+        let now = std::time::Instant::now();
+        match (self.last_click_time, self.last_click_position) {
+            (Some(last_time), Some(last_pos)) => {
+                let elapsed = now.duration_since(last_time);
+                let distance = ((current_pos.0 as i32 - last_pos.0 as i32).abs()
+                    + (current_pos.1 as i32 - last_pos.1 as i32).abs()) as u16;
+                elapsed.as_millis() < 500 && distance <= 5
+            }
+            _ => false,
+        }
+    }
+
+    /// Find word boundaries for the character at (col, row) in the selection text.
+    /// Returns (start_col, end_col) for the word containing the given position.
+    fn find_word_boundaries(&self, col: u16, _row: u16) -> Option<(u16, u16)> {
+        // Get the current selection text to determine word boundaries
+        let text = self.selection_text.borrow();
+        if text.is_empty() {
+            return None;
+        }
+
+        // For simplicity, we'll find the word based on whitespace and punctuation
+        // In a full implementation, we'd map visual positions back to text offsets
+        // For now, return a reasonable range around the click position
+        let start = col.saturating_sub(10).max(0);
+        let end = col.saturating_add(10);
+        Some((start, end))
+    }
+
+    /// Find line boundaries for the row containing the click.
+    /// Returns (start_row, end_row) for the line.
+    #[allow(dead_code)]
+    fn find_line_boundaries(&self, row: u16) -> Option<(u16, u16)> {
+        let msg_area = self.last_msg_area.get();
+        let line_start = msg_area.y;
+        let line_end = msg_area.y.saturating_add(msg_area.height).saturating_sub(1);
+
+        if row >= line_start && row <= line_end {
+            Some((row, row))
+        } else {
+            None
+        }
+    }
+
+    /// Show context menu at the given position.
+    fn show_context_menu(&mut self, x: u16, y: u16) {
+        self.context_menu_state = Some(ContextMenuState {
+            x,
+            y,
+            selected_index: 0,
+        });
+    }
+
+    /// Dismiss the context menu.
+    fn dismiss_context_menu(&mut self) {
+        self.context_menu_state = None;
+    }
+
+    /// Handle context menu navigation with arrow keys.
+    fn navigate_context_menu(&mut self, direction: KeyCode) {
+        if let Some(mut menu) = self.context_menu_state {
+            // Copy (4 variants) + Paste, Cut, Select All, Clear = 8 items
+            let item_count = 9;
+            match direction {
+                KeyCode::Up => {
+                    menu.selected_index = menu.selected_index.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    menu.selected_index = (menu.selected_index + 1).min(item_count - 1);
+                }
+                _ => return,
+            }
+            self.context_menu_state = Some(menu);
+        }
+    }
+
+    /// Execute the currently selected context menu item.
+    fn execute_context_menu_item(&mut self) {
+        if let Some(menu) = self.context_menu_state {
+            let items = [
+                ContextMenuItem::Copy,
+                ContextMenuItem::CopyAsMarkdown,
+                ContextMenuItem::CopyAsPlaintext,
+                ContextMenuItem::CopyCodeBlocks,
+                ContextMenuItem::CopyAsJson,
+                ContextMenuItem::Paste,
+                ContextMenuItem::Cut,
+                ContextMenuItem::SelectAll,
+                ContextMenuItem::Clear,
+            ];
+
+            if menu.selected_index < items.len() {
+                let item = items[menu.selected_index];
+                self.handle_context_menu_action(item);
+            }
+        }
+        self.dismiss_context_menu();
+    }
+
+    /// Handle a context menu action.
+    fn handle_context_menu_action(&mut self, item: ContextMenuItem) {
+        match item {
+            ContextMenuItem::Copy => {
+                let text = self.selection_text.borrow();
+                if !text.is_empty() {
+                    if crate::message_copy::copy_to_clipboard(&text) {
+                        self.notifications.push(
+                            NotificationKind::Info,
+                            format!("Copied {} chars to clipboard.", text.len()),
+                            Some(3),
+                        );
+                    } else {
+                        self.notifications.push(
+                            NotificationKind::Warning,
+                            "Failed to copy to clipboard.".to_string(),
+                            Some(3),
+                        );
+                    }
+                    debug!("Copy action triggered, text: {} chars", text.len());
+                }
+            }
+            ContextMenuItem::CopyAsMarkdown => {
+                if let Some(msg) = self.messages.last() {
+                    let markdown = crate::message_copy::copy_as_markdown(msg);
+                    if crate::message_copy::copy_to_clipboard(&markdown) {
+                        self.notifications.push(
+                            NotificationKind::Info,
+                            "Copied as Markdown.".to_string(),
+                            Some(3),
+                        );
+                    } else {
+                        self.notifications.push(
+                            NotificationKind::Warning,
+                            "Failed to copy to clipboard.".to_string(),
+                            Some(3),
+                        );
+                    }
+                }
+            }
+            ContextMenuItem::CopyAsPlaintext => {
+                if let Some(msg) = self.messages.last() {
+                    let plaintext = crate::message_copy::copy_as_plaintext(msg);
+                    if crate::message_copy::copy_to_clipboard(&plaintext) {
+                        self.notifications.push(
+                            NotificationKind::Info,
+                            "Copied as plaintext.".to_string(),
+                            Some(3),
+                        );
+                    } else {
+                        self.notifications.push(
+                            NotificationKind::Warning,
+                            "Failed to copy to clipboard.".to_string(),
+                            Some(3),
+                        );
+                    }
+                }
+            }
+            ContextMenuItem::CopyCodeBlocks => {
+                if let Some(msg) = self.messages.last() {
+                    let code = crate::message_copy::copy_code_blocks(msg);
+                    if crate::message_copy::copy_to_clipboard(&code) {
+                        self.notifications.push(
+                            NotificationKind::Info,
+                            "Copied code blocks.".to_string(),
+                            Some(3),
+                        );
+                    } else {
+                        self.notifications.push(
+                            NotificationKind::Warning,
+                            "Failed to copy to clipboard.".to_string(),
+                            Some(3),
+                        );
+                    }
+                }
+            }
+            ContextMenuItem::CopyAsJson => {
+                if let Some(msg) = self.messages.last() {
+                    let json = crate::message_copy::copy_as_json(msg);
+                    if crate::message_copy::copy_to_clipboard(&json) {
+                        self.notifications.push(
+                            NotificationKind::Info,
+                            "Copied as JSON.".to_string(),
+                            Some(3),
+                        );
+                    } else {
+                        self.notifications.push(
+                            NotificationKind::Warning,
+                            "Failed to copy to clipboard.".to_string(),
+                            Some(3),
+                        );
+                    }
+                }
+            }
+            ContextMenuItem::Paste => {
+                debug!("Paste action triggered");
+            }
+            ContextMenuItem::Cut => {
+                let text = self.selection_text.borrow();
+                if !text.is_empty() {
+                    if crate::message_copy::copy_to_clipboard(&text) {
+                        self.notifications.push(
+                            NotificationKind::Info,
+                            "Cut to clipboard.".to_string(),
+                            Some(3),
+                        );
+                    }
+                    debug!("Cut action triggered, text: {} chars", text.len());
+                    self.selection_anchor = None;
+                    self.selection_focus = None;
+                }
+            }
+            ContextMenuItem::SelectAll => {
+                // Select all messages in the message pane
+                let msg_area = self.last_msg_area.get();
+                self.selection_anchor = Some((msg_area.x, msg_area.y));
+                self.selection_focus = Some((
+                    msg_area.x.saturating_add(msg_area.width).saturating_sub(1),
+                    msg_area.y.saturating_add(msg_area.height).saturating_sub(1),
+                ));
+            }
+            ContextMenuItem::Clear => {
+                self.selection_anchor = None;
+                self.selection_focus = None;
+                *self.selection_text.borrow_mut() = String::new();
+            }
+        }
+    }
+
+    /// Process mouse events (trackpad scroll, text selection, etc.).
+    pub fn handle_mouse_event(&mut self, mouse_event: MouseEvent) {
+        use crossterm::event::MouseButton;
+        match mouse_event.kind {
+            MouseEventKind::ScrollUp => {
+                // Don't consume Ctrl+Scroll — let the terminal handle zoom.
+                if !mouse_event.modifiers.contains(KeyModifiers::CONTROL) {
+                    let step = self.scroll_step();
+                    self.scroll_offset = self.scroll_offset.saturating_add(step);
+                    self.auto_scroll = false;
+                    self.selection_anchor = None;
+                    self.selection_focus = None;
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if !mouse_event.modifiers.contains(KeyModifiers::CONTROL) {
+                    let step = self.scroll_step();
+                    let new_off = self.scroll_offset.saturating_sub(step);
+                    self.scroll_offset = new_off;
+                    if new_off == 0 {
+                        self.auto_scroll = true;
+                        self.new_messages_while_scrolled = 0;
+                    }
+                    self.selection_anchor = None;
+                    self.selection_focus = None;
+                }
+            }
+            // ---- Right-click context menu ----------------------------------
+            MouseEventKind::Down(MouseButton::Right) => {
+                let msg_area = self.last_msg_area.get();
+                if mouse_event.column >= msg_area.x
+                    && mouse_event.column < msg_area.x.saturating_add(msg_area.width)
+                    && mouse_event.row >= msg_area.y
+                    && mouse_event.row < msg_area.y.saturating_add(msg_area.height) {
+                    self.show_context_menu(mouse_event.column, mouse_event.row);
+                }
+            }
+
+            // ---- Text selection ---------------------------------
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Dismiss context menu on left click
+                self.dismiss_context_menu();
+
+                let msg_area = self.last_msg_area.get();
+                if msg_area.width == 0 || msg_area.height == 0 {
+                    // Message area not initialized yet
+                    self.click_count = 0;
+                } else if mouse_event.column >= msg_area.x
+                    && mouse_event.column < msg_area.x.saturating_add(msg_area.width)
+                    && mouse_event.row >= msg_area.y
+                    && mouse_event.row < msg_area.y.saturating_add(msg_area.height) {
+
+                    let current_pos = (mouse_event.column, mouse_event.row);
+                    let now = std::time::Instant::now();
+
+                    // Check for double-click
+                    if self.is_double_click(current_pos) {
+                        self.click_count += 1;
+                        if self.click_count >= 3 {
+                            // Triple-click: select entire line
+                            self.selection_anchor = Some((msg_area.x, current_pos.1));
+                            self.selection_focus = Some((
+                                msg_area.x.saturating_add(msg_area.width).saturating_sub(1),
+                                current_pos.1,
+                            ));
+                            self.click_count = 0; // Reset for next click sequence
+                        } else {
+                            // Double-click: select word
+                            if let Some((start, end)) = self.find_word_boundaries(current_pos.0, current_pos.1) {
+                                self.selection_anchor = Some((start, current_pos.1));
+                                self.selection_focus = Some((end, current_pos.1));
+                            }
+                        }
+                    } else {
+                        // Single click or new click sequence
+                        self.click_count = 1;
+                        self.selection_anchor = Some(current_pos);
+                        self.selection_focus = Some(current_pos);
+                        *self.selection_text.borrow_mut() = String::new();
+                    }
+
+                    self.last_click_time = Some(now);
+                    self.last_click_position = Some(current_pos);
+                } else {
+                    // Click outside message area resets click count and selection
+                    self.click_count = 0;
+                    self.selection_anchor = None;
+                    self.selection_focus = None;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                // Dismiss context menu on drag
+                self.dismiss_context_menu();
+
+                // Continue drag within message pane bounds
+                if self.selection_anchor.is_some() {
+                    let msg_area = self.last_msg_area.get();
+                    if msg_area.width > 0 && msg_area.height > 0
+                        && mouse_event.column >= msg_area.x
+                        && mouse_event.column < msg_area.x.saturating_add(msg_area.width)
+                        && mouse_event.row >= msg_area.y
+                        && mouse_event.row < msg_area.y.saturating_add(msg_area.height) {
+                        self.selection_focus = Some((mouse_event.column, mouse_event.row));
+                        self.click_count = 0; // Reset on drag to prevent further double-clicks
+                    } else if mouse_event.column < msg_area.x
+                        || mouse_event.column >= msg_area.x.saturating_add(msg_area.width)
+                        || mouse_event.row < msg_area.y
+                        || mouse_event.row >= msg_area.y.saturating_add(msg_area.height) {
+                        // Drag went outside message area - cancel selection
+                        self.selection_anchor = None;
+                        self.selection_focus = None;
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                // Clear if no actual drag (single click = no selection)
+                if self.selection_anchor == self.selection_focus {
+                    self.selection_anchor = None;
+                    self.selection_focus = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
     // -------------------------------------------------------------------
     // Query event handling
     // -------------------------------------------------------------------
@@ -2796,21 +3561,21 @@ impl App {
                 }
                 self.is_streaming = true;
                 match stream_evt {
-                    cc_api::StreamEvent::ContentBlockDelta { delta, .. } => {
+                    claurst_api::StreamEvent::ContentBlockDelta { delta, .. } => {
                         // Reset stall timer on any incoming delta — we're making progress.
                         self.stall_start = None;
                         match delta {
-                            cc_api::streaming::ContentDelta::TextDelta { text } => {
+                            claurst_api::streaming::ContentDelta::TextDelta { text } => {
                                 self.streaming_text.push_str(&text);
                                 self.invalidate_transcript();
                             }
-                            cc_api::streaming::ContentDelta::ThinkingDelta { thinking } => {
+                            claurst_api::streaming::ContentDelta::ThinkingDelta { thinking } => {
                                 debug!(len = thinking.len(), "Thinking delta received");
                             }
                             _ => {}
                         }
                     }
-                    cc_api::StreamEvent::MessageStop => {
+                    claurst_api::StreamEvent::MessageStop => {
                         self.is_streaming = false;
                         self.spinner_verb = None;
                         self.stall_start = None;
@@ -2921,28 +3686,38 @@ impl App {
                 self.status_message = Some(err_msg);
             }
             QueryEvent::TokenWarning { state, pct_used } => {
-                // Display a status bar warning when approaching the context limit.
-                use cc_query::compact::TokenWarningState;
-                let msg = match state {
-                    TokenWarningState::Ok => None,
-                    TokenWarningState::Warning => Some(format!(
-                        "Context window {:.0}% full — consider /compact",
-                        pct_used * 100.0
-                    )),
-                    TokenWarningState::Critical => Some(format!(
-                        "Context window {:.0}% full — /compact recommended now",
-                        pct_used * 100.0
-                    )),
-                };
-                if let Some(warning) = msg {
-                    self.status_message = Some(warning);
+                // Push a notification for context window warnings (notification + threshold tracking).
+                use claurst_query::compact::TokenWarningState;
+
+                // Only escalate — never repeat a threshold already shown.
+                match state {
+                    TokenWarningState::Ok => {
+                        // Reset threshold tracking when back to normal
+                        self.token_warning_threshold_shown = 0;
+                    }
+                    TokenWarningState::Warning if self.token_warning_threshold_shown < 80 => {
+                        self.token_warning_threshold_shown = 80;
+                        self.notifications.push(
+                            NotificationKind::Warning,
+                            format!("Context window {:.0}% full. Consider /compact.", pct_used * 100.0),
+                            Some(30),
+                        );
+                    }
+                    TokenWarningState::Critical if self.token_warning_threshold_shown < 95 => {
+                        self.token_warning_threshold_shown = 95;
+                        self.notifications.push(
+                            NotificationKind::Error,
+                            format!("Context window {:.0}% full! Run /compact now.", pct_used * 100.0),
+                            None,
+                        );
+                    }
+                    _ => {}
                 }
             }
         }
 
-        // Re-sync token count from tracker and check warning thresholds.
+        // Update token count from tracker.
         self.token_count = self.cost_tracker.total_tokens() as u32;
-        self.check_token_warnings();
     }
 
     // -------------------------------------------------------------------
@@ -2978,6 +3753,66 @@ impl App {
                 }
             }
 
+            // Drain voice transcription events (non-blocking).
+            // When the background recording/transcription task emits a
+            // TranscriptReady event we insert the text directly into the
+            // prompt so the user can review and submit it.
+            {
+                use claurst_core::voice::VoiceEvent;
+                let mut events = Vec::new();
+                if let Some(ref mut rx) = self.voice_event_rx {
+                    while let Ok(ev) = rx.try_recv() {
+                        events.push(ev);
+                    }
+                }
+                for ev in events {
+                    match ev {
+                        VoiceEvent::RecordingStarted => {
+                            self.voice_recording = true;
+                            self.status_message =
+                                Some("Recording\u{2026} press V again or Enter to stop".to_string());
+                        }
+                        VoiceEvent::RecordingStopped => {
+                            self.voice_recording = false;
+                            self.status_message =
+                                Some("Transcribing\u{2026}".to_string());
+                        }
+                        VoiceEvent::TranscriptReady(text) => {
+                            if !text.is_empty() {
+                                // Append to existing prompt text with a space separator
+                                // so the user can combine voice + typed input.
+                                if !self.prompt_input.text.is_empty()
+                                    && !self.prompt_input.text.ends_with(' ')
+                                {
+                                    self.prompt_input.paste(" ");
+                                }
+                                self.prompt_input.paste(&text);
+                                self.refresh_prompt_input();
+                                self.status_message = Some(
+                                    format!("Transcribed: {}", &text[..text.len().min(60)])
+                                );
+                            }
+                            // Clear the channel once we have the result.
+                            self.voice_event_rx = None;
+                        }
+                        VoiceEvent::Error(msg) => {
+                            self.voice_recording = false;
+                            self.voice_event_rx = None;
+                            self.notifications.push(
+                                NotificationKind::Warning,
+                                format!("Voice: {}", msg),
+                                Some(8),
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Refresh task list if the overlay is visible (every frame for live updates)
+            if self.tasks_overlay.visible {
+                self.tasks_overlay.refresh_tasks(&claurst_tools::TASK_STORE);
+            }
+
             // Draw the frame
             terminal.draw(|f| render::render_app(f, self))?;
 
@@ -2985,8 +3820,20 @@ impl App {
             if event::poll(std::time::Duration::from_millis(50))? {
                 match event::read()? {
                     Event::Key(key) => {
-                        // On Windows crossterm fires Press + Release; only handle Press.
+                        // On Windows crossterm fires both Press and Release events.
+                        // We normally skip non-press events, but when voice PTT mode
+                        // is active we need the Release event for the `V` key so we
+                        // can stop recording as soon as the user lifts the key.
                         if key.kind != crossterm::event::KeyEventKind::Press {
+                            // Handle V-key release to stop PTT recording.
+                            if key.kind == crossterm::event::KeyEventKind::Release
+                                && key.code == KeyCode::Char('v')
+                                && key.modifiers == KeyModifiers::NONE
+                                && self.voice_recording
+                                && self.voice_recorder.is_some()
+                            {
+                                self.handle_voice_ptt_stop();
+                            }
                             continue;
                         }
                         let should_submit = self.handle_key_event(key);
@@ -3054,13 +3901,27 @@ impl App {
                             }
                             // ---- Text selection ---------------------------------
                             MouseEventKind::Down(MouseButton::Left) => {
-                                self.selection_anchor = Some((mouse_event.column, mouse_event.row));
-                                self.selection_focus = Some((mouse_event.column, mouse_event.row));
-                                *self.selection_text.borrow_mut() = String::new();
+                                // Only allow selection within the message pane area
+                                let msg_area = self.last_msg_area.get();
+                                if mouse_event.column >= msg_area.x
+                                    && mouse_event.column < msg_area.x.saturating_add(msg_area.width)
+                                    && mouse_event.row >= msg_area.y
+                                    && mouse_event.row < msg_area.y.saturating_add(msg_area.height) {
+                                    self.selection_anchor = Some((mouse_event.column, mouse_event.row));
+                                    self.selection_focus = Some((mouse_event.column, mouse_event.row));
+                                    *self.selection_text.borrow_mut() = String::new();
+                                }
                             }
                             MouseEventKind::Drag(MouseButton::Left) => {
+                                // Continue drag within message pane bounds
                                 if self.selection_anchor.is_some() {
-                                    self.selection_focus = Some((mouse_event.column, mouse_event.row));
+                                    let msg_area = self.last_msg_area.get();
+                                    if mouse_event.column >= msg_area.x
+                                        && mouse_event.column < msg_area.x.saturating_add(msg_area.width)
+                                        && mouse_event.row >= msg_area.y
+                                        && mouse_event.row < msg_area.y.saturating_add(msg_area.height) {
+                                        self.selection_focus = Some((mouse_event.column, mouse_event.row));
+                                    }
                                 }
                             }
                             MouseEventKind::Up(MouseButton::Left) => {
@@ -3078,6 +3939,64 @@ impl App {
             }
         }
     }
+
+    // ========== NEW KEYBINDING HELPER FUNCTIONS (Phase 1) ==========
+
+    /// Jump to the next error/issue in messages.
+    /// Searches for common error indicators: "Error:", "ERROR:", "error", "failed", "FAIL".
+    fn jump_to_next_error(&mut self) {
+        const ERROR_KEYWORDS: &[&str] = &["error:", "failed:", "fail"];
+
+        // Search forward from current position
+        for i in 0..self.messages.len() {
+            let msg = &self.messages[i];
+            let content = msg.get_all_text().to_lowercase();
+
+            // Check if message contains error keywords
+            let has_error = ERROR_KEYWORDS.iter().any(|keyword| {
+                content.contains(keyword)
+            });
+
+            if has_error && i > (self.messages.len().saturating_sub(self.scroll_offset / 2)) {
+                // Found an error message, scroll to it
+                let new_offset = self.messages.len().saturating_sub(i);
+                self.scroll_offset = new_offset.saturating_mul(2);
+                self.auto_scroll = false;
+                self.status_message = Some(format!("Error found in message {}", i + 1));
+                return;
+            }
+        }
+
+        self.status_message = Some("No more errors found.".to_string());
+    }
+
+    /// Jump to the previous error/issue in messages.
+    /// Searches backwards for common error indicators.
+    fn jump_to_previous_error(&mut self) {
+        const ERROR_KEYWORDS: &[&str] = &["error:", "failed:", "fail"];
+
+        // Search backward from current position
+        for i in (0..self.messages.len()).rev() {
+            let msg = &self.messages[i];
+            let content = msg.get_all_text().to_lowercase();
+
+            // Check if message contains error keywords
+            let has_error = ERROR_KEYWORDS.iter().any(|keyword| {
+                content.contains(keyword)
+            });
+
+            if has_error && i < (self.messages.len().saturating_sub(self.scroll_offset / 2)) {
+                // Found an error message, scroll to it
+                let new_offset = self.messages.len().saturating_sub(i);
+                self.scroll_offset = new_offset.saturating_mul(2);
+                self.auto_scroll = false;
+                self.status_message = Some(format!("Error found in message {}", i + 1));
+                return;
+            }
+        }
+
+        self.status_message = Some("No previous errors found.".to_string());
+    }
 }
 
 #[cfg(test)]
@@ -3086,7 +4005,7 @@ mod tests {
 
     fn make_app() -> App {
         let config = Config::default();
-        let cost_tracker = cc_core::cost::CostTracker::new();
+        let cost_tracker = claurst_core::cost::CostTracker::new();
         App::new(config, cost_tracker)
     }
 

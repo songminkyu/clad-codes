@@ -9,9 +9,9 @@
 // by `pop_due_tasks` after they are returned.
 
 use crate::{QueryConfig, QueryOutcome, run_query_loop};
-use cc_core::types::Message;
-use cc_tools::Tool;
-use cc_tools::ToolContext;
+use claurst_core::types::Message;
+use claurst_tools::Tool;
+use claurst_tools::ToolContext;
 use chrono::Timelike;
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
@@ -23,7 +23,7 @@ use tracing::{debug, error, info};
 /// Returns immediately; the scheduler runs as a detached tokio task.
 /// Call `cancel.cancel()` to stop it gracefully.
 pub fn start_cron_scheduler(
-    client: Arc<cc_api::AnthropicClient>,
+    client: Arc<claurst_api::AnthropicClient>,
     tools: Arc<Vec<Box<dyn Tool>>>,
     tool_ctx: ToolContext,
     query_config: QueryConfig,
@@ -35,7 +35,7 @@ pub fn start_cron_scheduler(
 }
 
 async fn run_scheduler_loop(
-    client: Arc<cc_api::AnthropicClient>,
+    client: Arc<claurst_api::AnthropicClient>,
     tools: Arc<Vec<Box<dyn Tool>>>,
     tool_ctx: ToolContext,
     query_config: QueryConfig,
@@ -66,7 +66,7 @@ async fn run_scheduler_loop(
         debug!(time = %tick_time.format("%H:%M"), "Cron scheduler tick");
 
         // Find tasks due at this minute.
-        let due = cc_tools::cron::pop_due_tasks(&tick_time).await;
+        let due = claurst_tools::cron::pop_due_tasks(&tick_time).await;
 
         for task in due {
             info!(id = %task.id, cron = %task.cron, "Firing cron task");

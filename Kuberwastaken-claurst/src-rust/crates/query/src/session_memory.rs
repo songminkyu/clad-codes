@@ -14,10 +14,10 @@
 //      (creating the file if it doesn't exist).
 //   4. Track state so we don't re-extract from already-processed messages.
 
-use cc_api::{
+use claurst_api::{
     ApiMessage, CreateMessageRequest, StreamAccumulator, StreamEvent, StreamHandler, SystemPrompt,
 };
-use cc_core::types::{Message, Role};
+use claurst_core::types::{Message, Role};
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
@@ -213,7 +213,7 @@ impl SessionMemoryExtractor {
         &self,
         messages: &[Message],
         working_dir: &Path,
-        api_client: &cc_api::AnthropicClient,
+        api_client: &claurst_api::AnthropicClient,
     ) -> anyhow::Result<Vec<ExtractedMemory>> {
         let model_visible: Vec<&Message> = messages
             .iter()
@@ -250,7 +250,7 @@ impl SessionMemoryExtractor {
             .system(SystemPrompt::Text(EXTRACTION_SYSTEM_PROMPT.to_string()))
             .build();
 
-        let handler: Arc<dyn StreamHandler> = Arc::new(cc_api::streaming::NullStreamHandler);
+        let handler: Arc<dyn StreamHandler> = Arc::new(claurst_api::streaming::NullStreamHandler);
         let mut rx = api_client
             .create_message_stream(request, handler)
             .await
@@ -427,7 +427,7 @@ fn parse_extraction_response(response: &str) -> Vec<ExtractedMemory> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cc_core::types::Message;
+    use claurst_core::types::Message;
 
     fn make_user(text: &str) -> Message {
         Message::user(text)
@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn test_should_not_extract_mid_tool_chain() {
-        use cc_core::types::ContentBlock;
+        use claurst_core::types::ContentBlock;
         let mut msgs = make_messages(MIN_MESSAGES_TO_EXTRACT);
         // Replace the last assistant message with one that has a tool_use block
         let last = msgs.last_mut().unwrap();

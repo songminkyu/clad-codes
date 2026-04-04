@@ -6,10 +6,12 @@ use crate::agents_view::render_agents_menu;
 use crate::context_viz::render_context_viz;
 use crate::export_dialog::render_export_dialog;
 use crate::app::{App, SystemAnnotation, SystemMessageStyle, ToolStatus};
-use crate::clawd::{clawd_lines, ClawdPose};
+use crate::rustle::{rustle_lines, RustlePose};
 use crate::diff_viewer::render_diff_dialog;
 use crate::model_picker::render_model_picker;
 use crate::session_browser::render_session_browser;
+use crate::session_branching::render_session_branching;
+use crate::tasks_overlay::render_tasks_overlay;
 use crate::dialogs::{render_mcp_approval_dialog, render_permission_dialog};
 use crate::feedback_survey::render_feedback_survey;
 use crate::overage_upsell::render_overage_upsell;
@@ -36,7 +38,7 @@ use crate::settings_screen::render_settings_screen;
 use crate::stats_dialog::render_stats_dialog;
 use crate::theme_screen::render_theme_screen;
 use crate::virtual_list::{VirtualItem, VirtualList};
-use cc_core::constants::APP_VERSION;
+use claurst_core::constants::APP_VERSION;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -55,7 +57,7 @@ const SPINNER: &[char] = &['\u{00b7}', '\u{2722}', '*', '\u{2736}', '\u{273b}', 
 const SPINNER: &[char] = &['\u{00b7}', '\u{2722}', '\u{2733}', '\u{2736}', '\u{273b}', '\u{273d}',
                             '\u{273d}', '\u{273b}', '\u{2736}', '\u{2733}', '\u{2722}', '\u{00b7}'];
 const CLAUDE_ORANGE: Color = Color::Rgb(233, 30, 99);
-const WELCOME_BOX_HEIGHT: u16 = 11;
+const WELCOME_BOX_HEIGHT: u16 = 12;
 
 fn spinner_char(frame_count: u64) -> char {
     SPINNER[(frame_count as usize) % SPINNER.len()]
@@ -381,6 +383,11 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_rewind_flow(frame, &app.rewind_flow, size);
     }
 
+    // Tasks overlay (Ctrl+T)
+    if app.tasks_overlay.visible {
+        render_tasks_overlay(frame, &app.tasks_overlay, size);
+    }
+
     // New help overlay
     if app.help_overlay.visible {
         render_help_overlay(frame, &app.help_overlay, size);
@@ -518,6 +525,11 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_session_browser(&app.session_browser, size, frame.buffer_mut());
     }
 
+    // Session branching overlay
+    if app.session_branching.visible {
+        render_session_branching(&app.session_branching, size, frame.buffer_mut());
+    }
+
     // Export format picker dialog
     if app.export_dialog.visible {
         render_export_dialog(frame, &app.export_dialog, size);
@@ -557,13 +569,15 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         || app.help_overlay.visible
         || app.global_search.open;
     if !modal_active {
-        apply_selection_highlight(frame, app, size);
+        apply_selection_highlight(frame, app);
+        // Render context menu on top of selection
+        render_context_menu(frame, app);
     }
 }
 
 /// Post-render pass: invert colours on selected cells and extract the
 /// selection text into `app.selection_text`.
-fn apply_selection_highlight(frame: &mut Frame, app: &App, size: Rect) {
+fn apply_selection_highlight(frame: &mut Frame, app: &App) {
     let (anchor, focus) = match (app.selection_anchor, app.selection_focus) {
         (Some(a), Some(f)) => (a, f),
         _ => return,
@@ -571,6 +585,32 @@ fn apply_selection_highlight(frame: &mut Frame, app: &App, size: Rect) {
     if anchor == focus {
         return;
     }
+
+    // Restrict selection to message pane area only
+    let msg_area = app.last_msg_area.get();
+
+    // Validate selection is within message area bounds
+    if anchor.0 < msg_area.x
+        || anchor.0 >= msg_area.x.saturating_add(msg_area.width)
+        || anchor.1 < msg_area.y
+        || anchor.1 >= msg_area.y.saturating_add(msg_area.height)
+    {
+        // Anchor is outside message area — clear selection
+        return;
+    }
+
+    let msg_max_row = msg_area.y.saturating_add(msg_area.height).saturating_sub(1);
+    let msg_max_col = msg_area.x.saturating_add(msg_area.width).saturating_sub(1);
+
+    // Clamp anchor and focus to message pane bounds
+    let anchor = (
+        anchor.0.clamp(msg_area.x, msg_max_col),
+        anchor.1.clamp(msg_area.y, msg_max_row),
+    );
+    let focus = (
+        focus.0.clamp(msg_area.x, msg_max_col),
+        focus.1.clamp(msg_area.y, msg_max_row),
+    );
 
     // Normalise so start ≤ end (row-major order).
     let (start, end) = if (anchor.1, anchor.0) <= (focus.1, focus.0) {
@@ -581,11 +621,10 @@ fn apply_selection_highlight(frame: &mut Frame, app: &App, size: Rect) {
 
     let buf = frame.buffer_mut();
     let mut text = String::new();
-    let last_row = end.1.min(size.y + size.height - 1);
+    let last_row = end.1.min(msg_max_row);
     for row in start.1..=last_row {
-        let col_from = if row == start.1 { start.0 } else { 0 };
-        let col_to = if row == end.1 { end.0 } else { size.x + size.width - 1 };
-        let col_to = col_to.min(size.x + size.width - 1);
+        let col_from = if row == start.1 { start.0 } else { msg_area.x };
+        let col_to = if row == end.1 { end.0 } else { msg_max_col };
         for col in col_from..=col_to {
             if let Some(cell) = buf.cell_mut((col, row)) {
                 let sym = cell.symbol().to_owned();
@@ -605,6 +644,92 @@ fn apply_selection_highlight(frame: &mut Frame, app: &App, size: Rect) {
     }
     while text.ends_with(|c: char| c.is_whitespace()) { text.pop(); }
     *app.selection_text.borrow_mut() = text;
+}
+
+/// Render a right-click context menu at the specified position.
+fn render_context_menu(frame: &mut Frame, app: &App) {
+    if let Some(menu) = app.context_menu_state {
+        let items = [
+            ("Copy", !app.selection_text.borrow().is_empty()),
+            ("Copy as MD", !app.messages.is_empty()),
+            ("Copy Plain", !app.messages.is_empty()),
+            ("Copy Code", !app.messages.is_empty()),
+            ("Copy JSON", !app.messages.is_empty()),
+            ("Paste", true),
+            ("Cut", !app.selection_text.borrow().is_empty()),
+            ("Select All", true),
+            ("Clear", app.selection_anchor.is_some()),
+        ];
+
+        let menu_height = (items.len() as u16).min(15); // Limit to 15 items max
+        let menu_width = 16; // Increased width for longer labels
+
+        // Clamp menu position to screen bounds
+        let screen = frame.area();
+        let menu_x = menu.x.min(screen.width.saturating_sub(menu_width + 1));
+        let menu_y = menu.y.min(screen.height.saturating_sub(menu_height + 1));
+
+        let menu_area = Rect {
+            x: menu_x,
+            y: menu_y,
+            width: menu_width,
+            height: menu_height,
+        };
+
+        // Draw menu background with border
+        let menu_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().fg(Color::White).bg(Color::DarkGray));
+        menu_block.render(menu_area, frame.buffer_mut());
+
+        // Render menu items
+        let inner = Rect {
+            x: menu_area.x + 1,
+            y: menu_area.y + 1,
+            width: menu_area.width.saturating_sub(2),
+            height: menu_area.height.saturating_sub(2),
+        };
+
+        for (idx, (label, enabled)) in items.iter().enumerate() {
+            if idx >= inner.height as usize {
+                break;
+            }
+
+            let y = inner.y + idx as u16;
+            let is_selected = idx == menu.selected_index;
+
+            let fg_color = if *enabled {
+                if is_selected { Color::Black } else { Color::White }
+            } else {
+                Color::Gray // Disabled items appear grayed
+            };
+
+            let bg_color = if is_selected {
+                if *enabled { Color::Cyan } else { Color::DarkGray }
+            } else {
+                Color::DarkGray
+            };
+
+            let style = Style::default().fg(fg_color).bg(bg_color);
+            let padded_label = format!(" {:<12} ", label);
+
+            if let Some(cell) = frame.buffer_mut().cell_mut((inner.x, y)) {
+                cell.set_symbol(&padded_label[0..1.min(padded_label.len())]);
+                cell.set_style(style);
+            }
+
+            for (col_offset, ch) in padded_label.chars().enumerate() {
+                if col_offset >= inner.width as usize {
+                    break;
+                }
+                if let Some(cell) = frame.buffer_mut().cell_mut((inner.x + col_offset as u16, y)) {
+                    cell.set_symbol(&ch.to_string());
+                    cell.set_style(style);
+                }
+            }
+        }
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -668,6 +793,9 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // Store the actual message pane bounds for mouse event handling (text selection, scrolling).
+    app.last_msg_area.set(msg_area);
+
     let lines = render_message_items(app, msg_area.width);
 
     // Highlight search matches in transcript when global search is active
@@ -715,6 +843,10 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     list.sticky_bottom = app.auto_scroll;
     list.set_items(lines);
     list.scroll_offset = scroll as u16;
+
+    // Track scroll offset for selection validation
+    app.last_render_scroll_offset.set(scroll as u16);
+
     list.render(msg_area, frame.buffer_mut());
 
     // "â†“ N new messages" indicator when scrolled up and new messages arrived.
@@ -901,7 +1033,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     if area.height < box_height || box_width < 30 {
         // Too small: fall back to a single line
         let line = Line::from(vec![
-            Span::styled("Claude Code ", Style::default().fg(CLAUDE_ORANGE).add_modifier(Modifier::BOLD)),
+            Span::styled("Claurst ", Style::default().fg(CLAUDE_ORANGE).add_modifier(Modifier::BOLD)),
             Span::styled(format!("v{}", APP_VERSION), Style::default().fg(Color::DarkGray)),
         ]);
         frame.render_widget(Paragraph::new(vec![line]), area);
@@ -909,13 +1041,13 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     }
     let box_area = Rect { x: area.x, y: area.y, width: box_width, height: box_height };
 
-    // Outer border with title "Claude Code vX.Y"
+    // Outer border with title "Claurst vX.Y"
     let outer_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(CLAUDE_ORANGE))
         .title(Line::from(vec![
-            Span::styled(" Claude Code ", Style::default().fg(CLAUDE_ORANGE).add_modifier(Modifier::BOLD)),
+            Span::styled(" Claurst ", Style::default().fg(CLAUDE_ORANGE).add_modifier(Modifier::BOLD)),
             Span::styled(format!("v{} ", APP_VERSION), Style::default().fg(Color::DarkGray)),
         ]));
     frame.render_widget(outer_block, box_area);
@@ -957,7 +1089,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         "Welcome back!".to_string()
     };
-    let clawd = clawd_lines(&ClawdPose::Default);
+    let rustle = rustle_lines(&RustlePose::Default);
     let model_line = format!("{} \u{00b7} API Usage Billing", app.model_name);
 
     let mut left_lines: Vec<Line> = Vec::new();
@@ -969,7 +1101,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     // Center mascot in left column
     let mascot_indent = left_w.saturating_sub(11) / 2;
     let pad = " ".repeat(mascot_indent as usize);
-    for cl in &clawd {
+    for cl in &rustle {
         let mut spans = vec![Span::raw(pad.clone())];
         spans.extend(cl.spans.iter().cloned());
         left_lines.push(Line::from(spans));
@@ -987,7 +1119,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(left_lines).wrap(Wrap { trim: false }), h_chunks[0]);
 
     // --- Right column ---
-    let tip_text = cc_core::tips::select_tip(0)
+    let tip_text = claurst_core::tips::select_tip(0)
         .map(|t| t.content.to_string())
         .unwrap_or_else(|| "Run /init to create a CLAUDE.md file with instructions for Claude".to_string());
 
@@ -1018,11 +1150,11 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Build a tool_use_id → tool_name lookup from all messages in the transcript.
 /// This allows ToolResult blocks to dispatch to tool-specific renderers.
-fn build_tool_names(messages: &[cc_core::types::Message]) -> std::collections::HashMap<String, String> {
+fn build_tool_names(messages: &[claurst_core::types::Message]) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     for msg in messages {
         for block in msg.content_blocks() {
-            if let cc_core::types::ContentBlock::ToolUse { id, name, .. } = block {
+            if let claurst_core::types::ContentBlock::ToolUse { id, name, .. } = block {
                 map.insert(id.clone(), name.clone());
             }
         }
@@ -1032,7 +1164,7 @@ fn build_tool_names(messages: &[cc_core::types::Message]) -> std::collections::H
 
 fn render_message_lines(
     lines: &mut Vec<Line<'static>>,
-    msg: &cc_core::types::Message,
+    msg: &claurst_core::types::Message,
     width: usize,
     tool_names: &std::collections::HashMap<String, String>,
     expanded_thinking: &std::collections::HashSet<u64>,
@@ -1375,10 +1507,14 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 Some(state) => format!("PR #{} [{}]", pr_num, state),
                 None => format!("PR #{}", pr_num),
             };
+            // Colors mirror TS PrBadge getPrStatusColor + TS ink color names:
+            //   approved → Green, changes_requested → Red (error),
+            //   pending / review_required → Yellow (warning), merged → Magenta.
             let pr_color = match app.pr_state.as_deref() {
                 Some("approved") => Color::Green,
                 Some("changes_requested") => Color::Red,
-                Some("review_required") => Color::Yellow,
+                Some("merged") => Color::Magenta,
+                Some("pending") | Some("review_required") => Color::Yellow,
                 Some(_) => Color::Gray,
                 None => Color::Cyan,
             };
@@ -1413,15 +1549,22 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
-        // Vim mode indicator (only when non-insert in vim mode, to save space)
-        if app.prompt_input.vim_enabled && app.prompt_input.vim_mode == VimMode::Insert {
+        // Vim mode indicator — shown for all modes using neovim "-- MODE --" convention.
+        // INSERT is dim (common, low-noise); other modes use bright colour.
+        if app.prompt_input.vim_enabled {
             if !spans.is_empty() {
                 spans.push(Span::raw("  "));
             }
-            spans.push(Span::styled(
-                "-- INSERT --",
-                Style::default().fg(Color::DarkGray),
-            ));
+            let (label, style) = match app.prompt_input.vim_mode {
+                VimMode::Insert      => ("-- INSERT --",       Style::default().fg(Color::DarkGray)),
+                VimMode::Normal      => ("-- NORMAL --",       Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                VimMode::Visual      => ("-- VISUAL --",       Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                VimMode::VisualLine  => ("-- VISUAL LINE --",  Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                VimMode::VisualBlock => ("-- VISUAL BLOCK --", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                VimMode::Command     => ("-- COMMAND --",      Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                VimMode::Search      => ("-- SEARCH --",       Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            };
+            spans.push(Span::styled(label, style));
         }
 
         // Bash prefix indicator — shown when prompt starts with '!'
@@ -1438,7 +1581,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         // Permission mode badge (left side, mirrors TS bottom-left indicator).
         // Default mode is silent; non-default modes show a badge.
         {
-            use cc_core::config::PermissionMode;
+            use claurst_core::config::PermissionMode;
             match &app.config.permission_mode {
                 PermissionMode::BypassPermissions => {
                     if !spans.is_empty() { spans.push(Span::raw("  ")); }
@@ -1526,14 +1669,45 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
 
-        // 3. Cost
+        // 3. Cost — mirrors TS formatCost: 4 decimal places for costs < $0.50, else 2.
         if app.cost_usd > 0.0 {
             if !parts.is_empty() {
                 parts.push(Span::raw("  "));
             }
+            let cost_str = if app.cost_usd < 0.5 {
+                format!("${:.4}", app.cost_usd)
+            } else {
+                format!("${:.2}", app.cost_usd)
+            };
             parts.push(Span::styled(
-                format!("${:.2}", app.cost_usd),
+                cost_str,
                 Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        // 3b. Token budget (feature-gated)
+        #[cfg(feature = "token_budget")]
+        if let Some(max_tokens) = app.token_budget {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            let used = app.token_count as u64;
+            let max = max_tokens as u64;
+            let pct = if max > 0 {
+                (used as f64 / max as f64 * 100.0) as u32
+            } else {
+                0
+            };
+            let color = if pct >= 90 {
+                Color::Red
+            } else if pct >= 75 {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            };
+            parts.push(Span::styled(
+                format!("Tokens: {}/{} ({}%)", used, max, pct),
+                Style::default().fg(color),
             ));
         }
 
@@ -1563,22 +1737,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
 
-        // 5. Vim mode indicator
-        if app.prompt_input.vim_enabled {
-            let (mode_str, mode_color) = match app.prompt_input.vim_mode {
-                VimMode::Insert => ("[INSERT]", Color::Blue),
-                VimMode::Normal => ("[NORMAL]", Color::Green),
-                VimMode::Visual => ("[VISUAL]", Color::Magenta),
-                VimMode::VisualLine => ("[VISUAL LINE]", Color::Magenta),
-                VimMode::VisualBlock => ("[VISUAL BLOCK]", Color::Magenta),
-                VimMode::Command => ("[COMMAND]", Color::Cyan),
-                VimMode::Search => ("[SEARCH]", Color::Yellow),
-            };
-            if !parts.is_empty() {
-                parts.push(Span::raw("  "));
-            }
-            parts.push(Span::styled(mode_str, Style::default().fg(mode_color)));
-        }
+        // 5. Vim mode — displayed on the left side as "-- MODE --"; nothing extra on right.
 
         // 6. Agent type badge
         if let Some(ref badge) = app.agent_type_badge {

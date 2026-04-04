@@ -1,6 +1,6 @@
 // cc-bridge: Remote control bridge implementation.
 //
-// The bridge connects the local Claude Code CLI to the claude.ai web UI,
+// The bridge connects the local Claurst CLI to the claude.ai web UI,
 // enabling mobile/web-initiated sessions. This module implements:
 //
 // - Bridge configuration management (env-var and defaults)
@@ -191,14 +191,14 @@ impl BridgeConfig {
     /// Build config from environment variables.
     ///
     /// Recognised variables:
-    /// - `CLAUDE_CODE_BRIDGE_URL` — overrides `server_url` and sets `enabled = true`
-    /// - `CLAUDE_CODE_BRIDGE_TOKEN` / `CLAUDE_BRIDGE_OAUTH_TOKEN` — sets `session_token`
+    /// - `CLAURST_BRIDGE_URL` — overrides `server_url` and sets `enabled = true`
+    /// - `CLAURST_BRIDGE_TOKEN` / `CLAUDE_BRIDGE_OAUTH_TOKEN` — sets `session_token`
     /// - `CLAUDE_BRIDGE_BASE_URL` — alternative URL override (ant-only dev override)
     pub fn from_env() -> Self {
         let mut config = Self::default();
 
         // URL override (sets enabled implicitly)
-        if let Ok(url) = std::env::var("CLAUDE_CODE_BRIDGE_URL")
+        if let Ok(url) = std::env::var("CLAURST_BRIDGE_URL")
             .or_else(|_| std::env::var("CLAUDE_BRIDGE_BASE_URL"))
         {
             if !url.is_empty() {
@@ -208,7 +208,7 @@ impl BridgeConfig {
         }
 
         // Token override
-        if let Ok(token) = std::env::var("CLAUDE_CODE_BRIDGE_TOKEN")
+        if let Ok(token) = std::env::var("CLAURST_BRIDGE_TOKEN")
             .or_else(|_| std::env::var("CLAUDE_BRIDGE_OAUTH_TOKEN"))
         {
             if !token.is_empty() {
@@ -908,7 +908,7 @@ pub struct SimpleMessage {
 /// # Authentication
 ///
 /// Reads the bearer token from (in order of precedence):
-/// 1. `CLAUDE_CODE_BRIDGE_TOKEN` environment variable
+/// 1. `CLAURST_BRIDGE_TOKEN` environment variable
 /// 2. `CLAUDE_BRIDGE_OAUTH_TOKEN` environment variable
 ///
 /// If no token is found, returns an informative error.
@@ -924,7 +924,7 @@ pub struct SimpleMessage {
 ///
 /// ```rust,no_run
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
-/// match cc_bridge::start_bridge_session(None).await {
+/// match claurst_bridge::start_bridge_session(None).await {
 ///     Ok(info) => println!("Session URL: {}", info.session_url),
 ///     Err(e) => eprintln!("Could not start bridge: {e}"),
 /// }
@@ -935,20 +935,20 @@ pub async fn start_bridge_session(
 ) -> anyhow::Result<BridgeSessionInfo> {
     // Resolve auth token.
     let token = token_override
-        .or_else(|| std::env::var("CLAUDE_CODE_BRIDGE_TOKEN").ok())
+        .or_else(|| std::env::var("CLAURST_BRIDGE_TOKEN").ok())
         .or_else(|| std::env::var("CLAUDE_BRIDGE_OAUTH_TOKEN").ok())
         .filter(|t| !t.is_empty())
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "Remote Control requires a session token.\n\
-                 Set CLAUDE_CODE_BRIDGE_TOKEN=<your-token> to enable.\n\
+                 Set CLAURST_BRIDGE_TOKEN=<your-token> to enable.\n\
                  Get a token from https://claude.ai (Settings → Remote Control).\n\
                  Note: Remote Control is only available with claude.ai subscriptions."
             )
         })?;
 
     // Resolve server base URL.
-    let server_url = std::env::var("CLAUDE_CODE_BRIDGE_URL")
+    let server_url = std::env::var("CLAURST_BRIDGE_URL")
         .or_else(|_| std::env::var("CLAUDE_BRIDGE_BASE_URL"))
         .unwrap_or_else(|_| "https://claude.ai".to_string());
 
@@ -1047,7 +1047,7 @@ pub async fn poll_bridge_messages(
     info: &BridgeSessionInfo,
     since_id: Option<&str>,
 ) -> anyhow::Result<Vec<SimpleMessage>> {
-    let server_url = std::env::var("CLAUDE_CODE_BRIDGE_URL")
+    let server_url = std::env::var("CLAURST_BRIDGE_URL")
         .or_else(|_| std::env::var("CLAUDE_BRIDGE_BASE_URL"))
         .unwrap_or_else(|_| "https://claude.ai".to_string());
 
@@ -1125,7 +1125,7 @@ pub async fn post_bridge_response(
     content: &str,
     done: bool,
 ) -> anyhow::Result<()> {
-    let server_url = std::env::var("CLAUDE_CODE_BRIDGE_URL")
+    let server_url = std::env::var("CLAURST_BRIDGE_URL")
         .or_else(|_| std::env::var("CLAUDE_BRIDGE_BASE_URL"))
         .unwrap_or_else(|_| "https://claude.ai".to_string());
 
@@ -1174,6 +1174,67 @@ pub async fn post_bridge_response(
             "post_bridge_response: server returned HTTP {} for msg {}",
             status,
             msg_id
+        )
+    }
+}
+
+/// Post a single streaming tool/text event to the bridge server (non-blocking,
+/// best-effort).
+///
+/// POSTs `{"event": <payload>, "ts": <unix_ms>}` to
+/// `/api/bridge/sessions/<session_id>/events`.
+///
+/// Errors are returned to the caller, who should treat them as transient and
+/// ignore them so the query loop is never blocked.
+pub async fn post_bridge_event(
+    info: &BridgeSessionInfo,
+    payload: String,
+) -> anyhow::Result<()> {
+    let server_url = std::env::var("CLAURST_BRIDGE_URL")
+        .or_else(|_| std::env::var("CLAUDE_BRIDGE_BASE_URL"))
+        .unwrap_or_else(|_| "https://claude.ai".to_string());
+
+    // Validate session_id before URL interpolation.
+    BridgeConfig::validate_id(&info.session_id, "session_id")?;
+
+    let url = format!(
+        "{}/api/bridge/sessions/{}/events",
+        server_url, info.session_id
+    );
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .user_agent(format!("claude-code-rust/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("post_bridge_event: failed to build HTTP client")?;
+
+    let body = serde_json::json!({
+        "event": payload,
+        "ts": chrono::Utc::now().timestamp_millis(),
+    });
+
+    debug!(
+        session_id = %info.session_id,
+        "Posting bridge event"
+    );
+
+    let resp = http
+        .post(&url)
+        .bearer_auth(&info.token)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await
+        .context("post_bridge_event: HTTP POST failed")?;
+
+    let status = resp.status().as_u16();
+    if resp.status().is_success() {
+        debug!(session_id = %info.session_id, "Bridge event posted");
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "post_bridge_event: server returned HTTP {}",
+            status
         )
     }
 }

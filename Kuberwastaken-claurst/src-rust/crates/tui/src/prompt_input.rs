@@ -109,6 +109,10 @@ pub enum VimOperator {
     Delete,
     Change,
     Yank,
+    /// Uppercase region (gU).
+    Uppercase,
+    /// Lowercase region (gu).
+    Lowercase,
 }
 
 /// Vim character-find direction and variant.
@@ -339,7 +343,21 @@ fn motion_find_char(
     }
 }
 
-/// Apply an operator (d/c/y) to the range [from, to) in text.
+/// Convert text region to uppercase.
+fn uppercase_region(text: &str) -> String {
+    text.chars().map(|c| {
+        c.to_uppercase().next().unwrap_or(c)
+    }).collect()
+}
+
+/// Convert text region to lowercase.
+fn lowercase_region(text: &str) -> String {
+    text.chars().map(|c| {
+        c.to_lowercase().next().unwrap_or(c)
+    }).collect()
+}
+
+/// Apply an operator (d/c/y/gU/gu) to the range [from, to) in text.
 /// Returns `(new_text, new_cursor)`. For Change, sets mode to Insert.
 fn apply_operator_range(
     op: VimOperator,
@@ -351,7 +369,8 @@ fn apply_operator_range(
 ) -> (String, usize) {
     let to = to.min(text.len());
     let from = from.min(to);
-    *yank_buf = text[from..to].to_string();
+    let selected = &text[from..to];
+    *yank_buf = selected.to_string();
     match op {
         VimOperator::Yank => (text.to_string(), from),
         VimOperator::Delete => {
@@ -362,6 +381,16 @@ fn apply_operator_range(
         VimOperator::Change => {
             let new_text = format!("{}{}", &text[..from], &text[to..]);
             *mode = VimMode::Insert;
+            (new_text, from)
+        }
+        VimOperator::Uppercase => {
+            let upper = uppercase_region(selected);
+            let new_text = format!("{}{}{}", &text[..from], upper, &text[to..]);
+            (new_text, from)
+        }
+        VimOperator::Lowercase => {
+            let lower = lowercase_region(selected);
+            let new_text = format!("{}{}{}", &text[..from], lower, &text[to..]);
             (new_text, from)
         }
     }
@@ -788,6 +817,16 @@ fn vim_g(
             }
             false
         }
+        "U" => {
+            // `gU` — start case conversion uppercase operator
+            *pending = VimPendingState::Operator { op: VimOperator::Uppercase, count };
+            false
+        }
+        "u" => {
+            // `gu` — start case conversion lowercase operator
+            *pending = VimPendingState::Operator { op: VimOperator::Lowercase, count };
+            false
+        }
         _ => { *pending = VimPendingState::None; false }
     }
 }
@@ -804,8 +843,14 @@ fn vim_operator(
     op: VimOperator,
     count: usize,
 ) -> bool {
-    let op_char = match op { VimOperator::Delete => "d", VimOperator::Change => "c", VimOperator::Yank => "y" };
-    // Doubled operator = line op (dd, cc, yy)
+    let op_char = match op {
+        VimOperator::Delete => "d",
+        VimOperator::Change => "c",
+        VimOperator::Yank => "y",
+        VimOperator::Uppercase => "U",
+        VimOperator::Lowercase => "u",
+    };
+    // Doubled operator = line op (dd, cc, yy, gUU, guu)
     if key == op_char {
         let ls = text[..*cursor].rfind('\n').map(|p| p + 1).unwrap_or(0);
         let mut le = *cursor;
@@ -816,11 +861,22 @@ fn vim_operator(
             }
         }
         let le = le.min(text.len());
-        *yank_buf = text[ls..le].to_string();
+        let selected = &text[ls..le];
+        *yank_buf = selected.to_string();
         if op != VimOperator::Yank {
+            let new_content = match op {
+                VimOperator::Delete => String::new(),
+                VimOperator::Change => {
+                    *mode = VimMode::Insert;
+                    String::new()
+                }
+                VimOperator::Uppercase => uppercase_region(selected),
+                VimOperator::Lowercase => lowercase_region(selected),
+                VimOperator::Yank => unreachable!(),
+            };
             text.drain(ls..le);
-            *cursor = ls.min(text.len());
-            if op == VimOperator::Change { *mode = VimMode::Insert; }
+            text.insert_str(ls, &new_content);
+            *cursor = ls;
             return true;
         }
         return false;
@@ -1051,6 +1107,103 @@ pub fn handle_paste(
 }
 
 // ---------------------------------------------------------------------------
+// Kill ring (Emacs-style kill/yank system)
+// ---------------------------------------------------------------------------
+
+/// Kill ring stores accumulated kills (deleted text) for cycling through with Alt+Y.
+/// Maintains a FIFO list of kills with a current index for cycling backward.
+#[derive(Debug, Clone)]
+pub struct KillRing {
+    /// List of killed text entries. Most recent is last.
+    pub entries: Vec<String>,
+    /// Maximum number of entries to keep (prevents unbounded growth).
+    max_size: usize,
+    /// Current position in kill ring when cycling with Alt+Y (None = most recent).
+    pub current_index: Option<usize>,
+    /// Tracks whether the last action was a kill (for combining consecutive kills).
+    pub last_was_kill: bool,
+}
+
+impl KillRing {
+    /// Create a new kill ring with default capacity.
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::with_capacity(32),
+            max_size: 64,
+            current_index: None,
+            last_was_kill: false,
+        }
+    }
+
+    /// Add a kill entry. If the last operation was a kill, append to the most recent entry
+    /// instead of creating a new one (for combining consecutive kills).
+    pub fn push(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+
+        if self.last_was_kill && !self.entries.is_empty() {
+            // Append to the most recent entry (last_was_kill combines consecutive kills)
+            self.entries.last_mut().unwrap().push_str(&text);
+        } else {
+            // New kill entry
+            self.entries.push(text);
+            if self.entries.len() > self.max_size {
+                self.entries.remove(0);
+            }
+        }
+        self.current_index = None; // Reset cycling to most recent
+        self.last_was_kill = true;
+    }
+
+    /// Get the current kill to paste (most recent or current index if cycling).
+    pub fn get_current(&self) -> Option<&str> {
+        if self.entries.is_empty() {
+            return None;
+        }
+
+        match self.current_index {
+            None => self.entries.last().map(|s| s.as_str()),
+            Some(idx) => self.entries.get(idx).map(|s| s.as_str()),
+        }
+    }
+
+    /// Cycle backward through kill ring (Alt+Y after paste).
+    pub fn cycle_backward(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+
+        match self.current_index {
+            None => {
+                // Start cycling from the second-to-last entry
+                if self.entries.len() > 1 {
+                    self.current_index = Some(self.entries.len() - 2);
+                }
+            }
+            Some(0) => {
+                // Wrap around to the end
+                self.current_index = Some(self.entries.len() - 1);
+            }
+            Some(idx) => {
+                self.current_index = Some(idx - 1);
+            }
+        }
+    }
+
+    /// Mark that a non-kill action occurred (resets consecutive kill combination).
+    pub fn mark_non_kill(&mut self) {
+        self.last_was_kill = false;
+    }
+}
+
+impl Default for KillRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PromptInput state
 // ---------------------------------------------------------------------------
 
@@ -1124,6 +1277,8 @@ pub struct PromptInputState {
     pub vim_quit_requested: bool,
     /// Pending image attachments (from clipboard paste) to be sent with next message.
     pub pending_images: Vec<crate::image_paste::PastedImage>,
+    /// Emacs-style kill ring for Ctrl+K, Ctrl+U, Ctrl+W operations.
+    pub kill_ring: KillRing,
 }
 
 impl PromptInputState {
@@ -1158,6 +1313,7 @@ impl PromptInputState {
             vim_search_last: None,
             vim_quit_requested: false,
             pending_images: Vec::new(),
+            kill_ring: KillRing::new(),
         }
     }
 
@@ -1279,6 +1435,220 @@ impl PromptInputState {
             self.cursor += c.len_utf8();
         }
         self.update_token_estimate();
+        self.kill_ring.mark_non_kill();
+    }
+
+    /// Ctrl+K: Cut from cursor to end of line and save to kill ring.
+    pub fn kill_line(&mut self) {
+        if self.mode == InputMode::Readonly { return; }
+        let line_end = self.text[self.cursor..].find('\n')
+            .map(|p| self.cursor + p)
+            .unwrap_or(self.text.len());
+
+        if line_end > self.cursor {
+            let killed = self.text.drain(self.cursor..line_end).collect::<String>();
+            self.kill_ring.push(killed);
+            self.update_token_estimate();
+        }
+    }
+
+    /// Ctrl+U: Cut from line start to cursor and save to kill ring.
+    pub fn kill_line_backward(&mut self) {
+        if self.mode == InputMode::Readonly { return; }
+        let line_start = self.text[..self.cursor].rfind('\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+
+        if self.cursor > line_start {
+            let killed = self.text.drain(line_start..self.cursor).collect::<String>();
+            self.kill_ring.push(killed);
+            self.cursor = line_start;
+            self.update_token_estimate();
+        }
+    }
+
+    /// Ctrl+W: Cut previous word and save to kill ring.
+    pub fn kill_word_backward(&mut self) {
+        if self.mode == InputMode::Readonly || self.cursor == 0 { return; }
+        let before = &self.text[..self.cursor];
+        let chars: Vec<char> = before.chars().collect();
+        let mut idx = chars.len();
+        while idx > 0 && chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        if idx == 0 {
+            return;
+        }
+        if is_word_char(chars[idx - 1]) {
+            while idx > 0 && is_word_char(chars[idx - 1]) {
+                idx -= 1;
+            }
+        } else {
+            while idx > 0 && !is_word_char(chars[idx - 1]) && !chars[idx - 1].is_whitespace() {
+                idx -= 1;
+            }
+        }
+        let kill_start = char_idx_to_byte(before, idx);
+        if kill_start < self.cursor {
+            let killed = self.text.drain(kill_start..self.cursor).collect::<String>();
+            self.kill_ring.push(killed);
+            self.cursor = kill_start;
+            self.update_token_estimate();
+        }
+    }
+
+    /// Ctrl+Y: Paste from kill ring (most recent).
+    pub fn yank(&mut self) {
+        if self.mode == InputMode::Readonly { return; }
+        if let Some(text) = self.kill_ring.get_current() {
+            for c in text.chars() {
+                self.text.insert(self.cursor, c);
+                self.cursor += c.len_utf8();
+            }
+            self.update_token_estimate();
+            self.kill_ring.mark_non_kill();
+        }
+    }
+
+    /// Alt+Y: Cycle through kill ring backward.
+    pub fn yank_pop(&mut self) {
+        if self.mode == InputMode::Readonly { return; }
+        self.kill_ring.cycle_backward();
+    }
+
+    /// Alt+Backspace: Delete word backward.
+    pub fn delete_word_backward(&mut self) {
+        if self.mode == InputMode::Readonly || self.cursor == 0 { return; }
+        let before = &self.text[..self.cursor];
+        let chars: Vec<char> = before.chars().collect();
+        let mut idx = chars.len();
+        while idx > 0 && chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        if idx == 0 {
+            return;
+        }
+        if is_word_char(chars[idx - 1]) {
+            while idx > 0 && is_word_char(chars[idx - 1]) {
+                idx -= 1;
+            }
+        } else {
+            while idx > 0 && !is_word_char(chars[idx - 1]) && !chars[idx - 1].is_whitespace() {
+                idx -= 1;
+            }
+        }
+        let delete_start = char_idx_to_byte(before, idx);
+        if delete_start < self.cursor {
+            self.text.drain(delete_start..self.cursor);
+            self.cursor = delete_start;
+            self.update_token_estimate();
+            self.kill_ring.mark_non_kill();
+        }
+    }
+
+    /// Alt+Delete: Delete word forward.
+    pub fn delete_word_forward(&mut self) {
+        if self.mode == InputMode::Readonly || self.cursor >= self.text.len() { return; }
+        let rest = &self.text[self.cursor..];
+        let chars: Vec<char> = rest.chars().collect();
+        let mut idx = 0;
+        while idx < chars.len() && chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        if idx >= chars.len() {
+            return;
+        }
+        if is_word_char(chars[idx]) {
+            while idx < chars.len() && is_word_char(chars[idx]) {
+                idx += 1;
+            }
+        } else {
+            while idx < chars.len() && !is_word_char(chars[idx]) && !chars[idx].is_whitespace() {
+                idx += 1;
+            }
+        }
+        let delete_end = self.cursor + char_idx_to_byte(rest, idx);
+        if delete_end > self.cursor {
+            self.text.drain(self.cursor..delete_end);
+            self.update_token_estimate();
+            self.kill_ring.mark_non_kill();
+        }
+    }
+
+    /// Alt+B: Jump to previous word.
+    pub fn move_word_backward(&mut self) {
+        if self.cursor == 0 { return; }
+        let before = &self.text[..self.cursor];
+        let chars: Vec<char> = before.chars().collect();
+        let mut idx = chars.len();
+        while idx > 0 && chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        if idx == 0 {
+            return;
+        }
+        if is_word_char(chars[idx - 1]) {
+            while idx > 0 && is_word_char(chars[idx - 1]) {
+                idx -= 1;
+            }
+        } else {
+            while idx > 0 && !is_word_char(chars[idx - 1]) && !chars[idx - 1].is_whitespace() {
+                idx -= 1;
+            }
+        }
+        self.cursor = char_idx_to_byte(before, idx);
+    }
+
+    /// Alt+F: Jump to next word.
+    pub fn move_word_forward(&mut self) {
+        if self.cursor >= self.text.len() { return; }
+        let rest = &self.text[self.cursor..];
+        let chars: Vec<char> = rest.chars().collect();
+        let mut idx = 0;
+        if idx < chars.len() {
+            if is_word_char(chars[idx]) {
+                while idx < chars.len() && is_word_char(chars[idx]) {
+                    idx += 1;
+                }
+            } else if !chars[idx].is_whitespace() {
+                while idx < chars.len() && !is_word_char(chars[idx]) && !chars[idx].is_whitespace() {
+                    idx += 1;
+                }
+            }
+        }
+        while idx < chars.len() && chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        self.cursor = self.cursor + char_idx_to_byte(rest, idx);
+    }
+
+    /// Alt+D: Delete word after cursor.
+    pub fn delete_word_at_cursor(&mut self) {
+        if self.mode == InputMode::Readonly || self.cursor >= self.text.len() { return; }
+        let rest = &self.text[self.cursor..];
+        let chars: Vec<char> = rest.chars().collect();
+        let mut idx = 0;
+        while idx < chars.len() && chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        if idx >= chars.len() {
+            return;
+        }
+        if is_word_char(chars[idx]) {
+            while idx < chars.len() && is_word_char(chars[idx]) {
+                idx += 1;
+            }
+        } else {
+            while idx < chars.len() && !is_word_char(chars[idx]) && !chars[idx].is_whitespace() {
+                idx += 1;
+            }
+        }
+        let delete_end = self.cursor + char_idx_to_byte(rest, idx);
+        if delete_end > self.cursor {
+            self.text.drain(self.cursor..delete_end);
+            self.update_token_estimate();
+            self.kill_ring.mark_non_kill();
+        }
     }
 
     /// Apply a vim command using the full state-machine key handler.
@@ -2036,7 +2406,7 @@ pub fn input_height(state: &PromptInputState) -> u16 {
     base + if state.pending_images.is_empty() { 0 } else { 1 }
 }
 
-/// Render the prompt input widget in the same low-chrome style as Claude Code:
+/// Render the prompt input widget in the same low-chrome style as Claurst:
 /// multi-line input rows (one per logical line in the text) plus an accent
 /// underline. Suggestions are rendered by the footer, not as a boxed dropdown
 /// here.
@@ -2208,8 +2578,21 @@ pub fn render_prompt_input(
     }
 
     // Token estimate overlay on the first text row (top-right corner).
+    // Format mirrors TS formatTokens: compact "1.3k" for ≥1000, raw number below that.
     if state.text.len() > 1000 && area.height > 1 {
-        let count_str = format!("~{}t", state.token_estimate);
+        let n = state.token_estimate;
+        let formatted = if n >= 1000 {
+            let k = n as f64 / 1000.0;
+            // One decimal place, suppress trailing ".0" (e.g. 2000 → "2k", 1300 → "1.3k")
+            if (k * 10.0).round() % 10.0 == 0.0 {
+                format!("~{}k", k as u64)
+            } else {
+                format!("~{:.1}k", k)
+            }
+        } else {
+            format!("~{}", n)
+        };
+        let count_str = formatted;
         let x = area.x + area.width.saturating_sub(count_str.len() as u16);
         Paragraph::new(Line::from(vec![Span::styled(
             count_str,

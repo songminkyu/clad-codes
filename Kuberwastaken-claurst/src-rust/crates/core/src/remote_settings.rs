@@ -31,6 +31,17 @@ const DEFAULT_MAX_RETRIES: u32 = 5;
 pub const DEFAULT_POLLING_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 // ---------------------------------------------------------------------------
+// Free-code stub: no remote settings fetching
+// ---------------------------------------------------------------------------
+
+/// Stub: Returns empty managed settings.
+/// The free/OSS build does not fetch server-pushed security overlays or
+/// enterprise-managed settings from Anthropic's API.
+pub async fn fetch_remote_managed_settings() -> Value {
+    serde_json::json!({})
+}
+
+// ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 

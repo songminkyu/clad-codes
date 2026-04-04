@@ -1,4 +1,4 @@
-// cc-tui: Terminal UI using ratatui + crossterm for the Claude Code Rust port.
+// claurst-tui: Terminal UI using ratatui + crossterm for Claurst.
 //
 // This crate provides the interactive terminal interface including:
 // - Message display with syntax highlighting
@@ -27,14 +27,16 @@ use std::io::{self, Stdout};
 
 /// Figure/icon constants matching src/constants/figures.ts
 pub mod figures;
-/// Clawd robot mascot rendering.
-pub mod clawd;
+/// Rustle mascot rendering.
+pub mod rustle;
 /// Context window and rate-limit visualization overlay (/context).
 pub mod context_viz;
 /// Export format picker dialog (/export).
 pub mod export_dialog;
 /// Clipboard image paste and Ctrl+V text paste.
 pub mod image_paste;
+/// Inline image rendering via the Kitty graphics protocol (with text fallback).
+pub mod kitty_image;
 /// Application state and main event loop.
 pub mod app;
 /// Input helpers: slash command parsing.
@@ -55,6 +57,8 @@ pub mod plugin_views;
 pub mod settings_screen;
 /// Theme picker overlay.
 pub mod theme_screen;
+/// Color palette management for different themes and accessibility support.
+pub mod theme_colors;
 /// Privacy settings dialog.
 pub mod privacy_screen;
 /// Diff viewer dialog (two-pane: file list + unified diff detail).
@@ -81,6 +85,8 @@ pub mod hooks_config_menu;
 pub mod overage_upsell;
 /// Voice mode availability notice (shown when voice is available but not enabled).
 pub mod voice_mode_notice;
+/// Message copy utilities for different formatting options (markdown, plaintext, code, JSON).
+pub mod message_copy;
 /// Desktop app upsell startup dialog (shown at startup on macOS/Windows x64).
 pub mod desktop_upsell_startup;
 /// Memory update notification banner (shown after Claude updates a CLAUDE.md file).
@@ -97,6 +103,12 @@ pub mod invalid_config_dialog;
 pub mod bypass_permissions_dialog;
 /// First-launch onboarding / welcome dialog.
 pub mod onboarding_dialog;
+/// Push-to-talk voice capture and Whisper transcription.
+pub mod voice_capture;
+/// Task progress overlay (Ctrl+T) — shows task status with inline toggle.
+pub mod tasks_overlay;
+/// Session branching overlay (Ctrl+B) — create and switch between conversation branches.
+pub mod session_branching;
 
 // ---------------------------------------------------------------------------
 // Public re-exports
@@ -119,6 +131,7 @@ pub use mcp_view::{McpViewState, McpServerView, McpToolView, McpViewStatus, rend
 pub use prompt_input::{PromptInputState, VimMode, VimPendingState, VimOperator, VimFindKind, InputMode, render_prompt_input, handle_paste, compute_typeahead};
 pub use model_picker::{ModelPickerState, ModelEntry, EffortLevel, render_model_picker, model_supports_effort};
 pub use session_browser::{SessionBrowserState, SessionBrowserMode, SessionEntry, render_session_browser};
+pub use session_branching::{SessionBranchingState, BranchBrowserMode, BranchInfo, render_session_branching};
 pub use invalid_config_dialog::{InvalidConfigDialogState, InvalidConfigKind, render_invalid_config_dialog};
 pub use bypass_permissions_dialog::{BypassPermissionsDialogState, render_bypass_permissions_dialog};
 pub use onboarding_dialog::{OnboardingDialogState, render_onboarding_dialog};
@@ -127,7 +140,7 @@ pub use onboarding_dialog::{OnboardingDialogState, render_onboarding_dialog};
 // Terminal initialization / teardown helpers (public API)
 // ---------------------------------------------------------------------------
 
-/// Set up the terminal for TUI mode (raw mode + alternate screen).
+/// Set up the terminal for TUI mode (raw mode + alternate screen + mouse capture).
 pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -153,10 +166,10 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io
 mod tests {
     use super::*;
     use app::{App, HistorySearch, ToolStatus, ToolUseBlock};
-    use cc_core::config::Config;
-    use cc_core::cost::CostTracker;
-    use cc_core::file_history::FileHistory;
-    use cc_core::types::{ContentBlock, Role, ToolResultContent};
+    use claurst_core::config::Config;
+    use claurst_core::cost::CostTracker;
+    use claurst_core::file_history::FileHistory;
+    use claurst_core::types::{ContentBlock, Role, ToolResultContent};
     use dialogs::PermissionRequest;
     use notifications::NotificationKind;
     use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, Terminal};
@@ -490,7 +503,7 @@ mod tests {
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = make_app();
-        app.push_message(cc_core::types::Message::user("hello".to_string()));
+        app.push_message(claurst_core::types::Message::user("hello".to_string()));
 
         terminal
             .draw(|frame| crate::render::render_app(frame, &app))
@@ -505,7 +518,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
 
-        assert!(rendered.contains("Claude Code"));
+        assert!(rendered.contains("Claurst"));
         assert!(rendered.contains("hello"));
     }
 
@@ -834,7 +847,7 @@ mod tests {
 
     #[test]
     fn test_message_renderer_includes_tool_use_and_thinking_blocks() {
-        let msg = cc_core::types::Message::assistant_blocks(vec![
+        let msg = claurst_core::types::Message::assistant_blocks(vec![
             ContentBlock::Thinking {
                 thinking: "reasoning".to_string(),
                 signature: "sig".to_string(),
@@ -863,7 +876,7 @@ mod tests {
 
     #[test]
     fn test_message_renderer_includes_tool_result_errors() {
-        let msg = cc_core::types::Message::user_blocks(vec![ContentBlock::ToolResult {
+        let msg = claurst_core::types::Message::user_blocks(vec![ContentBlock::ToolResult {
             tool_use_id: "toolu_1".to_string(),
             content: ToolResultContent::Text("boom".to_string()),
             is_error: Some(true),
@@ -885,7 +898,7 @@ mod tests {
     #[test]
     fn test_handle_status_event() {
         let mut app = make_app();
-        app.handle_query_event(cc_query::QueryEvent::Status("working".to_string()));
+        app.handle_query_event(claurst_query::QueryEvent::Status("working".to_string()));
         assert_eq!(app.status_message.as_deref(), Some("working"));
     }
 
@@ -893,7 +906,7 @@ mod tests {
     fn test_handle_error_event() {
         let mut app = make_app();
         app.is_streaming = true;
-        app.handle_query_event(cc_query::QueryEvent::Error("oops".to_string()));
+        app.handle_query_event(claurst_query::QueryEvent::Error("oops".to_string()));
         assert!(!app.is_streaming);
         assert_eq!(app.messages.len(), 1);
         assert!(app.messages[0].get_all_text().contains("oops"));
@@ -902,7 +915,7 @@ mod tests {
     #[test]
     fn test_handle_tool_start_and_end() {
         let mut app = make_app();
-        app.handle_query_event(cc_query::QueryEvent::ToolStart {
+        app.handle_query_event(claurst_query::QueryEvent::ToolStart {
             tool_name: "Bash".to_string(),
             tool_id: "t1".to_string(),
             input_json: r#"{"command":"ls -la"}"#.to_string(),
@@ -910,7 +923,7 @@ mod tests {
         assert_eq!(app.tool_use_blocks.len(), 1);
         assert_eq!(app.tool_use_blocks[0].status, ToolStatus::Running);
 
-        app.handle_query_event(cc_query::QueryEvent::ToolEnd {
+        app.handle_query_event(claurst_query::QueryEvent::ToolEnd {
             tool_name: "Bash".to_string(),
             tool_id: "t1".to_string(),
             result: "output".to_string(),
@@ -929,7 +942,7 @@ mod tests {
             output_preview: None,
             input_json: r#"{"file_path":"foo.rs"}"#.to_string(),
         });
-        app.handle_query_event(cc_query::QueryEvent::ToolEnd {
+        app.handle_query_event(claurst_query::QueryEvent::ToolEnd {
             tool_name: "Read".to_string(),
             tool_id: "t2".to_string(),
             result: "file not found".to_string(),
@@ -944,7 +957,7 @@ mod tests {
         let mut app = make_app();
         app.is_streaming = true;
         app.streaming_text = "partial response".to_string();
-        app.handle_query_event(cc_query::QueryEvent::TurnComplete {
+        app.handle_query_event(claurst_query::QueryEvent::TurnComplete {
             turn: 1,
             stop_reason: "end_turn".to_string(),
             usage: None,

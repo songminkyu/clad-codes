@@ -1,13 +1,13 @@
-// cc-tools: All tool implementations for the Claude Code Rust port.
+// claurst-tools: All tool implementations for Claurst.
 //
 // Each tool maps to a capability the LLM can invoke: running shell commands,
 // reading/writing/editing files, searching codebases, fetching web pages, etc.
 
 use async_trait::async_trait;
-use cc_core::config::PermissionMode;
-use cc_core::cost::CostTracker;
-use cc_core::permissions::{PermissionDecision, PermissionHandler, PermissionRequest};
-use cc_core::types::ToolDefinition;
+use claurst_core::config::PermissionMode;
+use claurst_core::cost::CostTracker;
+use claurst_core::permissions::{PermissionDecision, PermissionHandler, PermissionRequest};
+use claurst_core::types::ToolDefinition;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -69,7 +69,7 @@ pub use powershell::PowerShellTool;
 pub use send_message::{SendMessageTool, drain_inbox, peek_inbox};
 pub use skill_tool::SkillTool;
 pub use sleep::SleepTool;
-pub use tasks::{TaskCreateTool, TaskGetTool, TaskListTool, TaskOutputTool, TaskStopTool, TaskUpdateTool};
+pub use tasks::{TaskCreateTool, TaskGetTool, TaskListTool, TaskOutputTool, TaskStopTool, TaskUpdateTool, Task, TaskStatus, TASK_STORE};
 pub use tool_search::ToolSearchTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
@@ -78,7 +78,7 @@ pub use computer_use::ComputerUseTool;
 pub use mcp_auth_tool::McpAuthTool;
 pub use repl_tool::ReplTool;
 pub use synthetic_output::SyntheticOutputTool;
-pub use team_tool::{TeamCreateTool, TeamDeleteTool};
+pub use team_tool::{TeamCreateTool, TeamDeleteTool, register_agent_runner, AgentRunFn};
 pub use remote_trigger::RemoteTriggerTool;
 
 // ---------------------------------------------------------------------------
@@ -186,14 +186,14 @@ pub struct ToolContext {
     pub permission_handler: Arc<dyn PermissionHandler>,
     pub cost_tracker: Arc<CostTracker>,
     pub session_id: String,
-    pub file_history: Arc<parking_lot::Mutex<cc_core::file_history::FileHistory>>,
+    pub file_history: Arc<parking_lot::Mutex<claurst_core::file_history::FileHistory>>,
     pub current_turn: Arc<AtomicUsize>,
     /// If true, suppress interactive prompts (batch / CI mode).
     pub non_interactive: bool,
     /// Optional MCP manager for ListMcpResources / ReadMcpResource tools.
-    pub mcp_manager: Option<Arc<cc_mcp::McpManager>>,
+    pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
     /// Configured event hooks (PreToolUse, PostToolUse, etc.).
-    pub config: cc_core::config::Config,
+    pub config: claurst_core::config::Config,
 }
 
 impl ToolContext {
@@ -213,19 +213,49 @@ impl ToolContext {
         tool_name: &str,
         description: &str,
         is_read_only: bool,
-    ) -> Result<(), cc_core::error::ClaudeError> {
+    ) -> Result<(), claurst_core::error::ClaudeError> {
         let request = PermissionRequest {
             tool_name: tool_name.to_string(),
             description: description.to_string(),
             details: None,
             is_read_only,
+            context_description: None,
         };
         let decision = self.permission_handler.request_permission(&request);
         match decision {
             PermissionDecision::Allow | PermissionDecision::AllowPermanently => Ok(()),
-            _ => Err(cc_core::error::ClaudeError::PermissionDenied(format!(
+            _ => Err(claurst_core::error::ClaudeError::PermissionDenied(format!(
                 "Permission denied for tool '{}'",
                 tool_name
+            ))),
+        }
+    }
+
+    /// Like `check_permission` but also passes structured `details` text
+    /// (e.g. a risk explanation) that the TUI permission dialog can display.
+    ///
+    /// Used by PowerShellTool (and any future tool) when it needs to show
+    /// the user *why* a command is considered risky before they approve it.
+    pub fn check_permission_with_details(
+        &self,
+        tool_name: &str,
+        description: &str,
+        details: &str,
+        is_read_only: bool,
+    ) -> Result<(), claurst_core::error::ClaudeError> {
+        let request = PermissionRequest {
+            tool_name: tool_name.to_string(),
+            description: description.to_string(),
+            details: Some(details.to_string()),
+            is_read_only,
+            context_description: None,
+        };
+        let decision = self.permission_handler.request_permission(&request);
+        match decision {
+            PermissionDecision::Allow | PermissionDecision::AllowPermanently => Ok(()),
+            _ => Err(claurst_core::error::ClaudeError::PermissionDenied(format!(
+                "Permission denied for tool '{}': {}",
+                tool_name, details
             ))),
         }
     }
@@ -254,7 +284,7 @@ impl ToolContext {
 /// The trait every tool must implement.
 #[async_trait]
 pub trait Tool: Send + Sync {
-    /// Human-readable name (matches the constant in cc_core::constants).
+    /// Human-readable name (matches the constant in claurst_core::constants).
     fn name(&self) -> &str;
 
     /// One-line description shown to the LLM.
@@ -455,20 +485,20 @@ mod tests {
 
     #[test]
     fn test_resolve_path_absolute() {
-        use cc_core::config::Config;
-        use cc_core::permissions::AutoPermissionHandler;
+        use claurst_core::config::Config;
+        use claurst_core::permissions::AutoPermissionHandler;
 
         let handler = Arc::new(AutoPermissionHandler {
-            mode: cc_core::config::PermissionMode::Default,
+            mode: claurst_core::config::PermissionMode::Default,
         });
         let ctx = ToolContext {
             working_dir: PathBuf::from("/workspace"),
-            permission_mode: cc_core::config::PermissionMode::Default,
+            permission_mode: claurst_core::config::PermissionMode::Default,
             permission_handler: handler,
-            cost_tracker: cc_core::cost::CostTracker::new(),
+            cost_tracker: claurst_core::cost::CostTracker::new(),
             session_id: "test".to_string(),
             file_history: Arc::new(parking_lot::Mutex::new(
-                cc_core::file_history::FileHistory::new(),
+                claurst_core::file_history::FileHistory::new(),
             )),
             current_turn: Arc::new(AtomicUsize::new(0)),
             non_interactive: true,
@@ -483,20 +513,20 @@ mod tests {
 
     #[test]
     fn test_resolve_path_relative() {
-        use cc_core::config::Config;
-        use cc_core::permissions::AutoPermissionHandler;
+        use claurst_core::config::Config;
+        use claurst_core::permissions::AutoPermissionHandler;
 
         let handler = Arc::new(AutoPermissionHandler {
-            mode: cc_core::config::PermissionMode::Default,
+            mode: claurst_core::config::PermissionMode::Default,
         });
         let ctx = ToolContext {
             working_dir: PathBuf::from("/workspace"),
-            permission_mode: cc_core::config::PermissionMode::Default,
+            permission_mode: claurst_core::config::PermissionMode::Default,
             permission_handler: handler,
-            cost_tracker: cc_core::cost::CostTracker::new(),
+            cost_tracker: claurst_core::cost::CostTracker::new(),
             session_id: "test".to_string(),
             file_history: Arc::new(parking_lot::Mutex::new(
-                cc_core::file_history::FileHistory::new(),
+                claurst_core::file_history::FileHistory::new(),
             )),
             current_turn: Arc::new(AtomicUsize::new(0)),
             non_interactive: true,

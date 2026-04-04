@@ -1,12 +1,12 @@
 [package]
-name = "cc-bridge"
+name = "claurst-bridge"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-cc-core = { workspace = true }
-cc-api = { workspace = true }
-cc-query = { workspace = true }
+claurst-core = { workspace = true }
+claurst-api = { workspace = true }
+claurst-query = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }

@@ -4,8 +4,10 @@
 //! Manages background synchronization of local session transcripts
 //! with the Claude.ai cloud API.
 
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -146,18 +148,64 @@ impl SessionsWebSocket {
         }
     }
 
-    /// Connect to the sessions WebSocket and emit events.
-    /// This is a stub — real implementation requires a WS client crate (tokio-tungstenite).
+    /// Connect to the sessions WebSocket, emit events, and reconnect on disconnect.
+    /// Runs until the sender is dropped or the task is cancelled.
     pub async fn connect(
         &self,
-        _event_tx: mpsc::Sender<SessionEvent>,
+        event_tx: mpsc::Sender<SessionEvent>,
     ) -> Result<(), String> {
-        // Stub: in production, connect to self.ws_url with Bearer auth,
-        // deserialize incoming JSON as SessionEvent, send via event_tx.
-        tracing::info!(
-            url = %self.ws_url,
-            "SessionsWebSocket stub: real implementation requires tokio-tungstenite"
+        let mut backoff_secs: u64 = 1;
+        loop {
+            match self.run_once(&event_tx).await {
+                Ok(()) => {
+                    // Server closed cleanly — reconnect.
+                    tracing::debug!("SessionsWebSocket: server closed connection, reconnecting");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, backoff = backoff_secs, "SessionsWebSocket: error, backing off");
+                }
+            }
+            if event_tx.is_closed() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs * 2).min(60);
+        }
+        Ok(())
+    }
+
+    async fn run_once(&self, event_tx: &mpsc::Sender<SessionEvent>) -> Result<(), String> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+        let url = format!(
+            "{}?access_token={}",
+            self.ws_url,
+            urlencoding::encode(&self.access_token)
         );
+        let request = url.as_str().into_client_request().map_err(|e| e.to_string())?;
+
+        let (ws_stream, _) = connect_async(request).await.map_err(|e| e.to_string())?;
+        tracing::info!(url = %self.ws_url, "SessionsWebSocket: connected");
+
+        let mut read = ws_stream;
+        while let Some(msg) = read.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    match serde_json::from_str::<SessionEvent>(&text) {
+                        Ok(ev) => {
+                            if event_tx.send(ev).await.is_err() {
+                                return Ok(()); // receiver dropped
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, raw = %text, "SessionsWebSocket: unrecognised event");
+                        }
+                    }
+                }
+                Ok(Message::Close(_)) => return Ok(()),
+                Ok(_) => {} // ping/pong/binary — ignore
+                Err(e) => return Err::<(), String>(e.to_string()),
+            }
+        }
         Ok(())
     }
 }

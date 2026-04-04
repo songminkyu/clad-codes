@@ -6,8 +6,8 @@
 // `generate_away_summary` to get a short 1-3 sentence recap of what was
 // happening before they left.
 
-use cc_api::{AnthropicClient, CreateMessageRequest};
-use cc_core::types::Message;
+use claurst_api::{AnthropicClient, CreateMessageRequest};
+use claurst_core::types::Message;
 use tokio_util::sync::CancellationToken;
 
 /// Recap only needs recent context — truncate to avoid "prompt too long" on
@@ -86,8 +86,8 @@ pub async fn generate_away_summary(
     conversation.push(Message::user(build_away_summary_prompt()));
 
     // Convert to API messages.
-    let api_messages: Vec<cc_api::ApiMessage> =
-        conversation.iter().map(cc_api::ApiMessage::from).collect();
+    let api_messages: Vec<claurst_api::ApiMessage> =
+        conversation.iter().map(claurst_api::ApiMessage::from).collect();
 
     let request = CreateMessageRequest::builder(&config.model, config.max_tokens)
         .messages(api_messages)

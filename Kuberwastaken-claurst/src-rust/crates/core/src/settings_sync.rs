@@ -2,10 +2,10 @@
 //
 // Port of src/services/settingsSync/index.ts
 //
-// Syncs user settings and CLAUDE.md memory files between a local Claude Code
+// Syncs user settings and CLAUDE.md memory files between a local Claurst
 // installation and claude.ai via:
 //   - Upload (interactive CLI, fire-and-forget at startup)
-//   - Download (CCR / CLAUDE_CODE_REMOTE=1, blocking before plugin load)
+//   - Download (CCR / CLAURST_REMOTE=1, blocking before plugin load)
 //
 // Authentication requires OAuth (Bearer token).  API-key-only users are
 // skipped silently — the TypeScript side gates on `isUsingOAuth()`.

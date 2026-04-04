@@ -217,10 +217,11 @@ pub fn load_hooks_config(
 /// Scan a plugin's commands directory and return all `PluginCommandDef` items.
 pub fn collect_command_defs(plugin: &LoadedPlugin) -> Vec<crate::plugin::PluginCommandDef> {
     let mut defs: Vec<crate::plugin::PluginCommandDef> = Vec::new();
+    let capabilities = plugin.manifest.capabilities.clone();
 
     // Commands from the `commands/` directory.
     if let Some(ref cmd_dir) = plugin.commands_path {
-        collect_markdown_commands(cmd_dir, &plugin.name, &mut defs);
+        collect_markdown_commands(cmd_dir, &plugin.name, capabilities.clone(), &mut defs);
     }
 
     // Extra commands declared in the manifest.
@@ -238,9 +239,10 @@ pub fn collect_command_defs(plugin: &LoadedPlugin) -> Vec<crate::plugin::PluginC
                     file_path: abs.to_string_lossy().into_owned(),
                     plugin_root: plugin.path.to_string_lossy().into_owned(),
                 },
+                plugin_capabilities: capabilities.clone(),
             });
         } else if abs.is_dir() {
-            collect_markdown_commands(&abs, &plugin.name, &mut defs);
+            collect_markdown_commands(&abs, &plugin.name, capabilities.clone(), &mut defs);
         }
     }
 
@@ -251,6 +253,7 @@ pub fn collect_command_defs(plugin: &LoadedPlugin) -> Vec<crate::plugin::PluginC
 fn collect_markdown_commands(
     dir: &Path,
     plugin_name: &str,
+    capabilities: Option<Vec<String>>,
     defs: &mut Vec<crate::plugin::PluginCommandDef>,
 ) {
     use walkdir::WalkDir;
@@ -284,6 +287,7 @@ fn collect_markdown_commands(
                     file_path: path.to_string_lossy().into_owned(),
                     plugin_root: dir.to_string_lossy().into_owned(),
                 },
+                plugin_capabilities: capabilities.clone(),
             });
             continue;
         }
@@ -300,6 +304,7 @@ fn collect_markdown_commands(
                     file_path: path.to_string_lossy().into_owned(),
                     plugin_root: dir.to_string_lossy().into_owned(),
                 },
+                plugin_capabilities: capabilities.clone(),
             });
         }
     }

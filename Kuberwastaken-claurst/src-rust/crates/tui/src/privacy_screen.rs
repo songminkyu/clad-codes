@@ -3,7 +3,7 @@
 // A focused overlay with toggle-style controls for privacy preferences.
 // Opened by /privacy-settings. Changes are persisted via Settings::save_sync().
 
-use cc_core::config::Settings;
+use claurst_core::config::Settings;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -102,7 +102,7 @@ fn default_toggles() -> Vec<PrivacyToggle> {
             key: "usage_sharing",
             label: "Usage Sharing",
             description: "Share aggregate usage patterns (no personal data) to help \
-                          Anthropic understand how Claude Code is used.",
+                          Anthropic understand how Claurst is used.",
             enabled: false,
         },
         PrivacyToggle {

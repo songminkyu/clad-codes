@@ -1,5 +1,5 @@
 // cc-core: Core types, error handling, configuration, settings, and constants
-// for the Claude Code CLI Rust port.
+// for Claurst.
 //
 // All sub-modules are defined inline below.
 
@@ -33,6 +33,12 @@ pub mod message_utils;
 // Per-session file modification history (T4-6).
 pub mod file_history;
 
+// Feature flag management via GrowthBook.
+pub mod feature_flags;
+
+// MCP resource prompt template rendering with variable substitution.
+pub mod mcp_templates;
+
 // Re-export commonly used types at the crate root
 pub use error::{ClaudeError, Result};
 pub use types::{
@@ -42,6 +48,7 @@ pub use types::{
 pub use config::{Config, McpServerConfig, OutputFormat, PermissionMode, Settings, Theme};
 pub use cost::CostTracker;
 pub use history::ConversationSession;
+pub use feature_flags::FeatureFlagManager;
 pub use permissions::{
     AutoPermissionHandler, InteractivePermissionHandler,
     ManagedAutoPermissionHandler, ManagedInteractivePermissionHandler,
@@ -57,7 +64,7 @@ pub use permissions::{
 pub mod error {
     use thiserror::Error;
 
-    /// The unified error type for the Claude Code Rust port.
+    /// The unified error type for Claurst.
     #[derive(Error, Debug)]
     pub enum ClaudeError {
         #[error("API error: {0}")]
@@ -624,6 +631,7 @@ pub mod config {
         Dark,
         Light,
         Custom(String),
+        Deuteranopia,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -896,7 +904,7 @@ pub mod constants {
     pub const ANTHROPIC_API_VERSION: &str = "2023-06-01";
     pub const ANTHROPIC_BETA_HEADER: &str =
         "interleaved-thinking-2025-05-14,token-efficient-tools-2025-02-19,files-api-2025-04-14,\
-         effort-2025-11-24,task-budgets-2026-03-13";
+         effort-2025-11-24";
 
     // File system
     pub const CLAUDE_MD_FILENAME: &str = "CLAUDE.md";
@@ -1548,6 +1556,9 @@ pub mod permissions {
         pub description: String,
         pub details: Option<String>,
         pub is_read_only: bool,
+        /// Context-aware description showing user WHY the tool needs permission.
+        /// E.g. "bash: execute `ls -la /home`", "write file: /path/to/.bashrc", "fetch: https://example.com"
+        pub context_description: Option<String>,
     }
 
     // -----------------------------------------------------------------------
@@ -2630,10 +2641,13 @@ pub mod keybindings;
 pub mod voice;
 pub mod analytics;
 pub mod lsp;
+pub mod session_tracing;
+pub mod context_collapse;
 pub mod team_memory_sync;
 pub mod system_prompt;
 pub mod memdir;
 pub mod oauth_config;
+pub mod codex_oauth;
 pub mod migrations;
 pub mod output_styles;
 pub mod feature_gates;
@@ -2643,6 +2657,7 @@ pub mod settings_sync;
 pub mod effort;
 pub mod prompt_history;
 pub mod bash_classifier;
+pub mod ps_classifier;
 
 // ---------------------------------------------------------------------------
 // tasks module — background task registry
@@ -3126,6 +3141,7 @@ mod tests {
             description: format!("{} operation", tool_name),
             details: None,
             is_read_only,
+            context_description: None,
         }
     }
 

@@ -264,7 +264,7 @@ impl ModelPickerState {
         self.close();
 
         // Persist selection to ~/.claude/settings.json (best-effort; ignore I/O errors).
-        let settings_path = cc_core::config::Settings::global_settings_path();
+        let settings_path = claurst_core::config::Settings::global_settings_path();
         let existing = std::fs::read_to_string(&settings_path).unwrap_or_default();
         let mut json: serde_json::Value = serde_json::from_str(&existing)
             .unwrap_or_else(|_| serde_json::json!({}));
@@ -335,7 +335,7 @@ impl ModelPickerState {
     /// On success, models are sorted newest-first (by `created_at` descending).
     /// On any error, returns `default_models()` as a fallback so the picker is
     /// never left empty.
-    pub async fn fetch_models(client: &cc_api::AnthropicClient) -> Vec<ModelEntry> {
+    pub async fn fetch_models(client: &claurst_api::AnthropicClient) -> Vec<ModelEntry> {
         match client.fetch_available_models().await {
             Ok(available) => {
                 if available.is_empty() {

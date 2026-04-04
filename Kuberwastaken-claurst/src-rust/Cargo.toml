@@ -15,10 +15,10 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0"
+version = "0.0.6"
 edition = "2021"
-authors = ["Claude Code Rust Port"]
-license = "MIT"
+authors = ["Claurst"]
+license = "GPL-3.0"
 
 [workspace.dependencies]
 # Async runtime
@@ -76,6 +76,8 @@ mime = "0.3"
 urlencoding = "2"
 open = "5"
 qrcode = "0.14"
+icy_sixel = "0.5"
+image = { version = "0.25", features = ["png", "jpeg"] }
 
 # Text processing
 similar = "2"
@@ -89,17 +91,20 @@ nix = { version = "0.29", features = ["process", "signal", "user"] }
 # Async channels
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
 
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+
 # JSON Schema
 schemars = { version = "0.8", features = ["derive"] }
 
 # Workspace crates
-cc-core = { path = "crates/core" }
-cc-api = { path = "crates/api" }
-cc-tools = { path = "crates/tools" }
-cc-query = { path = "crates/query" }
-cc-tui = { path = "crates/tui" }
-cc-commands = { path = "crates/commands" }
-cc-mcp = { path = "crates/mcp" }
-cc-bridge = { path = "crates/bridge" }
-cc-buddy = { path = "crates/buddy" }
-cc-plugins = { path = "crates/plugins" }
+claurst-core = { path = "crates/core" }
+claurst-api = { path = "crates/api" }
+claurst-tools = { path = "crates/tools" }
+claurst-query = { path = "crates/query" }
+claurst-tui = { path = "crates/tui" }
+claurst-commands = { path = "crates/commands" }
+claurst-mcp = { path = "crates/mcp" }
+claurst-bridge = { path = "crates/bridge" }
+claurst-buddy = { path = "crates/buddy" }
+claurst-plugins = { path = "crates/plugins" }

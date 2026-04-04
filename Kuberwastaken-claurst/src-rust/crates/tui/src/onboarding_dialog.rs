@@ -104,7 +104,7 @@ fn render_welcome_page(frame: &mut Frame, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Line::from(vec![Span::styled(
-            " Welcome to Claude Code ",
+            " Welcome to Claurst ",
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
         )]))
         .border_style(Style::default().fg(Color::Green));
@@ -115,7 +115,7 @@ fn render_welcome_page(frame: &mut Frame, area: Rect) {
     let lines: Vec<Line<'static>> = vec![
         Line::from(""),
         Line::from(vec![Span::styled(
-            "  Claude Code is an AI-powered coding assistant in your terminal.",
+            "  Claurst is an AI-powered coding assistant in your terminal.",
             Style::default().fg(Color::White),
         )]),
         Line::from(""),

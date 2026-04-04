@@ -1,13 +1,13 @@
 [package]
-name = "cc-query"
+name = "claurst-query"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-cc-core = { workspace = true }
-cc-api = { workspace = true }
-cc-plugins = { workspace = true }
-cc-tools = { workspace = true }
+claurst-core = { workspace = true }
+claurst-api = { workspace = true }
+claurst-plugins = { workspace = true }
+claurst-tools = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
@@ -22,6 +22,8 @@ chrono = { workspace = true }
 dirs = { workspace = true }
 parking_lot = { workspace = true }
 tokio-util = { workspace = true }
+once_cell = { workspace = true }
+dashmap = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

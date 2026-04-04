@@ -55,7 +55,7 @@ impl Tool for LspTool {
                 .into_owned()
         };
 
-        let lsp_manager_arc = cc_core::lsp::global_lsp_manager();
+        let lsp_manager_arc = claurst_core::lsp::global_lsp_manager();
 
         // Open the file so the LSP server knows about it and begins sending
         // diagnostics (textDocument/didOpen notification).

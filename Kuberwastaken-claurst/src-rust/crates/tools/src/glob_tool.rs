@@ -19,7 +19,7 @@ struct GlobInput {
 #[async_trait]
 impl Tool for GlobTool {
     fn name(&self) -> &str {
-        cc_core::constants::TOOL_NAME_GLOB
+        claurst_core::constants::TOOL_NAME_GLOB
     }
 
     fn description(&self) -> &str {

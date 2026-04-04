@@ -7,7 +7,8 @@
 
 use std::collections::HashMap;
 
-use cc_core::types::{ContentBlock, Message, Role, ToolResultContent};
+use claurst_core::types::{ContentBlock, Message, Role, ToolResultContent};
+use crate::kitty_image::render_image;
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -16,6 +17,12 @@ use unicode_width::UnicodeWidthStr;
 
 mod markdown;
 pub use markdown::render_markdown;
+
+mod markdown_enhanced;
+pub use markdown_enhanced::{
+    detect_table, render_table, parse_inline_formatting,
+    Table, TableAlignment,
+};
 
 /// Context passed to all renderers.
 pub struct RenderContext {
@@ -61,12 +68,19 @@ const TOOL_RESULT_MAX_LINES: usize = 30;
 pub fn render_code_block(lang: Option<&str>, code: &str, width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let label = lang.unwrap_or("code");
+    // Language label in brackets at the top
     lines.push(Line::from(vec![Span::styled(
-        format!("--- {} ", label),
-        Style::default().fg(Color::DarkGray),
+        format!("  [{lang_name}]", lang_name = label),
+        Style::default()
+            .fg(Color::Rgb(150, 150, 150))
+            .add_modifier(Modifier::DIM),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        "  ┌─────────────────────────────────────────────────".to_string(),
+        Style::default().fg(Color::Rgb(100, 100, 100)),
     )]));
     // `2` chars for the leading "  " indent; at least 10 chars of content
-    let max_content = (width as usize).saturating_sub(2).max(10);
+    let max_content = (width as usize).saturating_sub(4).max(10);
     for line in code.lines() {
         let display: String = if line.chars().count() > max_content {
             let truncated: String = line.chars().take(max_content.saturating_sub(1)).collect();
@@ -75,13 +89,13 @@ pub fn render_code_block(lang: Option<&str>, code: &str, width: u16) -> Vec<Line
             line.to_string()
         };
         lines.push(Line::from(vec![
-            Span::styled("  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  │ ", Style::default().fg(Color::Rgb(100, 100, 100))),
             Span::styled(display, Style::default().fg(Color::White)),
         ]));
     }
     lines.push(Line::from(vec![Span::styled(
-        "----------------".to_string(),
-        Style::default().fg(Color::DarkGray),
+        "  └─────────────────────────────────────────────────".to_string(),
+        Style::default().fg(Color::Rgb(100, 100, 100)),
     )]));
     lines
 }
@@ -271,14 +285,16 @@ pub fn render_tool_result_success(output: &str, truncated: bool) -> Vec<Line<'st
 /// Render a tool result (error variant).
 pub fn render_tool_result_error(error: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    // Use orange instead of red for color-blind accessibility
+    let error_color = Color::Rgb(255, 140, 0);  // Orange
     lines.push(Line::from(vec![Span::styled(
-        "x Error",
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        "✗ Error",
+        Style::default().fg(error_color).add_modifier(Modifier::BOLD),
     )]));
     for line in error.lines().take(10) {
         lines.push(Line::from(vec![
             Span::styled("  ", Style::default()),
-            Span::styled(line.to_string(), Style::default().fg(Color::Red)),
+            Span::styled(line.to_string(), Style::default().fg(error_color)),
         ]));
     }
     lines
@@ -612,8 +628,8 @@ fn prefix_message_lines(
             Style::default().fg(Color::White),
         ),
         Role::Assistant => (
-            "\u{2022} ",
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            "◆ ",
+            Style::default().fg(Color::Rgb(0, 150, 200)).add_modifier(Modifier::BOLD),
             Style::default().fg(Color::White),
         ),
     };
@@ -765,16 +781,19 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
             }
             ContentBlock::Image { source } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
-                let label = source
-                    .url
-                    .clone()
-                    .or(source.media_type.clone())
-                    .unwrap_or_else(|| "embedded image".to_string());
-                lines.extend(prefix_message_lines(
-                    render_attachment_line("Image", label),
-                    &msg.role,
-                    ctx.width,
-                ));
+                // Attempt Kitty graphics protocol rendering.  When the
+                // terminal supports it and the source carries inline base64
+                // data, `render_image` emits the APC escape sequence directly
+                // to stdout and returns `None` — nothing more to do for this
+                // block.  Otherwise it returns a human-readable fallback
+                // string that we display as a normal styled line.
+                if let Some(label) = render_image(&source) {
+                    lines.extend(prefix_message_lines(
+                        render_attachment_line("Image", label),
+                        &msg.role,
+                        ctx.width,
+                    ));
+                }
             }
             ContentBlock::Document { title, context, source, .. } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
@@ -1362,10 +1381,10 @@ mod tests {
 
     #[test]
     fn test_render_user_memory_input() {
-        let result = render_user_memory_input("project", "Claude Code Rust Port");
+        let result = render_user_memory_input("project", "Claurst");
         assert_eq!(result.len(), 2);
         let first = line_text(&result[0]);
-        assert!(first.contains("# project: Claude Code Rust Port"));
+        assert!(first.contains("# project: Claurst"));
         let second = line_text(&result[1]);
         assert!(second.contains("Got it."));
     }

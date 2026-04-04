@@ -17,7 +17,7 @@ struct ExitPlanModeInput {
 #[async_trait]
 impl Tool for ExitPlanModeTool {
     fn name(&self) -> &str {
-        cc_core::constants::TOOL_NAME_EXIT_PLAN_MODE
+        claurst_core::constants::TOOL_NAME_EXIT_PLAN_MODE
     }
 
     fn description(&self) -> &str {

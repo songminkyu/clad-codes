@@ -121,15 +121,15 @@ pub fn render_export_dialog(frame: &mut Frame, state: &ExportDialogState, area: 
 // ---------------------------------------------------------------------------
 
 pub fn export_as_markdown(
-    messages: &[cc_core::types::Message],
+    messages: &[claurst_core::types::Message],
     session_title: Option<&str>,
 ) -> String {
-    use cc_core::types::Role;
+    use claurst_core::types::Role;
     let mut out = String::new();
     if let Some(title) = session_title {
         out.push_str(&format!("# {}\n\n", title));
     } else {
-        out.push_str("# Claude Code Conversation Export\n\n");
+        out.push_str("# Claurst Conversation Export\n\n");
     }
     for msg in messages {
         let label = match msg.role {
@@ -143,10 +143,10 @@ pub fn export_as_markdown(
 }
 
 pub fn export_as_json(
-    messages: &[cc_core::types::Message],
+    messages: &[claurst_core::types::Message],
     session_title: Option<&str>,
 ) -> serde_json::Value {
-    use cc_core::types::Role;
+    use claurst_core::types::Role;
     let items: Vec<serde_json::Value> = messages
         .iter()
         .map(|m| {

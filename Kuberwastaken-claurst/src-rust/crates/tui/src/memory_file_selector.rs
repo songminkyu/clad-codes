@@ -61,7 +61,7 @@ impl MemoryFileSelectorState {
         self.files.clear();
 
         // User-level: ~/.claude/CLAUDE.md
-        let user_path = cc_core::config::Settings::config_dir().join("CLAUDE.md");
+        let user_path = claurst_core::config::Settings::config_dir().join("CLAUDE.md");
         let user_display = {
             let home = dirs::home_dir().unwrap_or_default();
             let rel = user_path

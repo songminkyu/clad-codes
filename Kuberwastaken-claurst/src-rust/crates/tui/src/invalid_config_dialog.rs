@@ -154,16 +154,16 @@ pub fn render_invalid_config_dialog(
         InvalidConfigKind::Settings => vec![
             "  1. Open ~/.claude/settings.json in a text editor.",
             "  2. Fix the JSON syntax error shown above.",
-            "  3. Restart Claude Code.",
+            "  3. Restart Claurst.",
         ],
         InvalidConfigKind::ClaudeMd => vec![
             "  1. Open the CLAUDE.md file shown above in a text editor.",
             "  2. Fix the syntax error.",
-            "  3. Restart Claude Code.",
+            "  3. Restart Claurst.",
         ],
         InvalidConfigKind::Generic => vec![
             "  1. Fix the configuration file shown above.",
-            "  2. Restart Claude Code.",
+            "  2. Restart Claurst.",
         ],
     };
     for instr in instructions {

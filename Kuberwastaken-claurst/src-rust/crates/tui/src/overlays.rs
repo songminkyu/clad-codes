@@ -107,7 +107,7 @@ impl HelpOverlay {
 pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect) {
     use ratatui::layout::{Constraint, Direction, Layout};
     use ratatui::widgets::Wrap;
-    use cc_core::constants::APP_VERSION;
+    use claurst_core::constants::APP_VERSION;
 
     if !overlay.visible {
         return;
@@ -124,7 +124,7 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
         .borders(Borders::ALL)
         .title(Line::from(vec![
             Span::styled(" Help ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled("— Claude Code  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("— Claurst  ", Style::default().fg(Color::DarkGray)),
         ]))
         .border_style(Style::default().fg(Color::Cyan));
     frame.render_widget(block, dialog_area);

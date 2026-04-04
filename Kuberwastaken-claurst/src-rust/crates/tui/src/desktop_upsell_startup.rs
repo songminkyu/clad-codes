@@ -21,7 +21,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 // Platform guard
 // ---------------------------------------------------------------------------
 
-/// Returns true when Claude Code Desktop is a supported platform option.
+/// Returns true when Claurst Desktop is a supported platform option.
 pub fn is_desktop_supported_platform() -> bool {
     cfg!(target_os = "macos")
         || (cfg!(target_os = "windows") && cfg!(target_arch = "x86_64"))
@@ -171,7 +171,7 @@ pub fn render_desktop_upsell_startup(
     let mut lines: Vec<Line> = vec![
         Line::from(""),
         Line::from(vec![Span::styled(
-            "Same Claude Code with visual diffs, live app",
+            "Same Claurst features with visual diffs, live app",
             Style::default().fg(Color::White),
         )]),
         Line::from(vec![Span::styled(

@@ -67,15 +67,13 @@ pub fn remove_mcp_token(server_name: &str) -> std::io::Result<()> {
 // PKCE helpers
 // ---------------------------------------------------------------------------
 
-/// Generate a PKCE code verifier (43–128 random URL-safe chars).
+/// Generate a PKCE code verifier (43 URL-safe random chars per RFC 7636).
 pub fn pkce_verifier() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    // Simple deterministic stub (real impl would use getrandom).
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    format!("{:0>43}", ts)
+    use base64::Engine as _;
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).expect("getrandom failed");
+    // base64url-encode → 43 chars (256 bits of entropy, no padding)
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// Derive a PKCE code challenge from a verifier (S256 method).

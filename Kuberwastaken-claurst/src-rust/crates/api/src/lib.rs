@@ -1,4 +1,4 @@
-// cc-api: Anthropic API client with streaming SSE support for the Claude Code
+// claurst-api: Anthropic API client with streaming SSE support for Claurst
 // Rust port.
 //
 // Handles:
@@ -9,9 +9,9 @@
 // - Rate-limit (429) and overloaded (529) retry with exponential back-off
 // - Authentication via API key from env or config
 
-use cc_core::constants::{ANTHROPIC_API_VERSION, ANTHROPIC_BETA_HEADER};
-use cc_core::error::ClaudeError;
-use cc_core::types::{ContentBlock, Message, MessageContent, Role, ToolDefinition, UsageInfo};
+use claurst_core::constants::{ANTHROPIC_API_VERSION, ANTHROPIC_BETA_HEADER};
+use claurst_core::error::ClaudeError;
+use claurst_core::types::{ContentBlock, Message, MessageContent, Role, ToolDefinition, UsageInfo};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,6 +19,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
+
+// ---------------------------------------------------------------------------
+// Modules
+// ---------------------------------------------------------------------------
+pub mod cch;
+pub mod codex_adapter;
 
 // ---------------------------------------------------------------------------
 // Public re-exports
@@ -322,6 +328,21 @@ pub struct AvailableModel {
 pub mod client {
     use super::*;
 
+    /// Provider selection for API calls.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Provider {
+        /// Use Anthropic's API
+        Anthropic,
+        /// Use OpenAI Codex via OAuth
+        Codex,
+    }
+
+    impl Default for Provider {
+        fn default() -> Self {
+            Provider::Anthropic
+        }
+    }
+
     /// Configuration for the HTTP client.
     #[derive(Debug, Clone)]
     pub struct ClientConfig {
@@ -336,13 +357,15 @@ pub mod client {
         /// When true, send `Authorization: Bearer <api_key>` instead of `x-api-key`.
         /// Used for Claude.ai subscription (OAuth user:inference scope) tokens.
         pub use_bearer_auth: bool,
+        /// Which provider to use for API calls.
+        pub provider: Provider,
     }
 
     impl Default for ClientConfig {
         fn default() -> Self {
             Self {
                 api_key: String::new(),
-                api_base: cc_core::constants::ANTHROPIC_API_BASE.to_string(),
+                api_base: claurst_core::constants::ANTHROPIC_API_BASE.to_string(),
                 api_version: ANTHROPIC_API_VERSION.to_string(),
                 beta_features: ANTHROPIC_BETA_HEADER.to_string(),
                 max_retries: 5,
@@ -350,6 +373,7 @@ pub mod client {
                 max_retry_delay: Duration::from_secs(60),
                 request_timeout: Duration::from_secs(600),
                 use_bearer_auth: false,
+                provider: Provider::Anthropic,
             }
         }
     }
@@ -377,7 +401,7 @@ pub mod client {
         }
 
         /// Convenience constructor that resolves the key from config/env.
-        pub fn from_config(cfg: &cc_core::config::Config) -> anyhow::Result<Self> {
+        pub fn from_config(cfg: &claurst_core::config::Config) -> anyhow::Result<Self> {
             let api_key = cfg
                 .resolve_api_key()
                 .ok_or_else(|| anyhow::anyhow!("No API key found"))?;
@@ -397,6 +421,11 @@ pub mod client {
             &self,
             mut request: CreateMessageRequest,
         ) -> Result<CreateMessageResponse, ClaudeError> {
+            // Route to Codex if configured
+            if self.config.provider == Provider::Codex {
+                return self.create_message_codex(&request).await;
+            }
+
             request.stream = false;
             let body = serde_json::to_value(&request).map_err(ClaudeError::Json)?;
 
@@ -411,6 +440,49 @@ pub mod client {
             serde_json::from_str(&text).map_err(ClaudeError::Json)
         }
 
+        /// Send a request to OpenAI Codex API instead of Anthropic.
+        async fn create_message_codex(
+            &self,
+            request: &CreateMessageRequest,
+        ) -> Result<CreateMessageResponse, ClaudeError> {
+            // Convert Anthropic format to OpenAI format
+            let openai_req = codex_adapter::anthropic_to_openai_request(request);
+
+            // Send to Codex endpoint
+            let client = reqwest::Client::new();
+            let resp = client
+                .post(codex_adapter::CODEX_RESPONSES_ENDPOINT)
+                .header("Authorization", format!("Bearer {}", self.config.api_key))
+                .header("Content-Type", "application/json")
+                .json(&openai_req)
+                .timeout(self.config.request_timeout)
+                .send()
+                .await
+                .map_err(|e| ClaudeError::Other(format!("Codex request failed: {}", e)))?;
+
+            let status = resp.status();
+            let text = resp.text().await.map_err(ClaudeError::Http)?;
+
+            if !status.is_success() {
+                return Err(self.parse_api_error(status.as_u16(), &text));
+            }
+
+            // Parse OpenAI response and convert to Anthropic format
+            let openai_resp: Value = serde_json::from_str(&text).map_err(ClaudeError::Json)?;
+            let (content, stop_reason, input_tokens, output_tokens) =
+                codex_adapter::parse_openai_response(&openai_resp);
+
+            let response = codex_adapter::build_anthropic_response(
+                &content,
+                &stop_reason,
+                input_tokens,
+                output_tokens,
+                &request.model,
+            );
+
+            Ok(response)
+        }
+
         // ---- Streaming create message ------------------------------------
 
         /// Send a streaming `POST /v1/messages`.  Events are dispatched to the
@@ -421,6 +493,13 @@ pub mod client {
             mut request: CreateMessageRequest,
             handler: Arc<dyn StreamHandler>,
         ) -> Result<mpsc::Receiver<StreamEvent>, ClaudeError> {
+            // Codex provider doesn't support streaming yet
+            if self.config.provider == Provider::Codex {
+                return Err(ClaudeError::Other(
+                    "Codex provider does not support streaming yet".to_string(),
+                ));
+            }
+
             request.stream = true;
             let body = serde_json::to_value(&request).map_err(ClaudeError::Json)?;
 
@@ -497,8 +576,17 @@ pub mod client {
             let mut attempts = 0u32;
             let mut delay = self.config.initial_retry_delay;
 
+            // Serialize body to JSON string for CCH signing
+            let body_str = serde_json::to_string(body)
+                .map_err(|e| ClaudeError::Api(format!("Failed to serialize request: {}", e)))?;
+            let body_bytes = body_str.as_bytes();
+
             loop {
                 attempts += 1;
+
+                // Compute CCH hash and build billing header
+                let cch_hash = cch::compute_cch(body_bytes);
+                let billing_header = format!("cc_version=0.1; cc_entrypoint=claude_code; {}; cc_workload=claude_code;", cch_hash);
 
                 // Use Bearer auth for Claude.ai OAuth tokens; x-api-key for regular keys.
                 let mut req = self
@@ -507,13 +595,14 @@ pub mod client {
                     .header("anthropic-version", &self.config.api_version)
                     .header("anthropic-beta", &self.config.beta_features)
                     .header("content-type", "application/json")
-                    .header("accept", "text/event-stream");
+                    .header("accept", "text/event-stream")
+                    .header("x-anthropic-billing-header", billing_header);
                 req = if self.config.use_bearer_auth {
                     req.header("Authorization", format!("Bearer {}", &self.config.api_key))
                 } else {
                     req.header("x-api-key", &self.config.api_key)
                 };
-                let req = req.json(body);
+                let req = req.body(body_str.clone());
 
                 let resp = req.send().await.map_err(ClaudeError::Http)?;
                 let status = resp.status().as_u16();

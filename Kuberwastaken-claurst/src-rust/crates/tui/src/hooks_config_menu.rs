@@ -254,7 +254,7 @@ impl HooksConfigMenuState {
     }
 
     fn load_hooks(&mut self) {
-        let settings_path = cc_core::config::Settings::config_dir().join("settings.json");
+        let settings_path = claurst_core::config::Settings::config_dir().join("settings.json");
         let json_str = match std::fs::read_to_string(&settings_path) {
             Ok(s)  => s,
             Err(_) => return,

@@ -1,4 +1,4 @@
-// ConfigTool: get or set Claude Code configuration settings at runtime.
+// ConfigTool: get or set Claurst configuration settings at runtime.
 //
 // Reads from and persists to ~/.claude/settings.json.
 // Supported settings: model, max_tokens, verbose, permission_mode.
@@ -29,7 +29,7 @@ impl Tool for ConfigTool {
     fn name(&self) -> &str { "Config" }
 
     fn description(&self) -> &str {
-        "Get or set Claude Code configuration settings. Omit 'value' to read the current value. \
+        "Get or set Claurst configuration settings. Omit 'value' to read the current value. \
          Supported settings: model, max_tokens, verbose, permission_mode, auto_compact. \
          Changes persist to ~/.claude/settings.json."
     }
@@ -73,7 +73,7 @@ impl Tool for ConfigTool {
         }
 
         // Load current settings
-        let mut settings = match cc_core::config::Settings::load().await {
+        let mut settings = match claurst_core::config::Settings::load().await {
             Ok(s) => s,
             Err(e) => return ToolResult::error(format!("Failed to load settings: {}", e)),
         };
@@ -126,7 +126,7 @@ impl Tool for ConfigTool {
                     ToolResult::success(format!("auto_compact = {}", b))
                 }
                 "permission_mode" => {
-                    use cc_core::config::PermissionMode;
+                    use claurst_core::config::PermissionMode;
                     let s = match new_value.as_str() {
                         Some(s) => s,
                         None => return ToolResult::error("'permission_mode' must be a string".to_string()),
@@ -188,8 +188,8 @@ impl Tool for ConfigTool {
     }
 }
 
-fn permission_mode_str(mode: &cc_core::config::PermissionMode) -> &'static str {
-    use cc_core::config::PermissionMode;
+fn permission_mode_str(mode: &claurst_core::config::PermissionMode) -> &'static str {
+    use claurst_core::config::PermissionMode;
     match mode {
         PermissionMode::Default => "default",
         PermissionMode::AcceptEdits => "accept_edits",

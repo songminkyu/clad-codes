@@ -1,13 +1,13 @@
 [package]
-name = "cc-plugins"
+name = "claurst-plugins"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Plugin runtime for the Claude Code CLI Rust port"
+description = "Plugin runtime for the Claurst CLI"
 
 [dependencies]
-cc-core = { workspace = true }
+claurst-core = { workspace = true }
 
 # Async
 tokio = { workspace = true }

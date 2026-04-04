@@ -46,6 +46,20 @@ pub struct ConsolidationState {
     pub lock_etag: Option<String>,
 }
 
+/// Data returned by `AutoDream::maybe_trigger` when consolidation should proceed.
+/// Pass this to `AutoDream::finish_consolidation` after the agent completes.
+#[derive(Debug, Clone)]
+pub struct ConsolidationTask {
+    /// The consolidation prompt to send to the sub-agent.
+    pub prompt: String,
+    /// Working directory for the sub-agent.
+    pub memory_dir: PathBuf,
+    /// Path to the state file (written after consolidation completes).
+    pub state_file: PathBuf,
+    /// Path to the lock file (removed after consolidation completes).
+    pub lock_file: PathBuf,
+}
+
 /// Core AutoDream logic; owns path state, delegates I/O to async methods.
 pub struct AutoDream {
     config: AutoDreamConfig,
@@ -212,6 +226,55 @@ impl AutoDream {
         match fs::read_to_string(&self.state_file).await {
             Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
             Err(_) => ConsolidationState::default(),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // High-level trigger
+    // -------------------------------------------------------------------------
+
+    /// Check all gates and, if they pass, acquire the lock and return the info
+    /// needed to run the consolidation subagent.
+    ///
+    /// Returns `Ok(Some(task))` if consolidation should proceed (lock acquired),
+    /// `Ok(None)` if gated out, or `Err` for hard I/O failures.
+    ///
+    /// The caller is responsible for actually running the agent and calling
+    /// `finish_consolidation` when done.
+    pub async fn maybe_trigger(&self) -> Result<Option<ConsolidationTask>> {
+        let state = self.load_state().await;
+        if !self.should_consolidate(&state).await? {
+            return Ok(None);
+        }
+        self.acquire_lock().await?;
+        Ok(Some(ConsolidationTask {
+            prompt: self.consolidation_prompt(),
+            memory_dir: self.memory_dir.clone(),
+            state_file: self.state_file.clone(),
+            lock_file: self.lock_file.clone(),
+        }))
+    }
+
+    /// Persist the updated consolidation state and release the lock.
+    /// Call this after the consolidation subagent completes (or fails).
+    pub async fn finish_consolidation(task: &ConsolidationTask) {
+        let updated = ConsolidationState {
+            last_consolidated_at: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or(std::time::Duration::ZERO)
+                    .as_secs(),
+            ),
+            lock_etag: None,
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&updated) {
+            if let Some(parent) = task.state_file.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            let _ = tokio::fs::write(&task.state_file, json).await;
+        }
+        if task.lock_file.exists() {
+            let _ = tokio::fs::remove_file(&task.lock_file).await;
         }
     }
 

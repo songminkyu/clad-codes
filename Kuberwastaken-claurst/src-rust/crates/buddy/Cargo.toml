@@ -1,13 +1,12 @@
 [package]
-name = "cc-buddy"
+name = "claurst-buddy"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-cc-core = { path = "../core" }
+claurst-core = { path = "../core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }

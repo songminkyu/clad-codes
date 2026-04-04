@@ -4,7 +4,8 @@
 //! Provides CRUD operations for cloud-hosted sessions.
 
 use serde::{Deserialize, Serialize};
-use crate::types::{Message, Role, MessageContent};
+use serde_json::Value;
+use crate::types::{Message, Role, MessageContent, ContentBlock};
 
 // ---------------------------------------------------------------------------
 // Cloud session API types
@@ -29,11 +30,15 @@ pub struct CloudSessionDetail {
 }
 
 /// A message in the cloud API format.
+///
+/// `content` is a JSON array of Anthropic API content-block objects so that
+/// structured blocks (tool_use, tool_result, image, …) survive a round-trip
+/// through the cloud without being collapsed to plain text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudMessage {
     pub id: String,
     pub role: String,    // "user" | "assistant"
-    pub content: String, // Plain text for now
+    pub content: Vec<Value>, // Array of Anthropic-schema content block objects
     pub created_at: u64,
     pub session_id: String,
 }
@@ -42,24 +47,35 @@ pub struct CloudMessage {
 // SDK message adapter
 // ---------------------------------------------------------------------------
 
+/// Normalise a `MessageContent` into a flat `Vec<ContentBlock>`.
+///
+/// A `MessageContent::Text` shorthand is lifted into a single
+/// `ContentBlock::Text` so every path produces the same block list.
+fn content_to_blocks(content: &MessageContent) -> Vec<ContentBlock> {
+    match content {
+        MessageContent::Text(t) => vec![ContentBlock::Text { text: t.clone() }],
+        MessageContent::Blocks(blocks) => blocks.clone(),
+    }
+}
+
 /// Convert an internal `Message` to a `CloudMessage`.
+///
+/// Every `ContentBlock` is serialised to its Anthropic API JSON
+/// representation; no information is discarded.
 pub fn message_to_cloud(msg: &Message, session_id: &str, msg_id: &str, ts: u64) -> CloudMessage {
     let role = match msg.role {
         Role::User => "user".to_string(),
         Role::Assistant => "assistant".to_string(),
     };
-    let content = match &msg.content {
-        MessageContent::Text(t) => t.clone(),
-        MessageContent::Blocks(blocks) => {
-            blocks.iter().filter_map(|b| {
-                if let crate::types::ContentBlock::Text { text } = b {
-                    Some(text.as_str())
-                } else {
-                    None
-                }
-            }).collect::<Vec<_>>().join("\n")
-        }
-    };
+
+    let content: Vec<Value> = content_to_blocks(&msg.content)
+        .into_iter()
+        .map(|block| {
+            serde_json::to_value(&block)
+                .unwrap_or_else(|_| Value::Null)
+        })
+        .collect();
+
     CloudMessage {
         id: msg_id.to_string(),
         role,
@@ -70,11 +86,33 @@ pub fn message_to_cloud(msg: &Message, session_id: &str, msg_id: &str, ts: u64) 
 }
 
 /// Convert a `CloudMessage` back to an internal `Message`.
+///
+/// Each element of `content` is deserialised as a `ContentBlock`.  Elements
+/// that cannot be parsed are silently skipped so that unknown future block
+/// types do not crash older clients.
 pub fn cloud_to_message(cloud: &CloudMessage) -> Message {
     let role = if cloud.role == "assistant" { Role::Assistant } else { Role::User };
+
+    let blocks: Vec<ContentBlock> = cloud
+        .content
+        .iter()
+        .filter_map(|v| serde_json::from_value::<ContentBlock>(v.clone()).ok())
+        .collect();
+
+    // Use the compact Text shorthand when there is exactly one plain-text block.
+    let content = if blocks.len() == 1 {
+        if let ContentBlock::Text { text } = &blocks[0] {
+            MessageContent::Text(text.clone())
+        } else {
+            MessageContent::Blocks(blocks)
+        }
+    } else {
+        MessageContent::Blocks(blocks)
+    };
+
     Message {
         role,
-        content: MessageContent::Text(cloud.content.clone()),
+        content,
         uuid: None,
         cost: None,
     }

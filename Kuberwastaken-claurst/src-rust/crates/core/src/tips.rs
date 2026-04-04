@@ -1,4 +1,4 @@
-// tips.rs — Tip scheduling system for Claude Code.
+// tips.rs — Tip scheduling system for Claurst.
 //
 // Ported from:
 //   src/services/tips/tipScheduler.ts

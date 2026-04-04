@@ -89,9 +89,27 @@ pub enum CommandRunAction {
     StaticResponse(String),
 }
 
+impl CommandRunAction {
+    /// Return the capability category string this action requires, or `None`
+    /// if the action needs no special capability grant.
+    ///
+    /// | Variant              | Required capability |
+    /// |----------------------|---------------------|
+    /// | `StaticResponse`     | none                |
+    /// | `MarkdownPrompt`     | `"read_files"`      |
+    /// | `ShellCommand`       | `"shell"`           |
+    pub fn required_capability(&self) -> Option<&'static str> {
+        match self {
+            CommandRunAction::StaticResponse(_) => None,
+            CommandRunAction::MarkdownPrompt { .. } => Some("read_files"),
+            CommandRunAction::ShellCommand { .. } => Some("shell"),
+        }
+    }
+}
+
 /// A plugin-defined slash command, ready for registration in the command system.
 ///
-/// `cc-plugins` does NOT implement `cc_commands::SlashCommand` directly (that
+/// `cc-plugins` does NOT implement `claurst_commands::SlashCommand` directly (that
 /// would create a circular dependency).  Instead `cc-commands` wraps
 /// `PluginCommandDef` in a thin adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +124,12 @@ pub struct PluginCommandDef {
     pub plugin_source_id: String,
     /// How to produce the command response.
     pub run_action: CommandRunAction,
+    /// Capability grants declared in the plugin manifest.
+    ///
+    /// `None`  → manifest predates capability enforcement → all capabilities allowed
+    ///           (backwards-compatible default).
+    /// `Some(v)` → only the listed capability strings are permitted.
+    pub plugin_capabilities: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------

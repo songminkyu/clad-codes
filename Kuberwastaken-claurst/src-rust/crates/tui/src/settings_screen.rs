@@ -4,9 +4,9 @@
 // viewing and editing General, Display, Privacy, Advanced, and KeyBindings
 // settings. Changes are persisted via Settings::save_sync().
 
-use cc_core::config::{Config, Settings};
-use cc_core::keybindings::default_bindings;
-use cc_core::output_styles::builtin_styles;
+use claurst_core::config::{Config, Settings};
+use claurst_core::keybindings::default_bindings;
+use claurst_core::output_styles::builtin_styles;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -276,7 +276,7 @@ impl Default for SettingsScreen {
 /// Read a boolean value from `settings.json` by camelCase key, falling back to
 /// `default` when the file is absent or the key is missing.
 fn read_setting_bool(_settings: &Settings, key: &str, default: bool) -> bool {
-    let path = cc_core::config::Settings::config_dir().join("settings.json");
+    let path = claurst_core::config::Settings::config_dir().join("settings.json");
     if let Ok(content) = std::fs::read_to_string(&path) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
             if let Some(b) = val.get(key).and_then(|v| v.as_bool()) {
@@ -290,7 +290,7 @@ fn read_setting_bool(_settings: &Settings, key: &str, default: bool) -> bool {
 /// Read a u8 value from `settings.json` by camelCase key, falling back to
 /// `default` when the file is absent or the key is missing.
 fn read_setting_u8(_settings: &Settings, key: &str, default: u8) -> u8 {
-    let path = cc_core::config::Settings::config_dir().join("settings.json");
+    let path = claurst_core::config::Settings::config_dir().join("settings.json");
     if let Ok(content) = std::fs::read_to_string(&path) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
             if let Some(n) = val.get(key).and_then(|v| v.as_u64()) {
@@ -304,7 +304,7 @@ fn read_setting_u8(_settings: &Settings, key: &str, default: u8) -> u8 {
 /// Write a single boolean key-value pair to `settings.json`, preserving other
 /// fields already present in the file.
 fn save_setting_bool(key: &str, value: bool) {
-    let path = cc_core::config::Settings::config_dir().join("settings.json");
+    let path = claurst_core::config::Settings::config_dir().join("settings.json");
     let mut val: serde_json::Value = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -380,7 +380,7 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
     // Outer border
     let outer_block = Block::default()
         .borders(Borders::ALL)
-        .title(" Settings — Claude Code ")
+        .title(" Settings — Claurst ")
         .border_style(Style::default().fg(Color::Cyan));
     frame.render_widget(outer_block, popup);
 
@@ -494,7 +494,7 @@ fn build_general_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
 
     // Model
     let model_val = cfg.model.clone().unwrap_or_else(|| {
-        cc_core::constants::DEFAULT_MODEL.to_string()
+        claurst_core::constants::DEFAULT_MODEL.to_string()
     });
     lines.extend(field_lines(
         "model",
@@ -514,7 +514,7 @@ fn build_general_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
     let max_tokens_val = cfg
         .max_tokens
         .map(|n| n.to_string())
-        .unwrap_or_else(|| cc_core::constants::DEFAULT_MAX_TOKENS.to_string());
+        .unwrap_or_else(|| claurst_core::constants::DEFAULT_MAX_TOKENS.to_string());
     lines.extend(field_lines(
         "max_tokens",
         "Max Tokens",
@@ -600,20 +600,21 @@ fn build_display_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
 
     // Theme
     let theme_name = match &cfg.theme {
-        cc_core::config::Theme::Default => "default",
-        cc_core::config::Theme::Dark => "dark",
-        cc_core::config::Theme::Light => "light",
-        cc_core::config::Theme::Custom(s) => s.as_str(),
+        claurst_core::config::Theme::Default => "default",
+        claurst_core::config::Theme::Dark => "dark",
+        claurst_core::config::Theme::Light => "light",
+        claurst_core::config::Theme::Deuteranopia => "deuteranopia",
+        claurst_core::config::Theme::Custom(s) => s.as_str(),
     };
     lines.push(label_value_line("Theme", theme_name));
-    lines.push(indent_line("  Options: default, dark, light  (use /theme to change)", Color::DarkGray));
+    lines.push(indent_line("  Options: default, dark, light, deuteranopia  (use /theme to change)", Color::DarkGray));
     lines.push(Line::from(""));
 
     // Output format
     let fmt = match &cfg.output_format {
-        cc_core::config::OutputFormat::Text => "text",
-        cc_core::config::OutputFormat::Json => "json",
-        cc_core::config::OutputFormat::StreamJson => "stream-json",
+        claurst_core::config::OutputFormat::Text => "text",
+        claurst_core::config::OutputFormat::Json => "json",
+        claurst_core::config::OutputFormat::StreamJson => "stream-json",
     };
     lines.push(label_value_line("Output Format", fmt));
     lines.push(indent_line("  Options: text, json, stream-json", Color::DarkGray));
@@ -687,7 +688,7 @@ struct PrivacySnapshot {
 impl PrivacySnapshot {
     /// Load privacy fields from `~/.claude/settings.json`.
     fn load() -> Self {
-        let path = cc_core::config::Settings::config_dir().join("settings.json");
+        let path = claurst_core::config::Settings::config_dir().join("settings.json");
         let Ok(content) = std::fs::read_to_string(&path) else { return Self::default(); };
         let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else { return Self::default(); };
         Self {
@@ -743,7 +744,7 @@ fn build_privacy_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
         &mut lines,
         "Telemetry",
         privacy.telemetry_enabled(),
-        "Sends anonymised usage statistics to help improve Claude Code.",
+        "Sends anonymised usage statistics to help improve Claurst.",
     );
 
     // Usage sharing
@@ -1228,7 +1229,7 @@ pub fn handle_settings_key(
                     SettingsTab::General => {
                         let cfg = &screen.settings_snapshot.config;
                         let model_val = cfg.model.clone().unwrap_or_else(|| {
-                            cc_core::constants::DEFAULT_MODEL.to_string()
+                            claurst_core::constants::DEFAULT_MODEL.to_string()
                         });
                         screen.start_edit("model", &model_val);
                     }

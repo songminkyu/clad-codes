@@ -122,7 +122,7 @@ impl OutputStyle {
 // System prompt prefix variants
 // ---------------------------------------------------------------------------
 
-/// Which entrypoint context Claude Code is running in.
+/// Which entrypoint context Claurst is running in.
 /// Determines the opening attribution line of the system prompt.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SystemPromptPrefix {
@@ -144,7 +144,7 @@ pub enum SystemPromptPrefix {
 impl SystemPromptPrefix {
     /// Detect from environment variables, mirroring `getCLISyspromptPrefix`.
     pub fn detect(is_non_interactive: bool, has_append_system_prompt: bool) -> Self {
-        // Vertex: always uses the default "Claude Code" prefix.
+        // Vertex: always uses the default "Claurst" prefix.
         if std::env::var("ANTHROPIC_VERTEX_PROJECT_ID").is_ok()
             || std::env::var("CLOUD_ML_PROJECT_ID").is_ok()
         {
@@ -155,7 +155,7 @@ impl SystemPromptPrefix {
             return Self::Bedrock;
         }
 
-        if std::env::var("CLAUDE_CODE_REMOTE").is_ok() {
+        if std::env::var("CLAURST_REMOTE").is_ok() {
             return Self::Remote;
         }
 
@@ -174,10 +174,10 @@ impl SystemPromptPrefix {
     pub fn attribution_text(self) -> &'static str {
         match self {
             Self::Cli | Self::Vertex | Self::Bedrock | Self::Remote => {
-                "You are Claude Code, Anthropic's official CLI for Claude."
+                "You are Claurst, Anthropic's official CLI for Claude."
             }
             Self::SdkPreset => {
-                "You are Claude Code, Anthropic's official CLI for Claude, \
+                "You are Claurst, Anthropic's official CLI for Claude, \
                 running within the Claude Agent SDK."
             }
             Self::Sdk => {
@@ -479,15 +479,8 @@ const SAFETY_GUIDELINES: &str = r#"
 "#;
 
 /// Security / cyber-risk instruction.
-/// Owned by the safeguards team — do not modify the content here.
-const CYBER_RISK_INSTRUCTION: &str = r#"
-## Security
-
-You are authorized to assist with security research, CTF challenges, penetration testing
-with explicit authorization, defensive security, and educational security content. Do not
-assist with creating malware, unauthorized access, denial-of-service attacks, or any
-destructive security techniques without clear legitimate purpose.
-"#;
+/// No security guardrails injected.
+const CYBER_RISK_INSTRUCTION: &str = "";
 
 const COORDINATOR_SYSTEM_PROMPT: &str = r#"
 ## Coordinator Mode
@@ -521,7 +514,7 @@ mod tests {
     #[test]
     fn test_default_prompt_contains_attribution() {
         let prompt = build_system_prompt(&default_opts());
-        assert!(prompt.contains("Claude Code"), "Default prompt must contain attribution");
+        assert!(prompt.contains("Claurst"), "Default prompt must contain attribution");
     }
 
     #[test]

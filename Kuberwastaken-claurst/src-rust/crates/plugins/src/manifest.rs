@@ -299,6 +299,25 @@ pub struct PluginManifest {
     // Normalised from `marketplaceId` by normalize_manifest_json before deserializing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub marketplace_id: Option<String>,
+
+    // ---- Capability grants ----
+    /// The set of capability categories this plugin is allowed to use.
+    ///
+    /// When `None`, the plugin was written before capability enforcement was
+    /// introduced — all categories are allowed for backwards compatibility.
+    ///
+    /// When `Some([])`, the plugin explicitly declares no capabilities, so any
+    /// tool action that requires a capability will be blocked.
+    ///
+    /// Known categories:
+    /// - `"read_files"`  — read from the local filesystem
+    /// - `"write_files"` — write / modify files on the local filesystem
+    /// - `"network"`     — make outbound HTTP/network requests
+    /// - `"shell"`       — execute arbitrary shell commands
+    /// - `"browser"`     — control a web browser (CDP / Playwright)
+    /// - `"mcp"`         — call MCP server tools
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
 }
 
 impl PluginManifest {
@@ -396,6 +415,8 @@ fn normalize_manifest_json(mut v: serde_json::Value) -> serde_json::Value {
         ("outputStyles", "output_styles"),
         ("userConfig", "user_config"),
         ("marketplaceId", "marketplace_id"),
+        // `capabilities` has the same spelling in camelCase, so no rename
+        // needed for that one — but keep the entry for future camelCase aliases.
     ];
     for (camel, snake) in renames {
         if let Some(val) = obj.remove(*camel) {

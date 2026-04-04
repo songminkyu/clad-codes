@@ -41,6 +41,13 @@ import {
 import { sanitizeSchemaForOpenAICompat } from '../../utils/schemaSanitizer.js'
 import { redactSecretValueForDisplay } from '../../utils/providerProfile.js'
 
+type SecretValueSource = Partial<{
+  OPENAI_API_KEY: string
+  CODEX_API_KEY: string
+  GEMINI_API_KEY: string
+  GOOGLE_API_KEY: string
+}>
+
 const GITHUB_MODELS_DEFAULT_BASE = 'https://models.github.ai/inference'
 const GITHUB_API_VERSION = '2022-11-28'
 const GITHUB_429_MAX_RETRIES = 3
@@ -683,10 +690,12 @@ class OpenAIShimStream {
 class OpenAIShimMessages {
   private defaultHeaders: Record<string, string>
   private reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh'
+  private providerOverride?: { model: string; baseURL: string; apiKey: string }
 
-  constructor(defaultHeaders: Record<string, string>, reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh') {
+  constructor(defaultHeaders: Record<string, string>, reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh', providerOverride?: { model: string; baseURL: string; apiKey: string }) {
     this.defaultHeaders = defaultHeaders
     this.reasoningEffort = reasoningEffort
+    this.providerOverride = providerOverride
   }
 
   create(
@@ -698,7 +707,7 @@ class OpenAIShimMessages {
     let httpResponse: Response | undefined
 
     const promise = (async () => {
-      const request = resolveProviderRequest({ model: params.model, reasoningEffortOverride: self.reasoningEffort })
+      const request = resolveProviderRequest({ model: self.providerOverride?.model ?? params.model, baseUrl: self.providerOverride?.baseURL, reasoningEffortOverride: self.reasoningEffort })
       const response = await self._doRequest(request, params, options)
       httpResponse = response
 
@@ -748,7 +757,7 @@ class OpenAIShimMessages {
           ? ` or place a Codex auth.json at ${credentials.authPath}`
           : ''
         const safeModel =
-          redactSecretValueForDisplay(request.requestedModel, process.env) ??
+          redactSecretValueForDisplay(request.requestedModel, process.env as SecretValueSource) ??
           'the requested model'
         throw new Error(
           `Codex auth is required for ${safeModel}. Set CODEX_API_KEY${authHint}.`,
@@ -857,7 +866,7 @@ class OpenAIShimMessages {
       ...(options?.headers ?? {}),
     }
 
-    const apiKey = process.env.OPENAI_API_KEY ?? ''
+    const apiKey = this.providerOverride?.apiKey ?? process.env.OPENAI_API_KEY ?? ''
     // Detect Azure endpoints by hostname (not raw URL) to prevent bypass via
     // path segments like https://evil.com/cognitiveservices.azure.com/
     let isAzure = false
@@ -939,13 +948,13 @@ class OpenAIShimMessages {
         response.status,
         errorResponse,
         `OpenAI API error ${response.status}: ${errorBody}${rateHint}`,
-        response.headers as unknown as Record<string, string>,
+        response.headers as unknown as Headers,
       )
     }
 
     throw APIError.generate(
       500, undefined, 'OpenAI shim: request loop exited unexpectedly',
-      {} as Record<string, string>,
+      new Headers(),
     )
   }
 
@@ -1056,8 +1065,8 @@ class OpenAIShimBeta {
   messages: OpenAIShimMessages
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh'
 
-  constructor(defaultHeaders: Record<string, string>, reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh') {
-    this.messages = new OpenAIShimMessages(defaultHeaders, reasoningEffort)
+  constructor(defaultHeaders: Record<string, string>, reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh', providerOverride?: { model: string; baseURL: string; apiKey: string }) {
+    this.messages = new OpenAIShimMessages(defaultHeaders, reasoningEffort, providerOverride)
     this.reasoningEffort = reasoningEffort
   }
 }
@@ -1067,6 +1076,7 @@ export function createOpenAIShimClient(options: {
   maxRetries?: number
   timeout?: number
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh'
+  providerOverride?: { model: string; baseURL: string; apiKey: string }
 }): unknown {
   hydrateGithubModelsTokenFromSecureStorage()
 
@@ -1089,7 +1099,7 @@ export function createOpenAIShimClient(options: {
 
   const beta = new OpenAIShimBeta({
     ...(options.defaultHeaders ?? {}),
-  }, options.reasoningEffort)
+  }, options.reasoningEffort, options.providerOverride)
 
   return {
     beta,

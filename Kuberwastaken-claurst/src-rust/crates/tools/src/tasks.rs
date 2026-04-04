@@ -108,7 +108,8 @@ impl Task {
 }
 
 /// Global task store shared across all tool invocations.
-static TASK_STORE: Lazy<Arc<DashMap<String, Task>>> =
+/// Public so the TUI can access and display tasks.
+pub static TASK_STORE: Lazy<Arc<DashMap<String, Task>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
 // ---------------------------------------------------------------------------
@@ -127,7 +128,7 @@ struct TaskCreateInput {
 
 #[async_trait]
 impl Tool for TaskCreateTool {
-    fn name(&self) -> &str { cc_core::constants::TOOL_NAME_TASK_CREATE }
+    fn name(&self) -> &str { claurst_core::constants::TOOL_NAME_TASK_CREATE }
     fn description(&self) -> &str { "Create a new task to track work items. Returns the task ID." }
     fn permission_level(&self) -> PermissionLevel { PermissionLevel::None }
 
@@ -177,7 +178,7 @@ struct TaskGetInput {
 
 #[async_trait]
 impl Tool for TaskGetTool {
-    fn name(&self) -> &str { cc_core::constants::TOOL_NAME_TASK_GET }
+    fn name(&self) -> &str { claurst_core::constants::TOOL_NAME_TASK_GET }
     fn description(&self) -> &str { "Get full details of a task by ID." }
     fn permission_level(&self) -> PermissionLevel { PermissionLevel::None }
 
@@ -238,7 +239,7 @@ struct TaskUpdateInput {
 
 #[async_trait]
 impl Tool for TaskUpdateTool {
-    fn name(&self) -> &str { cc_core::constants::TOOL_NAME_TASK_UPDATE }
+    fn name(&self) -> &str { claurst_core::constants::TOOL_NAME_TASK_UPDATE }
     fn description(&self) -> &str { "Update a task's properties (status, subject, description, etc.)." }
     fn permission_level(&self) -> PermissionLevel { PermissionLevel::None }
 
@@ -352,7 +353,7 @@ pub struct TaskListTool;
 
 #[async_trait]
 impl Tool for TaskListTool {
-    fn name(&self) -> &str { cc_core::constants::TOOL_NAME_TASK_LIST }
+    fn name(&self) -> &str { claurst_core::constants::TOOL_NAME_TASK_LIST }
     fn description(&self) -> &str { "List all active tasks (excluding deleted/completed)." }
     fn permission_level(&self) -> PermissionLevel { PermissionLevel::None }
 
@@ -405,7 +406,7 @@ struct TaskStopInput {
 
 #[async_trait]
 impl Tool for TaskStopTool {
-    fn name(&self) -> &str { cc_core::constants::TOOL_NAME_TASK_STOP }
+    fn name(&self) -> &str { claurst_core::constants::TOOL_NAME_TASK_STOP }
     fn description(&self) -> &str { "Stop a running background task." }
     fn permission_level(&self) -> PermissionLevel { PermissionLevel::Execute }
 
@@ -462,7 +463,7 @@ fn default_block() -> bool { true }
 
 #[async_trait]
 impl Tool for TaskOutputTool {
-    fn name(&self) -> &str { cc_core::constants::TOOL_NAME_TASK_OUTPUT }
+    fn name(&self) -> &str { claurst_core::constants::TOOL_NAME_TASK_OUTPUT }
     fn description(&self) -> &str { "Get the output of a task." }
     fn permission_level(&self) -> PermissionLevel { PermissionLevel::None }
 

@@ -85,7 +85,7 @@ fn builtin_themes() -> Vec<ThemeOption> {
         ThemeOption {
             name: "default".to_string(),
             label: "Default".to_string(),
-            description: "Claude Code default — dark background, cyan accents".to_string(),
+            description: "Claurst default — dark background, cyan accents".to_string(),
             swatch: [Color::Black, Color::Cyan, Color::Green, Color::White],
         },
         ThemeOption {
@@ -152,6 +152,17 @@ fn builtin_themes() -> Vec<ThemeOption> {
                 Color::Rgb(102, 217, 239),
                 Color::Rgb(166, 226, 46),
                 Color::Rgb(248, 248, 242),
+            ],
+        },
+        ThemeOption {
+            name: "deuteranopia".to_string(),
+            label: "Deuteranopia".to_string(),
+            description: "Red-green color blind friendly — blue/yellow/gray palette".to_string(),
+            swatch: [
+                Color::Rgb(18, 18, 18),
+                Color::Rgb(0, 122, 204),  // Blue
+                Color::Rgb(255, 180, 0),  // Gold/Yellow
+                Color::Rgb(200, 200, 200), // Light gray
             ],
         },
     ]

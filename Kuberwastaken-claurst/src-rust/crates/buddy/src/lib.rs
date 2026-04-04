@@ -1,11 +1,10 @@
-/// cc-buddy: Tamagotchi/Buddy companion system for Claude Code CLI.
+/// claurst-buddy: Tamagotchi/Buddy companion system for Claurst.
 ///
 /// Ported from src/buddy/ (TypeScript). All bones (species, rarity, stats,
 /// eye, hat, shiny) are deterministically derived from the user-ID via a
 /// seeded PRNG so they can never be edited by hand. The soul (name,
 /// personality, hatched_at) is AI-generated on first hatch and persisted in
 /// `{config_dir}/companion.json`.
-use sha2::{Digest, Sha256};
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -39,14 +38,17 @@ impl Mulberry32 {
 
 /// Derive a deterministic u32 seed from a user-id string.
 ///
-/// Algorithm: SHA-256(user_id + "friend-2026-401"), first 4 bytes as
-/// little-endian u32 — matches the TypeScript `hashString` path that runs
-/// when Bun is not available (FNV-1a was used there, but the spec for the
-/// Rust port pins to SHA-256 for cross-platform determinism).
+/// Algorithm: FNV-1a 32-bit over the raw bytes of `user_id`.
+/// Matches the TypeScript `hashString` FNV-1a implementation used in Bun.
 pub fn seed_from_user_id(user_id: &str) -> u32 {
-    let salted = format!("{}friend-2026-401", user_id);
-    let hash = Sha256::digest(salted.as_bytes());
-    u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]])
+    const FNV_OFFSET_BASIS: u32 = 2_166_136_261;
+    const FNV_PRIME: u32 = 16_777_619;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in user_id.bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 // ---------------------------------------------------------------------------

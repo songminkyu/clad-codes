@@ -1,10 +1,10 @@
 [package]
-name = "cc-mcp"
+name = "claurst-mcp"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-cc-core = { workspace = true }
+claurst-core = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
@@ -23,6 +23,7 @@ url = { workspace = true }
 once_cell = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
+getrandom = { workspace = true }
 dirs = { workspace = true }
 chrono = { workspace = true }
 urlencoding = { workspace = true }

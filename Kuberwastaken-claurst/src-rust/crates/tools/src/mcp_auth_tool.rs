@@ -69,7 +69,7 @@ impl Tool for McpAuthTool {
             }
         };
 
-        use cc_mcp::McpServerStatus;
+        use claurst_mcp::McpServerStatus;
 
         // 1. Check current connection status.
         match manager.server_status(&params.server_name) {
