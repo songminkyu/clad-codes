@@ -36,7 +36,7 @@ pub use session_memory::{
 };
 
 use claurst_api::{
-    ApiMessage, ApiToolDefinition, CreateMessageRequest, StreamAccumulator, StreamEvent,
+    ApiMessage, ApiToolDefinition, AnthropicStreamEvent, CreateMessageRequest, StreamAccumulator,
     StreamHandler, SystemPrompt, ThinkingConfig,
 };
 use claurst_core::config::Config;
@@ -109,6 +109,18 @@ pub struct QueryConfig {
     /// Fallback model name. Used when the primary model returns overloaded /
     /// rate-limit errors (mirrors TS `--fallback-model`).
     pub fallback_model: Option<String>,
+    /// Optional ProviderRegistry for dispatching to non-Anthropic providers.
+    /// When `config.provider` is set to something other than "anthropic" and
+    /// this registry contains that provider, the registry's provider is used
+    /// instead of `AnthropicClient`.
+    pub provider_registry: Option<std::sync::Arc<claurst_api::ProviderRegistry>>,
+    /// Active agent name (e.g., "build", "plan", "explore", or None for default).
+    pub agent_name: Option<String>,
+    /// Resolved agent definition for the current session.
+    pub agent_definition: Option<claurst_core::AgentDefinition>,
+    /// Optional shared model registry for dynamic provider and model resolution.
+    /// When set, the query loop uses this instead of constructing a fresh registry.
+    pub model_registry: Option<std::sync::Arc<claurst_api::ModelRegistry>>,
 }
 
 impl Default for QueryConfig {
@@ -130,6 +142,10 @@ impl Default for QueryConfig {
             skill_index: None,
             max_budget_usd: None,
             fallback_model: None,
+            provider_registry: None,
+            agent_name: None,
+            agent_definition: None,
+            model_registry: None,
         }
     }
 }
@@ -148,13 +164,251 @@ impl QueryConfig {
             ..Default::default()
         }
     }
+
+    /// Build a QueryConfig using dynamic model resolution from the model registry.
+    ///
+    /// Prefers the best model for the configured provider (from models.dev data)
+    /// over the hardcoded defaults.
+    pub fn from_config_with_registry(cfg: &Config, registry: &claurst_api::ModelRegistry) -> Self {
+        // We can't move the Arc here, but we need a clone for the query loop.
+        // Callers typically wrap the registry in an Arc already.
+        Self {
+            model: claurst_api::effective_model_for_config(cfg, registry),
+            max_tokens: cfg.effective_max_tokens(),
+            output_style: cfg.effective_output_style(),
+            output_style_prompt: cfg.resolve_output_style_prompt(),
+            working_directory: cfg
+                .project_dir
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            ..Default::default()
+        }
+    }
+}
+
+fn reasoning_effort_for_level(
+    effort_level: claurst_core::effort::EffortLevel,
+) -> &'static str {
+    match effort_level {
+        claurst_core::effort::EffortLevel::Low => "low",
+        claurst_core::effort::EffortLevel::Medium => "medium",
+        claurst_core::effort::EffortLevel::High | claurst_core::effort::EffortLevel::Max => {
+            "high"
+        }
+    }
+}
+
+fn google_thinking_level_for_effort(
+    effort_level: Option<claurst_core::effort::EffortLevel>,
+) -> &'static str {
+    match effort_level.unwrap_or(claurst_core::effort::EffortLevel::High) {
+        claurst_core::effort::EffortLevel::Low => "low",
+        claurst_core::effort::EffortLevel::Medium => "medium",
+        claurst_core::effort::EffortLevel::High | claurst_core::effort::EffortLevel::Max => {
+            "high"
+        }
+    }
+}
+
+fn is_openai_reasoning_model(model_id: &str) -> bool {
+    let model_id = model_id.to_ascii_lowercase();
+    model_id.starts_with("gpt-5")
+        || model_id.starts_with("o1")
+        || model_id.starts_with("o3")
+        || model_id.starts_with("o4")
+}
+
+fn is_openaiish_provider(provider_id: &str) -> bool {
+    matches!(
+        provider_id,
+        "openai"
+            | "azure"
+            | "groq"
+            | "mistral"
+            | "deepseek"
+            | "xai"
+            | "openrouter"
+            | "togetherai"
+            | "together-ai"
+            | "perplexity"
+            | "cerebras"
+            | "deepinfra"
+            | "venice"
+            | "huggingface"
+            | "nvidia"
+            | "siliconflow"
+            | "sambanova"
+            | "moonshot"
+            | "zhipu"
+            | "qwen"
+            | "nebius"
+            | "novita"
+            | "ovhcloud"
+            | "scaleway"
+            | "vultr"
+            | "vultr-ai"
+            | "baseten"
+            | "friendli"
+            | "upstage"
+            | "stepfun"
+            | "fireworks"
+            | "ollama"
+            | "lmstudio"
+            | "lm-studio"
+            | "llamacpp"
+            | "llama-cpp"
+    )
+}
+
+fn build_provider_options(
+    provider_id: &str,
+    model_id: &str,
+    effort_level: Option<claurst_core::effort::EffortLevel>,
+    thinking_budget: Option<u32>,
+) -> Value {
+    let mut options = serde_json::Map::new();
+    let model_id = model_id.to_ascii_lowercase();
+
+    if provider_id == "github-copilot" {
+        if model_id.contains("claude") {
+            options.insert(
+                "thinking_budget".to_string(),
+                serde_json::json!(thinking_budget.unwrap_or(4_000)),
+            );
+        } else if model_id.starts_with("gpt-5") && !model_id.contains("gpt-5-pro") {
+            let reasoning_effort = effort_level
+                .map(reasoning_effort_for_level)
+                .unwrap_or("medium");
+            options.insert(
+                "reasoningEffort".to_string(),
+                serde_json::json!(reasoning_effort),
+            );
+            options.insert(
+                "reasoningSummary".to_string(),
+                serde_json::json!("auto"),
+            );
+            options.insert(
+                "include".to_string(),
+                serde_json::json!(["reasoning.encrypted_content"]),
+            );
+
+            if model_id.contains("gpt-5.")
+                && !model_id.contains("codex")
+                && !model_id.contains("-chat")
+            {
+                options.insert(
+                    "textVerbosity".to_string(),
+                    serde_json::json!("low"),
+                );
+            }
+        }
+    }
+
+    if provider_id == "google" && model_id.contains("gemini") {
+        if model_id.contains("2.5") {
+            if let Some(budget) = thinking_budget {
+                options.insert(
+                    "thinkingConfig".to_string(),
+                    serde_json::json!({
+                        "includeThoughts": true,
+                        "thinkingBudget": budget,
+                    }),
+                );
+            }
+        } else if model_id.contains("3.") || model_id.contains("gemini-3") {
+            options.insert(
+                "thinkingConfig".to_string(),
+                serde_json::json!({
+                    "includeThoughts": true,
+                    "thinkingLevel": google_thinking_level_for_effort(effort_level),
+                }),
+            );
+        }
+    }
+
+    if provider_id == "amazon-bedrock" {
+        if model_id.contains("anthropic") || model_id.contains("claude") {
+            if let Some(budget) = thinking_budget {
+                options.insert(
+                    "reasoningConfig".to_string(),
+                    serde_json::json!({
+                        "type": "enabled",
+                        "budgetTokens": budget.min(31_999),
+                    }),
+                );
+            }
+        } else if let Some(level) = effort_level {
+            options.insert(
+                "reasoningConfig".to_string(),
+                serde_json::json!({
+                    "type": "enabled",
+                    "maxReasoningEffort": reasoning_effort_for_level(level),
+                }),
+            );
+        }
+    }
+
+    if is_openaiish_provider(provider_id) && is_openai_reasoning_model(&model_id) {
+        let reasoning_effort = effort_level
+            .map(reasoning_effort_for_level)
+            .unwrap_or("medium");
+        options.insert(
+            "reasoningEffort".to_string(),
+            serde_json::json!(reasoning_effort),
+        );
+
+        if model_id.starts_with("gpt-5")
+            && model_id.contains("gpt-5.")
+            && !model_id.contains("codex")
+            && !model_id.contains("-chat")
+            && provider_id != "azure"
+        {
+            options.insert(
+                "textVerbosity".to_string(),
+                serde_json::json!("low"),
+            );
+        }
+    }
+
+    if provider_id == "openrouter" {
+        options.insert("usage".to_string(), serde_json::json!({ "include": true }));
+        if model_id.contains("gemini-3") {
+            options.insert(
+                "reasoning".to_string(),
+                serde_json::json!({ "effort": "high" }),
+            );
+        }
+    }
+
+    if provider_id == "qwen"
+        && thinking_budget.is_some()
+        && !model_id.contains("kimi-k2-thinking")
+    {
+        options.insert("enable_thinking".to_string(), serde_json::json!(true));
+    }
+
+    if provider_id == "zhipu" && thinking_budget.is_some() {
+        options.insert(
+            "thinking".to_string(),
+            serde_json::json!({
+                "type": "enabled",
+                "clear_thinking": false,
+            }),
+        );
+    }
+
+    if options.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(options)
+    }
 }
 
 /// Events emitted by the query loop for the TUI to render.
 #[derive(Debug, Clone)]
 pub enum QueryEvent {
     /// A stream event from the API.
-    Stream(StreamEvent),
+    Stream(AnthropicStreamEvent),
     /// A tool is about to be executed.
     ToolStart { tool_name: String, tool_id: String, input_json: String },
     /// A tool has finished executing.
@@ -420,20 +674,31 @@ pub async fn run_query_loop(
     // we don't loop forever on a model that can't finish within any budget.
     let mut max_tokens_recovery_count: u32 = 0;
     // Active model — may switch to fallback on overloaded errors.
-    let mut effective_model = config.model.clone();
+    // Agent model override takes priority over the session model when set.
+    let mut effective_model = if let Some(ref agent) = config.agent_definition {
+        agent.model.clone().unwrap_or_else(|| config.model.clone())
+    } else {
+        config.model.clone()
+    };
     let mut used_fallback = false;
+
+    // If an agent defines a max_turns override, respect it (agent wins over config).
+    let effective_max_turns = config.agent_definition
+        .as_ref()
+        .and_then(|a| a.max_turns)
+        .unwrap_or(config.max_turns);
 
     loop {
         turn += 1;
         tool_ctx
             .current_turn
             .store(turn as usize, std::sync::atomic::Ordering::Relaxed);
-        if turn > config.max_turns {
+        if turn > effective_max_turns {
             info!(turns = turn, "Max turns reached");
             if let Some(ref tx) = event_tx {
                 let _ = tx.send(QueryEvent::Status(format!(
                     "Reached maximum turn limit ({})",
-                    config.max_turns
+                    effective_max_turns
                 )));
             }
             // Return the last assistant message if any
@@ -511,22 +776,36 @@ pub async fn run_query_loop(
 
         // Verification nudge: if there are incomplete todos for this session
         // and the conversation has more than 2 turns, append a reminder.
-        let system = if turn > 2 {
-            let nudge = build_todo_nudge(&tool_ctx.session_id);
-            if nudge.is_empty() {
-                build_system_prompt(config)
-            } else {
-                let mut patched = config.clone();
-                patched.append_system_prompt = Some(match &config.append_system_prompt {
-                    Some(existing) => format!("{}\n\n{}", existing, nudge),
-                    None => nudge,
-                });
-                build_system_prompt(&patched)
+        let system = {
+            // Build a (possibly patched) config for system-prompt assembly.
+            // Agent prompt prefix and todo nudge are both applied here.
+            let mut patched = config.clone();
+
+            // Apply agent system-prompt prefix: prepend before the main system prompt.
+            if let Some(ref agent) = config.agent_definition {
+                if let Some(ref agent_prompt) = agent.prompt {
+                    patched.system_prompt = Some(match &config.system_prompt {
+                        Some(existing) => format!("{}\n\n{}", agent_prompt, existing),
+                        None => agent_prompt.clone(),
+                    });
+                }
             }
-        } else {
-            build_system_prompt(config)
+
+            // Apply todo nudge on turns > 2.
+            if turn > 2 {
+                let nudge = build_todo_nudge(&tool_ctx.session_id);
+                if !nudge.is_empty() {
+                    patched.append_system_prompt = Some(match &config.append_system_prompt {
+                        Some(existing) => format!("{}\n\n{}", existing, nudge),
+                        None => nudge,
+                    });
+                }
+            }
+
+            build_system_prompt(&patched)
         };
 
+        let system_for_provider = system.clone(); // used by non-Anthropic dispatch below
         let mut req_builder = CreateMessageRequest::builder(&effective_model, config.max_tokens)
             .messages(api_messages)
             .system(system)
@@ -545,10 +824,17 @@ pub async fn run_query_loop(
             req_builder = req_builder.thinking(ThinkingConfig::enabled(budget));
         }
 
-        // Apply temperature: explicit config value takes precedence, then effort-level override.
-        let effective_temperature = config.temperature.or_else(|| {
-            config.effort_level.and_then(|el| el.temperature())
-        });
+        // Apply temperature: explicit config value takes precedence, then agent override,
+        // then effort-level override.
+        let effective_temperature = config.temperature
+            .or_else(|| {
+                config.agent_definition.as_ref()
+                    .and_then(|a| a.temperature)
+                    .map(|t| t as f32)
+            })
+            .or_else(|| {
+                config.effort_level.and_then(|el| el.temperature())
+            });
         if let Some(t) = effective_temperature {
             req_builder = req_builder.temperature(t);
         }
@@ -562,6 +848,446 @@ pub async fn run_query_loop(
         } else {
             Arc::new(claurst_api::streaming::NullStreamHandler)
         };
+
+        // Non-Anthropic provider dispatch: if the model is "provider/model"
+        // format and the registry has that provider, use it directly.
+        //
+        // Provider resolution priority:
+        //   1. Explicit "provider/model" format in the model string
+        //   2. config.provider setting (from --provider flag or settings.json)
+        //   3. Model registry lookup (e.g. "gemini-3-flash-preview" → google)
+        //   4. Default to "anthropic"
+        if let Some(ref registry) = config.provider_registry {
+            let (provider_id_str, model_id_str) = if let Some(p) = tool_ctx.config.provider.as_deref().filter(|p| *p != "anthropic") {
+                // Explicit non-Anthropic provider in config — use it.
+                // If the stored model is in canonical "provider/model" form,
+                // strip the top-level provider prefix before sending it to the
+                // provider adapter. If it contains an additional slash
+                // (e.g. "meta-llama/Llama-3.3..." on OpenRouter), preserve it.
+                let provider_prefix = format!("{}/", p);
+                let model_id = effective_model
+                    .strip_prefix(&provider_prefix)
+                    .unwrap_or(&effective_model)
+                    .to_string();
+                (p.to_string(), model_id)
+            } else if let Some((p, m)) = effective_model.split_once('/') {
+                // No explicit provider but model has "provider/model" format.
+                // Check whether `p` is a known provider or just a model
+                // namespace (e.g. "meta-llama/Llama-3" on OpenRouter).
+                let known_providers = [
+                    "anthropic", "openai", "google", "groq", "mistral",
+                    "deepseek", "xai", "cohere", "perplexity", "cerebras",
+                    "openrouter", "togetherai", "together-ai", "deepinfra",
+                    "venice", "github-copilot", "ollama", "lmstudio",
+                    "llamacpp", "azure", "amazon-bedrock", "huggingface",
+                    "nvidia", "fireworks", "sambanova",
+                ];
+                if known_providers.contains(&p) {
+                    (p.to_string(), m.to_string())
+                } else {
+                    // Treat the whole string as the model ID, fall through
+                    // to auto-detection below.
+                    let fallback_provider = tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
+                    (fallback_provider.to_string(), effective_model.clone())
+                }
+            } else {
+                // No explicit provider set (or set to "anthropic"): try the
+                // model registry to auto-detect provider from the model name.
+                // Use the shared model registry from QueryConfig if available;
+                // otherwise construct a temporary one.
+                let temp_reg;
+                let model_reg: &claurst_api::ModelRegistry = if let Some(ref shared) = config.model_registry {
+                    shared
+                } else {
+                    temp_reg = {
+                        let mut r = claurst_api::ModelRegistry::new();
+                        if let Some(cache_dir) = dirs::cache_dir() {
+                            let cache_path = cache_dir.join("claurst").join("models_dev.json");
+                            r.load_cache(&cache_path);
+                        }
+                        r
+                    };
+                    &temp_reg
+                };
+                if let Some(detected_pid) = model_reg.find_provider_for_model(&effective_model) {
+                    let pid_str = detected_pid.to_string();
+                    if pid_str != "anthropic" {
+                        (pid_str, effective_model.clone())
+                    } else {
+                        ("anthropic".to_string(), effective_model.clone())
+                    }
+                } else {
+                    // Fall back to config.provider (may be "anthropic" or None→"anthropic")
+                    let p = tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
+                    (p.to_string(), effective_model.clone())
+                }
+            };
+
+            if provider_id_str != "anthropic" {
+                let pid = claurst_core::provider_id::ProviderId::new(&provider_id_str);
+
+                // Try registry first; if not found, build provider dynamically
+                // from auth_store (handles keys added at runtime via /connect).
+                let mut registry_provider = registry.get(&pid).cloned();
+
+                // If the user supplied --api-base for a local provider (Ollama, LM Studio,
+                // llama.cpp), rebuild the provider with the override URL.  These providers
+                // are always pre-registered with a hardcoded default URL, so without this
+                // the --api-base flag would be silently ignored.
+                if let Some(override_base) = tool_ctx.config.provider_configs
+                    .get(&provider_id_str)
+                    .and_then(|pc| pc.api_base.as_deref())
+                {
+                    use claurst_api::providers::openai_compat_providers;
+                    let base_url = format!("{}/v1", override_base.trim_end_matches('/'));
+                    let overridden: Option<std::sync::Arc<dyn claurst_api::LlmProvider>> =
+                        match provider_id_str.as_str() {
+                            "ollama" => Some(std::sync::Arc::new(
+                                openai_compat_providers::ollama().with_base_url(base_url),
+                            )),
+                            "lmstudio" | "lm-studio" => Some(std::sync::Arc::new(
+                                openai_compat_providers::lm_studio().with_base_url(base_url),
+                            )),
+                            "llamacpp" | "llama-cpp" => Some(std::sync::Arc::new(
+                                openai_compat_providers::llama_cpp().with_base_url(base_url),
+                            )),
+                            _ => None,
+                        };
+                    if overridden.is_some() {
+                        registry_provider = overridden;
+                    }
+                }
+
+                let dynamic_provider: Option<std::sync::Arc<dyn claurst_api::LlmProvider>> = if registry_provider.is_none() {
+                    let auth_store = claurst_core::AuthStore::load();
+                    if let Some(key) = auth_store.api_key_for(&provider_id_str) {
+                        if !key.is_empty() {
+                            match provider_id_str.as_str() {
+                                "openai" => Some(std::sync::Arc::new(claurst_api::OpenAiProvider::new(key))),
+                                "google" => Some(std::sync::Arc::new(claurst_api::GoogleProvider::new(key))),
+                                "github-copilot" => Some(std::sync::Arc::new(claurst_api::CopilotProvider::new(key))),
+                                "cohere" => {
+                                    if let Some(p) = claurst_api::CohereProvider::from_env() {
+                                        Some(std::sync::Arc::new(p))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => {
+                                    // Use the factory functions that include correct provider quirks
+                                    // (e.g. Mistral tool_id_max_len=9, DeepSeek reasoning_field).
+                                    // The factory reads an env var for the key, but .with_api_key()
+                                    // below replaces it with the runtime-provided key.
+                                    use claurst_api::providers::openai_compat_providers;
+                                    let provider = match provider_id_str.as_str() {
+                                        "groq" => openai_compat_providers::groq().with_api_key(key),
+                                        "mistral" => openai_compat_providers::mistral().with_api_key(key),
+                                        "deepseek" => openai_compat_providers::deepseek().with_api_key(key),
+                                        "xai" => openai_compat_providers::xai().with_api_key(key),
+                                        "openrouter" => openai_compat_providers::openrouter().with_api_key(key),
+                                        "togetherai" | "together-ai" => openai_compat_providers::together_ai().with_api_key(key),
+                                        "perplexity" => openai_compat_providers::perplexity().with_api_key(key),
+                                        "cerebras" => openai_compat_providers::cerebras().with_api_key(key),
+                                        "deepinfra" => openai_compat_providers::deepinfra().with_api_key(key),
+                                        "venice" => openai_compat_providers::venice().with_api_key(key),
+                                        "huggingface" => openai_compat_providers::huggingface().with_api_key(key),
+                                        "nvidia" => openai_compat_providers::nvidia().with_api_key(key),
+                                        "siliconflow" => openai_compat_providers::siliconflow().with_api_key(key),
+                                        "sambanova" => openai_compat_providers::sambanova().with_api_key(key),
+                                        "moonshot" => openai_compat_providers::moonshot().with_api_key(key),
+                                        "zhipu" => openai_compat_providers::zhipu().with_api_key(key),
+                                        "qwen" => openai_compat_providers::qwen().with_api_key(key),
+                                        "nebius" => openai_compat_providers::nebius().with_api_key(key),
+                                        "novita" => openai_compat_providers::novita().with_api_key(key),
+                                        "ovhcloud" => openai_compat_providers::ovhcloud().with_api_key(key),
+                                        "scaleway" => openai_compat_providers::scaleway().with_api_key(key),
+                                        "vultr" | "vultr-ai" => openai_compat_providers::vultr_ai().with_api_key(key),
+                                        "baseten" => openai_compat_providers::baseten().with_api_key(key),
+                                        "friendli" => openai_compat_providers::friendli().with_api_key(key),
+                                        "upstage" => openai_compat_providers::upstage().with_api_key(key),
+                                        "stepfun" => openai_compat_providers::stepfun().with_api_key(key),
+                                        "fireworks" => openai_compat_providers::fireworks().with_api_key(key),
+                                        "ollama" => openai_compat_providers::ollama(),
+                                        "lmstudio" | "lm-studio" => openai_compat_providers::lm_studio(),
+                                        "llamacpp" | "llama-cpp" => openai_compat_providers::llama_cpp(),
+                                        _ => {
+                                            // True fallback: unknown provider, generic OpenAI-compatible
+                                            claurst_api::OpenAiCompatProvider::new(&provider_id_str, &provider_id_str, "https://api.openai.com/v1")
+                                                .with_api_key(key)
+                                        }
+                                    };
+                                    Some(std::sync::Arc::new(provider))
+                                }
+                            }
+                        } else { None }
+                    } else { None }
+                } else { None };
+
+                let provider = registry_provider.or(dynamic_provider);
+                if let Some(provider) = provider {
+                    debug!(provider = %provider_id_str, model = %model_id_str, "Dispatching to non-Anthropic provider");
+
+                    // Notify TUI that we're calling the provider
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::Status(format!("Calling {} ({})…", provider.name(), model_id_str)));
+                    }
+
+                    // Build ProviderRequest from the already-assembled request data.
+                    // tools comes from the api_tools we already built above.
+                    // Filter unsupported modalities: replace Image/Document blocks
+                    // with placeholder text when the provider doesn't support them,
+                    // preventing crashes on text-only models.
+                    let mut caps = provider.capabilities();
+                    if let Some(model_entry) = config
+                        .model_registry
+                        .as_ref()
+                        .and_then(|model_registry| model_registry.get(&provider_id_str, &model_id_str))
+                    {
+                        caps.image_input = model_entry.vision;
+                        caps.tool_calling = model_entry.tool_calling;
+                        caps.thinking = model_entry.reasoning;
+                    }
+                    let provider_tools: Vec<claurst_core::types::ToolDefinition> = if caps.tool_calling {
+                        tools.iter().map(|t| t.to_definition()).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let provider_messages: Vec<claurst_core::types::Message> = messages
+                        .iter()
+                        .map(|msg| {
+                            let mut msg = msg.clone();
+                            if let claurst_core::types::MessageContent::Blocks(ref mut blocks) = msg.content {
+                                for block in blocks.iter_mut() {
+                                    match block {
+                                        claurst_core::types::ContentBlock::Image { .. } if !caps.image_input => {
+                                            *block = claurst_core::types::ContentBlock::Text {
+                                                text: "[Image not supported by this model]".to_string(),
+                                            };
+                                        }
+                                        claurst_core::types::ContentBlock::Document { .. } if !caps.pdf_input => {
+                                            *block = claurst_core::types::ContentBlock::Text {
+                                                text: "[PDF not supported by this model]".to_string(),
+                                            };
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            msg
+                        })
+                        .collect();
+
+                    let provider_request = claurst_api::ProviderRequest {
+                        model: model_id_str.to_owned(),
+                        messages: provider_messages,
+                        system_prompt: Some(system_for_provider.clone()),
+                        tools: provider_tools,
+                        max_tokens: config.max_tokens,
+                        temperature: effective_temperature.map(|t| t as f64),
+                        top_p: None,
+                        top_k: None,
+                        stop_sequences: vec![],
+                        thinking: if caps.thinking {
+                            effective_thinking_budget
+                                .map(|b| claurst_api::ThinkingConfig::enabled(b))
+                        } else {
+                            None
+                        },
+                        provider_options: build_provider_options(
+                            &provider_id_str,
+                            &model_id_str,
+                            config.effort_level,
+                            effective_thinking_budget,
+                        ),
+                    };
+
+                    // Use create_message_stream so the TUI receives real-time
+                    // text deltas instead of waiting for the full response.
+                    let mut stream = match provider.create_message_stream(provider_request).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!(provider = %provider_id_str, error = %e, "Provider stream failed");
+                            return QueryOutcome::Error(
+                                claurst_core::error::ClaudeError::Api(e.to_string())
+                            );
+                        }
+                    };
+
+                    // Accumulators for building the final assistant message.
+                    let mut text_chunks: Vec<String> = Vec::new();
+                    // tool_call_blocks: index → (id, name, accumulated_json)
+                    let mut tool_call_blocks: std::collections::HashMap<usize, (String, String, String)> =
+                        std::collections::HashMap::new();
+                    let mut usage = UsageInfo::default();
+                    let mut stop_str = "end_turn".to_string();
+                    let mut msg_id = uuid::Uuid::new_v4().to_string();
+
+                    use futures::StreamExt as ProviderStreamExt;
+                    loop {
+                        tokio::select! {
+                            _ = cancel_token.cancelled() => {
+                                return QueryOutcome::Cancelled;
+                            }
+                            event = stream.next() => {
+                                match event {
+                                    None => break,
+                                    Some(Err(e)) => {
+                                        error!(provider = %provider_id_str, error = %e, "Provider stream error");
+                                        break;
+                                    }
+                                    Some(Ok(evt)) => {
+                                        // Forward to TUI via AnthropicStreamEvent mapping.
+                                        if let Some(ref tx) = event_tx {
+                                            if let Some(ae) = map_to_anthropic_event(&evt) {
+                                                let _ = tx.send(QueryEvent::Stream(ae));
+                                            }
+                                        }
+
+                                        // Accumulate response data.
+                                        match &evt {
+                                            claurst_api::StreamEvent::MessageStart { id, usage: u, .. } => {
+                                                msg_id = id.clone();
+                                                usage.input_tokens = u.input_tokens;
+                                                usage.cache_read_input_tokens = u.cache_read_input_tokens;
+                                                usage.cache_creation_input_tokens = u.cache_creation_input_tokens;
+                                            }
+                                            claurst_api::StreamEvent::ContentBlockStart { index, content_block } => {
+                                                if let ContentBlock::ToolUse { id, name, .. } = content_block {
+                                                    tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new()));
+                                                }
+                                            }
+                                            claurst_api::StreamEvent::TextDelta { text, .. } => {
+                                                text_chunks.push(text.clone());
+                                            }
+                                            claurst_api::StreamEvent::InputJsonDelta { index, partial_json } => {
+                                                if let Some((_, _, buf)) = tool_call_blocks.get_mut(index) {
+                                                    buf.push_str(partial_json);
+                                                }
+                                            }
+                                            claurst_api::StreamEvent::MessageDelta { stop_reason, usage: u } => {
+                                                stop_str = match stop_reason {
+                                                    Some(claurst_api::provider_types::StopReason::ToolUse) => "tool_use",
+                                                    Some(claurst_api::provider_types::StopReason::MaxTokens) => "max_tokens",
+                                                    _ => "end_turn",
+                                                }.to_string();
+                                                if let Some(u) = u {
+                                                    usage.output_tokens = u.output_tokens;
+                                                }
+                                            }
+                                            claurst_api::StreamEvent::MessageStop => break,
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Build the content blocks from accumulated stream data.
+                    let mut content_blocks: Vec<ContentBlock> = Vec::new();
+
+                    let combined_text = text_chunks.join("");
+                    if !combined_text.is_empty() {
+                        content_blocks.push(ContentBlock::Text { text: combined_text });
+                    }
+
+                    // Reconstruct tool-use blocks (sorted by index for determinism).
+                    let mut tc_indices: Vec<usize> = tool_call_blocks.keys().cloned().collect();
+                    tc_indices.sort();
+                    for idx in tc_indices {
+                        if let Some((id, name, json_str)) = tool_call_blocks.remove(&idx) {
+                            let input: serde_json::Value = serde_json::from_str(&json_str)
+                                .unwrap_or(serde_json::json!({}));
+                            content_blocks.push(ContentBlock::ToolUse { id, name, input });
+                        }
+                    }
+
+                    let assistant_msg = Message {
+                        role: claurst_core::types::Role::Assistant,
+                        content: claurst_core::types::MessageContent::Blocks(content_blocks.clone()),
+                        uuid: Some(msg_id),
+                        cost: None,
+                    };
+
+                    cost_tracker.add_usage(
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cache_creation_input_tokens,
+                        usage.cache_read_input_tokens,
+                    );
+
+                    messages.push(assistant_msg.clone());
+
+                    // Handle tool-use turn: execute tools and loop.
+                    let tool_use_blocks: Vec<_> = content_blocks.iter().filter_map(|b| {
+                        if let ContentBlock::ToolUse { id, name, input } = b {
+                            Some((id.clone(), name.clone(), input.clone()))
+                        } else {
+                            None
+                        }
+                    }).collect();
+
+                    if !tool_use_blocks.is_empty() && stop_str == "tool_use" {
+                        let mut tool_results = Vec::new();
+                        for (tool_id, tool_name, tool_input) in tool_use_blocks {
+                            let result = execute_tool(&*tool_name, &tool_input, tools, &tool_ctx).await;
+                            tool_results.push(ContentBlock::ToolResult {
+                                tool_use_id: tool_id,
+                                content: claurst_core::types::ToolResultContent::Text(result.content),
+                                is_error: Some(result.is_error),
+                            });
+                        }
+                        messages.push(Message {
+                            role: claurst_core::types::Role::User,
+                            content: claurst_core::types::MessageContent::Blocks(tool_results),
+                            uuid: None,
+                            cost: None,
+                        });
+                        continue; // loop for next turn
+                    }
+
+                    // End turn — notify TUI and return.
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::TurnComplete {
+                            stop_reason: stop_str.clone(),
+                            turn,
+                            usage: Some(usage.clone()),
+                        });
+                    }
+
+                    return QueryOutcome::EndTurn {
+                        message: assistant_msg,
+                        usage,
+                    };
+                } else {
+                    // Non-Anthropic provider detected but no API key / credentials
+                    // available.  Return a clear error instead of silently falling
+                    // through to the Anthropic client.
+                    let hint = match provider_id_str.as_str() {
+                        "google" => "Set GOOGLE_API_KEY or run `claurst auth login --provider google`.",
+                        "openai" => "Set OPENAI_API_KEY or run `claurst auth login --provider openai`.",
+                        "groq" => "Set GROQ_API_KEY.",
+                        "mistral" => "Set MISTRAL_API_KEY.",
+                        "deepseek" => "Set DEEPSEEK_API_KEY.",
+                        "xai" => "Set XAI_API_KEY.",
+                        "github-copilot" => "Reconnect GitHub Copilot via /connect, or set GITHUB_TOKEN.",
+                        "cohere" => "Set COHERE_API_KEY.",
+                        _ => "Set the appropriate API key environment variable or use `claurst auth login`.",
+                    };
+                    error!(
+                        provider = %provider_id_str,
+                        model = %model_id_str,
+                        "No credentials found for provider"
+                    );
+                    return QueryOutcome::Error(
+                        ClaudeError::Api(format!(
+                            "No API key for provider '{}' (model '{}'). {}",
+                            provider_id_str, model_id_str, hint
+                        ))
+                    );
+                }
+            }
+        }
 
         // Send to API
         debug!(turn, model = %effective_model, "Sending API request");
@@ -609,13 +1335,13 @@ pub async fn run_query_loop(
                         Some(evt) => {
                             accumulator.on_event(&evt);
                             match &evt {
-                                StreamEvent::Error { error_type, message } => {
+                                AnthropicStreamEvent::Error { error_type, message } => {
                                     if error_type == "overloaded_error" {
                                         warn!(model = %effective_model, "API overloaded");
                                     }
                                     error!(error_type, message, "Stream error");
                                 }
-                                StreamEvent::MessageStop => break,
+                                AnthropicStreamEvent::MessageStop => break,
                                 _ => {}
                             }
                         }
@@ -864,8 +1590,8 @@ pub async fn run_query_loop(
                                     {
                                         Ok(memories) if !memories.is_empty() => {
                                             let target = working_dir_clone
-                                                .join(".claude")
-                                                .join("CLAUDE.md");
+                                                .join(".claurst")
+                                                .join("AGENTS.md");
                                             if let Err(e) =
                                                 session_memory::SessionMemoryExtractor::persist(
                                                     &memories, &target,
@@ -898,9 +1624,9 @@ pub async fn run_query_loop(
                 // the spawn doesn't call run_query_loop recursively from within
                 // its own future (which would make the future !Send).
                 {
-                    let memory_dir = dirs::home_dir().map(|h| h.join(".claude").join("memory"));
+                    let memory_dir = dirs::home_dir().map(|h| h.join(".claurst").join("memory"));
                     let conversations_dir =
-                        dirs::home_dir().map(|h| h.join(".claude").join("conversations"));
+                        dirs::home_dir().map(|h| h.join(".claurst").join("conversations"));
                     if let (Some(mem), Some(conv)) = (memory_dir, conversations_dir) {
                         let dreamer = crate::auto_dream::AutoDream::new(mem, conv);
                         if let Ok(Some(task)) = dreamer.maybe_trigger().await {
@@ -1244,6 +1970,92 @@ fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
 }
 
 // ---------------------------------------------------------------------------
+// Provider stream event mapping
+// ---------------------------------------------------------------------------
+
+/// Map a unified `StreamEvent` (from a non-Anthropic provider) onto the
+/// equivalent `AnthropicStreamEvent` so that the TUI stream consumer sees a
+/// single, consistent event type regardless of which provider produced it.
+fn map_to_anthropic_event(
+    evt: &claurst_api::StreamEvent,
+) -> Option<claurst_api::AnthropicStreamEvent> {
+    use claurst_api::streaming::{AnthropicStreamEvent, ContentDelta};
+    use claurst_api::StreamEvent;
+
+    match evt {
+        StreamEvent::MessageStart { id, model, usage } => {
+            Some(AnthropicStreamEvent::MessageStart {
+                id: id.clone(),
+                model: model.clone(),
+                usage: usage.clone(),
+            })
+        }
+        StreamEvent::ContentBlockStart { index, content_block } => {
+            Some(AnthropicStreamEvent::ContentBlockStart {
+                index: *index,
+                content_block: content_block.clone(),
+            })
+        }
+        StreamEvent::TextDelta { index, text } => {
+            Some(AnthropicStreamEvent::ContentBlockDelta {
+                index: *index,
+                delta: ContentDelta::TextDelta { text: text.clone() },
+            })
+        }
+        StreamEvent::ThinkingDelta { index, thinking } => {
+            Some(AnthropicStreamEvent::ContentBlockDelta {
+                index: *index,
+                delta: ContentDelta::ThinkingDelta { thinking: thinking.clone() },
+            })
+        }
+        StreamEvent::ReasoningDelta { index, reasoning } => {
+            Some(AnthropicStreamEvent::ContentBlockDelta {
+                index: *index,
+                delta: ContentDelta::ThinkingDelta { thinking: reasoning.clone() },
+            })
+        }
+        StreamEvent::InputJsonDelta { index, partial_json } => {
+            Some(AnthropicStreamEvent::ContentBlockDelta {
+                index: *index,
+                delta: ContentDelta::InputJsonDelta { partial_json: partial_json.clone() },
+            })
+        }
+        StreamEvent::SignatureDelta { index, signature } => {
+            Some(AnthropicStreamEvent::ContentBlockDelta {
+                index: *index,
+                delta: ContentDelta::SignatureDelta { signature: signature.clone() },
+            })
+        }
+        StreamEvent::ContentBlockStop { index } => {
+            Some(AnthropicStreamEvent::ContentBlockStop { index: *index })
+        }
+        StreamEvent::MessageDelta { stop_reason, usage } => {
+            // Convert the unified StopReason to the string form used by
+            // AnthropicStreamEvent::MessageDelta.
+            let stop_reason_str = stop_reason.as_ref().map(|r| match r {
+                claurst_api::provider_types::StopReason::ToolUse => "tool_use".to_string(),
+                claurst_api::provider_types::StopReason::MaxTokens => "max_tokens".to_string(),
+                claurst_api::provider_types::StopReason::StopSequence => "stop_sequence".to_string(),
+                claurst_api::provider_types::StopReason::EndTurn => "end_turn".to_string(),
+                claurst_api::provider_types::StopReason::ContentFiltered => "content_filtered".to_string(),
+                claurst_api::provider_types::StopReason::Other(s) => s.clone(),
+            });
+            Some(AnthropicStreamEvent::MessageDelta {
+                stop_reason: stop_reason_str,
+                usage: usage.clone(),
+            })
+        }
+        StreamEvent::MessageStop => Some(AnthropicStreamEvent::MessageStop),
+        StreamEvent::Error { error_type, message } => {
+            Some(AnthropicStreamEvent::Error {
+                error_type: error_type.clone(),
+                message: message.clone(),
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1270,6 +2082,10 @@ mod tests {
             skill_index: None,
             max_budget_usd: None,
             fallback_model: None,
+            provider_registry: None,
+            agent_name: None,
+            agent_definition: None,
+            model_registry: None,
         }
     }
 
@@ -1398,6 +2214,51 @@ mod tests {
         let s2 = format!("{:?}", err_outcome);
         assert!(s2.contains("Error"));
     }
+
+    #[test]
+    fn test_build_provider_options_for_google_gemini_3() {
+        let options = build_provider_options(
+            "google",
+            "gemini-3-flash-preview",
+            Some(claurst_core::effort::EffortLevel::High),
+            None,
+        );
+        assert_eq!(
+            options["thinkingConfig"]["thinkingLevel"],
+            serde_json::json!("high")
+        );
+        assert_eq!(
+            options["thinkingConfig"]["includeThoughts"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn test_build_provider_options_for_openrouter_gpt5() {
+        let options = build_provider_options(
+            "openrouter",
+            "gpt-5.4",
+            Some(claurst_core::effort::EffortLevel::Medium),
+            None,
+        );
+        assert_eq!(options["reasoningEffort"], serde_json::json!("medium"));
+        assert_eq!(options["textVerbosity"], serde_json::json!("low"));
+        assert_eq!(options["usage"]["include"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_build_provider_options_for_bedrock_anthropic() {
+        let options = build_provider_options(
+            "amazon-bedrock",
+            "anthropic.claude-sonnet-4-6-v1",
+            Some(claurst_core::effort::EffortLevel::High),
+            Some(10_000),
+        );
+        assert_eq!(
+            options["reasoningConfig"]["budgetTokens"],
+            serde_json::json!(10_000)
+        );
+    }
 }
 
 /// Stream handler that forwards events to an unbounded channel.
@@ -1406,7 +2267,7 @@ struct ChannelStreamHandler {
 }
 
 impl StreamHandler for ChannelStreamHandler {
-    fn on_event(&self, event: &StreamEvent) {
+    fn on_event(&self, event: &AnthropicStreamEvent) {
         let _ = self.tx.send(QueryEvent::Stream(event.clone()));
     }
 }
@@ -1436,7 +2297,7 @@ pub async fn run_single_query(
 
     while let Some(evt) = rx.recv().await {
         acc.on_event(&evt);
-        if matches!(evt, StreamEvent::MessageStop) {
+        if matches!(evt, AnthropicStreamEvent::MessageStop) {
             break;
         }
     }

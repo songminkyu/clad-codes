@@ -12,10 +12,11 @@ members = [
     "crates/cli",
     "crates/buddy",
     "crates/plugins",
+    "crates/acp",
 ]
 
 [workspace.package]
-version = "0.0.6"
+version = "0.0.7"
 edition = "2021"
 authors = ["Claurst"]
 license = "GPL-3.0"
@@ -26,6 +27,7 @@ tokio = { version = "1.44", features = ["full"] }
 tokio-stream = "0.1"
 futures = "0.3"
 async-trait = "0.1"
+async-stream = "0.3"
 
 # HTTP
 reqwest = { version = "0.12", features = ["json", "stream", "native-tls", "multipart"], default-features = false }
@@ -76,6 +78,7 @@ mime = "0.3"
 urlencoding = "2"
 open = "5"
 qrcode = "0.14"
+rusqlite = { version = "0.31", features = ["bundled"] }
 icy_sixel = "0.5"
 image = { version = "0.25", features = ["png", "jpeg"] }
 
@@ -99,6 +102,7 @@ schemars = { version = "0.8", features = ["derive"] }
 
 # Workspace crates
 claurst-core = { path = "crates/core" }
+claurst-acp = { path = "crates/acp" }
 claurst-api = { path = "crates/api" }
 claurst-tools = { path = "crates/tools" }
 claurst-query = { path = "crates/query" }

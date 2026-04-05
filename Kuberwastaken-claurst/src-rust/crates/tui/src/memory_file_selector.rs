@@ -4,9 +4,12 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
-use crate::overlays::centered_rect;
+use crate::overlays::{
+    centered_rect, render_dark_overlay_buf, render_dialog_bg_buf, CLAURST_ACCENT, CLAURST_MUTED,
+    CLAURST_PANEL_BG, CLAURST_TEXT,
+};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -50,9 +53,9 @@ impl MemoryFileSelectorState {
     /// Open the selector for the given project root.
     ///
     /// Populates the file list with:
-    /// - User:    `~/.claude/CLAUDE.md`
-    /// - Project: `{project_root}/CLAUDE.md`
-    /// - Local:   `{project_root}/.claude/CLAUDE.md`
+    /// - User:    `~/.claurst/AGENTS.md`
+    /// - Project: `{project_root}/AGENTS.md`
+    /// - Local:   `{project_root}/.claurst/AGENTS.md`
     ///
     /// Each entry is marked `exists = true/false` based on the filesystem.
     pub fn open(&mut self, project_root: &std::path::Path) {
@@ -60,8 +63,8 @@ impl MemoryFileSelectorState {
         self.selected = 0;
         self.files.clear();
 
-        // User-level: ~/.claude/CLAUDE.md
-        let user_path = claurst_core::config::Settings::config_dir().join("CLAUDE.md");
+        // User-level: ~/.claurst/AGENTS.md
+        let user_path = claurst_core::config::Settings::config_dir().join("AGENTS.md");
         let user_display = {
             let home = dirs::home_dir().unwrap_or_default();
             let rel = user_path
@@ -76,8 +79,8 @@ impl MemoryFileSelectorState {
             file_type: MemoryFileType::User,
         });
 
-        // Project-level: {project_root}/CLAUDE.md
-        let project_path = project_root.join("CLAUDE.md");
+        // Project-level: {project_root}/AGENTS.md
+        let project_path = project_root.join("AGENTS.md");
         let project_display = project_path.display().to_string();
         self.files.push(MemoryFile {
             exists: project_path.exists(),
@@ -86,8 +89,8 @@ impl MemoryFileSelectorState {
             file_type: MemoryFileType::Project,
         });
 
-        // Local-level: {project_root}/.claude/CLAUDE.md
-        let local_path = project_root.join(".claude").join("CLAUDE.md");
+        // Local-level: {project_root}/.claurst/AGENTS.md
+        let local_path = project_root.join(".claurst").join("AGENTS.md");
         let local_display = local_path.display().to_string();
         self.files.push(MemoryFile {
             exists: local_path.exists(),
@@ -142,10 +145,27 @@ pub fn render_memory_file_selector(
     }
 
     // Height: 2 border + 1 blank + N files + 1 blank + 1 footer = N + 5
-    let dialog_height = (state.files.len() as u16 + 5).max(8);
+    let dialog_height = (state.files.len() as u16 + 6).max(8);
     let dialog_area = centered_rect(70, dialog_height, area);
+    render_dark_overlay_buf(buf, area);
+    render_dialog_bg_buf(buf, dialog_area);
+
+    let inner = Rect {
+        x: dialog_area.x + 2,
+        y: dialog_area.y + 1,
+        width: dialog_area.width.saturating_sub(4),
+        height: dialog_area.height.saturating_sub(2),
+    };
 
     let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(" Memory", Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(" — choose a file", Style::default().fg(CLAURST_MUTED)),
+        Span::styled(
+            format!("{:>width$}", "Esc close", width = inner.width.saturating_sub(24) as usize),
+            Style::default().fg(CLAURST_MUTED),
+        ),
+    ]));
     lines.push(Line::from(""));
 
     for (i, file) in state.files.iter().enumerate() {
@@ -156,27 +176,26 @@ pub fn render_memory_file_selector(
         };
 
         let new_tag = if !file.exists {
-            Span::styled(" (new)", Style::default().fg(Color::DarkGray))
+            Span::styled(" (new)", Style::default().fg(CLAURST_MUTED))
         } else {
             Span::raw("")
         };
 
         if i == state.selected {
-            // Highlighted row — orange background
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("  \u{203a} {type_label} {}", file.display_path),
+                    pad_line(&format!("  \u{203a} {type_label} {}", file.display_path), inner.width),
                     Style::default()
-                        .fg(Color::Rgb(233, 30, 99))
+                        .fg(Color::Black)
+                        .bg(CLAURST_ACCENT)
                         .add_modifier(Modifier::BOLD),
                 ),
-                new_tag,
             ]));
         } else {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("    {type_label} {}", file.display_path),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(CLAURST_TEXT),
                 ),
                 new_tag,
             ]));
@@ -186,18 +205,23 @@ pub fn render_memory_file_selector(
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
         "  \u{2191}\u{2193} navigate  Enter select  Esc close",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(CLAURST_MUTED),
     )]));
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Memory Files ")
-        .border_style(Style::default().fg(Color::Rgb(233, 30, 99)));
-
     let para = Paragraph::new(lines)
-        .block(block)
+        .style(Style::default().bg(CLAURST_PANEL_BG).fg(CLAURST_TEXT))
         .alignment(Alignment::Left);
 
     use ratatui::widgets::Widget;
-    para.render(dialog_area, buf);
+    para.render(inner, buf);
+}
+
+fn pad_line(text: &str, width: u16) -> String {
+    let max_width = width as usize;
+    let mut clipped: String = text.chars().take(max_width).collect();
+    let visible = clipped.chars().count();
+    if visible < max_width {
+        clipped.push_str(&" ".repeat(max_width - visible));
+    }
+    clipped
 }

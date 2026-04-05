@@ -1,8 +1,7 @@
-// LSPTool — query language server diagnostics for a file.
+// LspTool — code intelligence via Language Server Protocol.
 //
-// Ported from src/tools/LSPTool/ in the TypeScript source.  Returns errors,
-// warnings, and hints emitted by any configured language server for the
-// requested file.
+// Supports hover, definition, references, document symbols, and diagnostics.
+// Ported from the TypeScript LSPTool; extended with full action routing.
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
@@ -17,8 +16,9 @@ impl Tool for LspTool {
     }
 
     fn description(&self) -> &str {
-        "Query language server diagnostics for a file. Returns errors, warnings, and hints \
-         reported by any language server configured for the file type."
+        "Query a language server for code intelligence. Supports hover documentation, \
+         go-to-definition, find-references, document symbols, and diagnostics. \
+         Language servers must be configured in settings (lsp_servers)."
     }
 
     fn permission_level(&self) -> PermissionLevel {
@@ -29,81 +29,187 @@ impl Tool for LspTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "file_path": {
+                "action": {
                     "type": "string",
-                    "description": "Absolute or working-directory-relative path to the file to \
-                                    get diagnostics for."
+                    "enum": ["hover", "definition", "references", "symbols", "diagnostics"],
+                    "description": "The LSP action to perform."
+                },
+                "file": {
+                    "type": "string",
+                    "description": "Absolute or working-directory-relative path to the source file."
+                },
+                "line": {
+                    "type": "integer",
+                    "description": "1-based line number (required for hover, definition, references)."
+                },
+                "column": {
+                    "type": "integer",
+                    "description": "1-based column number (required for hover, definition, references)."
                 }
             },
-            "required": ["file_path"]
+            "required": ["action", "file"]
         })
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
-        let file_path_raw = match input.get("file_path").and_then(|v| v.as_str()) {
-            Some(p) => p.to_string(),
-            None => return ToolResult::error("file_path is required"),
+        // --- Parse inputs ---------------------------------------------------
+        let action = match input.get("action").and_then(|v| v.as_str()) {
+            Some(a) => a.to_string(),
+            None => return ToolResult::error("'action' is required"),
         };
 
-        // Resolve to an absolute path.
-        let path = if std::path::Path::new(&file_path_raw).is_absolute() {
-            file_path_raw.clone()
+        let file_raw = match input.get("file").and_then(|v| v.as_str()) {
+            Some(f) => f.to_string(),
+            None => return ToolResult::error("'file' is required"),
+        };
+
+        // Resolve to absolute path
+        let file_path = if std::path::Path::new(&file_raw).is_absolute() {
+            file_raw.clone()
         } else {
             ctx.working_dir
-                .join(&file_path_raw)
+                .join(&file_raw)
                 .to_string_lossy()
                 .into_owned()
         };
 
-        let lsp_manager_arc = claurst_core::lsp::global_lsp_manager();
+        // line/column only required for position-based actions
+        let line = input
+            .get("line")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as u32;
+        let column = input
+            .get("column")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as u32;
 
-        // Open the file so the LSP server knows about it and begins sending
-        // diagnostics (textDocument/didOpen notification).
+        // --- Seed the global LSP manager with configs from current session ---
+        let lsp_manager_arc = claurst_core::lsp::global_lsp_manager();
         {
             let mut manager = lsp_manager_arc.lock().await;
-            if let Err(_e) = manager.open_file(&path, &ctx.working_dir).await {
-                // No LSP server is configured for this file type — return a
-                // graceful informational message rather than an error.
+            manager.seed_from_config(&ctx.config.lsp_servers);
+        }
+
+        // Check that at least one server is registered for this file before
+        // doing expensive I/O.
+        {
+            let manager = lsp_manager_arc.lock().await;
+            if manager.server_name_for_file_pub(&file_path).is_none() {
                 return ToolResult::success(format!(
-                    "No LSP servers configured for '{}'. \
-                     Configure language servers in settings to enable diagnostics.",
-                    path
+                    "No LSP server configured for '{}'. \
+                     Add a server entry to lsp_servers in your settings to enable \
+                     code intelligence for this file type.",
+                    file_path
                 ));
             }
         }
 
-        // Give the server a short window to deliver diagnostics via the
-        // textDocument/publishDiagnostics notification (at most 50 ms).
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Read cached diagnostics.
-        let diagnostics = {
-            let manager = lsp_manager_arc.lock().await;
-            manager.get_diagnostics_for_file(&path)
-        };
-
-        if diagnostics.is_empty() {
-            return ToolResult::success(format!("No diagnostics for '{}'.", path));
+        // --- Ensure the file is opened on its LSP server --------------------
+        {
+            let mut manager = lsp_manager_arc.lock().await;
+            if let Err(e) = manager.open_file(&file_path, &ctx.working_dir).await {
+                return ToolResult::error(format!("Failed to open file in LSP: {}", e));
+            }
         }
 
-        let output = diagnostics
-            .iter()
-            .map(|d| {
-                let sev = d.severity.as_str().to_uppercase();
-                let source = d.source.as_deref().unwrap_or("lsp");
-                let code_part = d
-                    .code
-                    .as_deref()
-                    .map(|c| format!(" [{}]", c))
-                    .unwrap_or_default();
-                format!(
-                    "[{}] {}:{}:{} — {}  ({}){}",
-                    sev, d.file, d.line, d.column, d.message, source, code_part
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        // --- Dispatch action ------------------------------------------------
+        match action.as_str() {
+            "hover" => {
+                let result = {
+                    let mut manager = lsp_manager_arc.lock().await;
+                    manager
+                        .hover(&file_path, &ctx.working_dir, line, column)
+                        .await
+                };
+                match result {
+                    Ok(Some(text)) => ToolResult::success(text),
+                    Ok(None) => ToolResult::success(format!(
+                        "No hover information at {}:{}:{}",
+                        file_path, line, column
+                    )),
+                    Err(e) => ToolResult::error(format!("hover failed: {}", e)),
+                }
+            }
 
-        ToolResult::success(output)
+            "definition" => {
+                let result = {
+                    let mut manager = lsp_manager_arc.lock().await;
+                    manager
+                        .definition(&file_path, &ctx.working_dir, line, column)
+                        .await
+                };
+                match result {
+                    Ok(locs) if locs.is_empty() => ToolResult::success(format!(
+                        "No definition found at {}:{}:{}",
+                        file_path, line, column
+                    )),
+                    Ok(locs) => ToolResult::success(locs.join("\n")),
+                    Err(e) => ToolResult::error(format!("definition failed: {}", e)),
+                }
+            }
+
+            "references" => {
+                let result = {
+                    let mut manager = lsp_manager_arc.lock().await;
+                    manager
+                        .references(&file_path, &ctx.working_dir, line, column)
+                        .await
+                };
+                match result {
+                    Ok(locs) if locs.is_empty() => ToolResult::success(format!(
+                        "No references found at {}:{}:{}",
+                        file_path, line, column
+                    )),
+                    Ok(locs) => ToolResult::success(format!(
+                        "{} reference(s):\n{}",
+                        locs.len(),
+                        locs.join("\n")
+                    )),
+                    Err(e) => ToolResult::error(format!("references failed: {}", e)),
+                }
+            }
+
+            "symbols" => {
+                let result = {
+                    let mut manager = lsp_manager_arc.lock().await;
+                    manager
+                        .document_symbols(&file_path, &ctx.working_dir)
+                        .await
+                };
+                match result {
+                    Ok(syms) if syms.is_empty() => {
+                        ToolResult::success(format!("No symbols found in '{}'.", file_path))
+                    }
+                    Ok(syms) => ToolResult::success(syms.join("\n")),
+                    Err(e) => ToolResult::error(format!("symbols failed: {}", e)),
+                }
+            }
+
+            "diagnostics" => {
+                // Give the server a short window to deliver diagnostics via the
+                // textDocument/publishDiagnostics notification (at most 200 ms).
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+                let diagnostics = {
+                    let manager = lsp_manager_arc.lock().await;
+                    manager.get_diagnostics_for_file(&file_path)
+                };
+
+                if diagnostics.is_empty() {
+                    return ToolResult::success(format!(
+                        "No diagnostics for '{}'.",
+                        file_path
+                    ));
+                }
+
+                let output = claurst_core::lsp::LspManager::format_diagnostics(&diagnostics);
+                ToolResult::success(output)
+            }
+
+            other => ToolResult::error(format!(
+                "Unknown action '{}'. Valid actions: hover, definition, references, symbols, diagnostics",
+                other
+            )),
+        }
     }
 }

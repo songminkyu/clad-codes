@@ -1,19 +1,15 @@
 //! Rustle mascot rendering for ratatui.
 //!
-//! A 3-row Unicode block-art creature. Call `rustle_lines()` to get 4 `Line`
-//! values (3 body rows + 1 blank spacing row) ready for embedding in a Paragraph.
+//! A 5-row Unicode block-art crab-like creature. Call `rustle_lines()` to get
+//! 5 `Line` values (4 body rows + 1 blank spacing row) ready for embedding in
+//! a Paragraph.
 //!
 //! Structure (top to bottom):
-//!   Row 1 — head: narrow top widening downward (▄ creates the taper)
-//!   Row 2 — claws + eyes: widest row, pincers extend from sides (▄ = gap-to-arm)
-//!   Row 3 — body + legs: body tapers into four legs via ▀ gap
-//!
-//! Visual (Default pose):
-//! ```text
-//!  ▄██████▄       head (6 wide top, 8 wide bottom)
-//! █▄██ █ ██▄█     claws + eyes (11 wide, widest)
-//!  ███▀▀███       body→legs (8 wide body, 3+3 legs)
-//! ```
+//!   Row 1 — head: narrow top (5-wide) widening downward (7-wide)
+//!   Row 2 — claws + eyes: widest row, pincers extend from sides
+//!   Row 3 — body
+//!   Row 4 — legs: body tapers into two pairs of legs via ▀ gap
+//!   Row 5 — blank spacing
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -42,62 +38,96 @@ fn eye_bg_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-/// Returns 4 Lines representing the Rustle mascot:
-///   [0] — head row (narrow top widening downward)
+/// Eyeball highlight style: white on black.
+fn eyeball_style() -> Style {
+    Style::default()
+        .fg(Color::White)
+        .bg(Color::Black)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Build spans for the eye section, giving ▘/▝ eyeball characters white
+/// foreground and everything else pink-on-black.
+fn eye_spans(s: &'static str) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut buf_is_eyeball = false;
+
+    for ch in s.chars() {
+        let is_eyeball = ch == '▘' || ch == '▝' || ch == '▀';
+        if is_eyeball != buf_is_eyeball && !buf.is_empty() {
+            let style = if buf_is_eyeball { eyeball_style() } else { eye_bg_style() };
+            spans.push(Span::styled(buf.clone(), style));
+            buf.clear();
+        }
+        buf_is_eyeball = is_eyeball;
+        buf.push(ch);
+    }
+    if !buf.is_empty() {
+        let style = if buf_is_eyeball { eyeball_style() } else { eye_bg_style() };
+        spans.push(Span::styled(buf, style));
+    }
+    spans
+}
+
+/// Returns 5 Lines representing the Rustle mascot:
+///   [0] — head row (5-wide top, 7-wide bottom)
 ///   [1] — claws + eyes row (widest — pincers extend from sides)
-///   [2] — body + legs row (body tapers into four legs)
-///   [3] — blank spacing line
-pub fn rustle_lines(pose: &RustlePose) -> [Line<'static>; 4] {
+///   [2] — body row
+///   [3] — legs row (body tapers into two pairs of legs)
+///   [4] — blank spacing line
+pub fn rustle_lines(pose: &RustlePose) -> [Line<'static>; 5] {
     // Pose varies the claw row (Row 2):
     //   r2l — left claw + head edge (body_style)
-    //   r2e — eye section           (eye_bg_style)
+    //   r2e — eye section with ▘/▝ eyeball highlights
     //   r2r — head edge + right claw (body_style)
-    // Head (Row 1) and legs (Row 3) are fixed across poses.
 
     let (r2l, r2e, r2r) = match pose {
         RustlePose::Default => (
-            "█▄██",     // left claw tip, ▄ gap-to-connect, head edges
-            " █ ",      // centered eyes (space = black pupil, █ = bridge)
-            "██▄█",     // head edges, ▄ connect-to-gap, right claw tip
+            "█▄█",       // left claw tip, ▄ gap-to-connect, head edge
+            "▀ █ ▘",    // keep the left eye as-is; shift only the right eye highlight left
+            "█▄█",       // head edge, ▄ connect-to-gap, right claw tip
         ),
         RustlePose::ArmsUp => (
-            "█▀██",     // ▀ = claw raised (upper half = arm up)
-            " █ ",
-            "██▀█",     // raised right claw
+            "█▀█",       // ▀ = claw raised (upper half = arm up)
+            "▀ █ ▘",    // keep the left eye as-is; shift only the right eye highlight left
+            "█▀█",       // raised right claw
         ),
         RustlePose::LookLeft => (
-            "█▄██",
-            "▐█▐",     // pupils shifted left (▐ = right-half pink, left-half black)
-            "██▄█",
+            "█▄█",
+            "▘ █ ▘",    // single-pixel upper-left quarter blocks = eyes shifted left
+            "█▄█",
         ),
         RustlePose::LookRight => (
-            "█▄██",
-            "▌█▌",     // pupils shifted right (▌ = left-half pink, right-half black)
-            "██▄█",
+            "█▄█",
+            "▝ █ ▝",    // single-pixel upper-right quarter blocks = eyes shifted right
+            "█▄█",
         ),
     };
 
-    // Row 1: head — narrow top, wider bottom
-    // Upper half: ` ██████ ` (6 wide), Lower half: `████████` (8 wide)
+    // Row 1: head — narrow top (5-wide), wider bottom (7-wide)
     let row1 = Line::from(vec![
-        Span::styled(" ▄██████▄ ".to_string(), body_style()),
+        Span::styled("  ▄█████▄  ".to_string(), body_style()),
     ]);
 
-    // Row 2: claws extending from sides + face with eyes (widest row)
-    let row2 = Line::from(vec![
-        Span::styled(r2l.to_string(), body_style()),
-        Span::styled(r2e.to_string(), eye_bg_style()),
-        Span::styled(r2r.to_string(), body_style()),
-    ]);
+    // Row 2: claws extending from sides + face with eyeball highlights (widest row)
+    let mut row2_spans = vec![Span::styled(r2l.to_string(), body_style())];
+    row2_spans.extend(eye_spans(r2e));
+    row2_spans.push(Span::styled(r2r.to_string(), body_style()));
+    let row2 = Line::from(row2_spans);
 
-    // Row 3: body tapering into four legs
-    // Upper half: `████████` (8 wide body), Lower half: `███  ███` (3+2gap+3 legs)
+    // Row 3: body
     let row3 = Line::from(vec![
-        Span::styled(" ███▀▀███ ".to_string(), body_style()),
+        Span::styled(" ████████  ".to_string(), body_style()),
     ]);
 
-    // Row 4: blank spacing
-    let row4 = Line::from("");
+    // Row 4: legs — upper half body (6-wide), lower half two leg pairs (2+gap+2)
+    let row4 = Line::from(vec![
+        Span::styled("  ██▀▀██   ".to_string(), body_style()),
+    ]);
 
-    [row1, row2, row3, row4]
+    // Row 5: blank spacing
+    let row5 = Line::from("");
+
+    [row1, row2, row3, row4, row5]
 }

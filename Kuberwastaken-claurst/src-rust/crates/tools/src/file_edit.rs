@@ -142,6 +142,9 @@ impl Tool for FileEditTool {
             self.name(),
         );
 
+        // Run any configured formatter for this file type.
+        crate::try_format_file(&path.to_string_lossy(), ctx).await;
+
         // Build a diff snippet for the response
         let replacements = if params.replace_all { count } else { 1 };
         let msg = format!(

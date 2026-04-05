@@ -6,7 +6,12 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Widget},
+    widgets::{Block, Borders, Paragraph, Widget},
+};
+
+use crate::overlays::{
+    centered_rect, render_dark_overlay_buf, render_dialog_bg_buf, CLAURST_ACCENT, CLAURST_MUTED,
+    CLAURST_PANEL_BG, CLAURST_PANEL_BORDER, CLAURST_TEXT,
 };
 
 // ---------------------------------------------------------------------------
@@ -202,29 +207,46 @@ pub fn render_mcp_view(state: &McpViewState, area: Rect, buf: &mut Buffer) {
 
     let w = (area.width * 9 / 10).max(50).min(area.width);
     let h = (area.height * 4 / 5).max(15).min(area.height);
-    let x = area.x + (area.width - w) / 2;
-    let y = area.y + (area.height - h) / 2;
-    let dialog = Rect { x, y, width: w, height: h };
-
-    Clear.render(dialog, buf);
-    Block::default()
-        .title(" MCP Servers [Tab: pane, ↑↓: navigate, e: error detail, r: reconnect, Esc: close] ")
-        .borders(Borders::ALL)
-        .style(Style::default().fg(Color::Cyan))
-        .render(dialog, buf);
+    let dialog = centered_rect(w, h, area);
+    render_dark_overlay_buf(buf, area);
+    render_dialog_bg_buf(buf, dialog);
 
     let inner = Rect {
-        x: dialog.x + 1,
+        x: dialog.x + 2,
         y: dialog.y + 1,
-        width: dialog.width.saturating_sub(2),
+        width: dialog.width.saturating_sub(4),
         height: dialog.height.saturating_sub(2),
     };
+
+    if inner.height < 5 {
+        return;
+    }
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let title = Line::from(vec![
+        Span::styled(" MCP", Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(" — {} servers · {} tools", state.servers.len(), state.filtered_tools().len()),
+            Style::default().fg(CLAURST_MUTED),
+        ),
+        Span::styled(
+            format!("{:>width$}", "Esc close", width = inner.width.saturating_sub(26) as usize),
+            Style::default().fg(CLAURST_MUTED),
+        ),
+    ]);
+    Paragraph::new(title)
+        .style(Style::default().bg(CLAURST_PANEL_BG).fg(CLAURST_TEXT))
+        .render(layout[0], buf);
 
     // Split: servers (left 35%) | tools (right 65%)
     let panes = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-        .split(inner);
+        .split(layout[1]);
 
     render_server_list(state, panes[0], buf);
 
@@ -236,12 +258,40 @@ pub fn render_mcp_view(state: &McpViewState, area: Rect, buf: &mut Buffer) {
 
     render_tool_list(state, right_panes[0], buf);
     render_tool_detail(state, right_panes[1], buf);
+
+    let footer = Line::from(vec![
+        Span::styled(" Tab ", Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)),
+        Span::raw("switch pane  "),
+        Span::styled(" / ", Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)),
+        Span::raw("filter tools  "),
+        Span::styled(" e ", Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)),
+        Span::raw("error detail  "),
+        Span::styled(" r ", Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)),
+        Span::raw("reconnect"),
+    ]);
+    Paragraph::new(footer)
+        .style(Style::default().bg(CLAURST_PANEL_BG).fg(CLAURST_MUTED))
+        .render(layout[2], buf);
 }
 
 fn render_server_list(state: &McpViewState, area: Rect, buf: &mut Buffer) {
     let focused = state.active_pane == McpViewPane::ServerList;
-    let border_style = if focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) };
-    Block::default().title(" Servers ").borders(Borders::ALL).border_style(border_style).render(area, buf);
+    let border_style = if focused {
+        Style::default().fg(CLAURST_ACCENT)
+    } else {
+        Style::default().fg(CLAURST_PANEL_BORDER)
+    };
+    Block::default()
+        .title(Span::styled(
+            " Servers ",
+            Style::default()
+                .fg(if focused { CLAURST_ACCENT } else { CLAURST_MUTED })
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .style(Style::default().bg(CLAURST_PANEL_BG).fg(CLAURST_TEXT))
+        .render(area, buf);
 
     let inner = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: area.height.saturating_sub(2) };
 
@@ -261,20 +311,27 @@ fn render_server_list(state: &McpViewState, area: Rect, buf: &mut Buffer) {
         for (idx, server) in group {
             if *row >= area.height { break; }
             let sel = *idx == selected && focused;
-            let prefix = if sel { "> " } else { "  " };
-            let style = if sel { Style::default().add_modifier(Modifier::BOLD) } else { Style::default() };
-            let line = Line::from(vec![
-                Span::styled(prefix, style),
-                Span::styled(server.status.badge().to_string(), Style::default().fg(server.status.color())),
-                Span::styled(format!(" {}", server.name), style),
-                Span::styled(
-                    format!(
-                        "  {} tools  {} res  {} prompts",
-                        server.tool_count, server.resource_count, server.prompt_count
-                    ),
-                    Style::default().fg(Color::DarkGray),
+            let prefix = if sel { "› " } else { "  " };
+            let row_text = pad_line(
+                &format!(
+                    "{}{} {}  {} tools  {} res  {} prompts",
+                    prefix,
+                    server.status.badge(),
+                    server.name,
+                    server.tool_count,
+                    server.resource_count,
+                    server.prompt_count
                 ),
-            ]);
+                area.width,
+            );
+            let line = Line::from(vec![Span::styled(
+                row_text,
+                if sel {
+                    Style::default().fg(Color::Black).bg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(CLAURST_TEXT)
+                },
+            )]);
             Paragraph::new(line).render(Rect { x: area.x, y: area.y + *row, width: area.width, height: 1 }, buf);
             if let Some(err) = &server.error_message {
                 *row += 1;
@@ -295,15 +352,32 @@ fn render_server_list(state: &McpViewState, area: Rect, buf: &mut Buffer) {
 
 fn render_tool_list(state: &McpViewState, area: Rect, buf: &mut Buffer) {
     let focused = state.active_pane == McpViewPane::ToolList || state.active_pane == McpViewPane::ToolDetail;
-    let border_style = if focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) };
-    Block::default().title(" Tools ").borders(Borders::ALL).border_style(border_style).render(area, buf);
+    let border_style = if focused {
+        Style::default().fg(CLAURST_ACCENT)
+    } else {
+        Style::default().fg(CLAURST_PANEL_BORDER)
+    };
+    Block::default()
+        .title(Span::styled(
+            " Tools ",
+            Style::default()
+                .fg(if focused { CLAURST_ACCENT } else { CLAURST_MUTED })
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .style(Style::default().bg(CLAURST_PANEL_BG).fg(CLAURST_TEXT))
+        .render(area, buf);
 
     let inner = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: area.height.saturating_sub(2) };
 
     // Search bar
     let search_line = Line::from(vec![
-        Span::styled("/ ", Style::default().fg(Color::DarkGray)),
-        Span::raw(state.tool_search.clone()),
+        Span::styled("/ ", Style::default().fg(CLAURST_ACCENT)),
+        Span::styled(
+            if state.tool_search.is_empty() { "filter tools".to_string() } else { state.tool_search.clone() },
+            Style::default().fg(if state.tool_search.is_empty() { CLAURST_MUTED } else { CLAURST_TEXT }),
+        ),
     ]);
     Paragraph::new(search_line).render(Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 }, buf);
 
@@ -315,19 +389,19 @@ fn render_tool_list(state: &McpViewState, area: Rect, buf: &mut Buffer) {
     for (i, tool) in tools[start..].iter().enumerate() {
         if i >= max_visible { break; }
         let sel = start + i == state.selected_tool;
-        let prefix = if sel { "> " } else { "  " };
-        let style = if sel { Style::default().add_modifier(Modifier::BOLD) } else { Style::default() };
-
         let avail = list_area.width.saturating_sub(20) as usize;
         let name = format!("{}:{}", tool.server, tool.name);
         let name_short: String = name.chars().take(avail).collect();
         let desc: String = tool.description.chars().take(30).collect();
-
-        let line = Line::from(vec![
-            Span::styled(prefix, style),
-            Span::styled(name_short, style.fg(Color::Cyan)),
-            Span::styled(format!("  {}", desc), Style::default().fg(Color::DarkGray)),
-        ]);
+        let row = pad_line(&format!("{}  {}", name_short, desc), list_area.width);
+        let line = Line::from(vec![Span::styled(
+            row,
+            if sel {
+                Style::default().fg(Color::Black).bg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(CLAURST_TEXT)
+            },
+        )]);
         Paragraph::new(line).render(
             Rect { x: list_area.x, y: list_area.y + i as u16, width: list_area.width, height: 1 },
             buf,
@@ -337,7 +411,11 @@ fn render_tool_list(state: &McpViewState, area: Rect, buf: &mut Buffer) {
 
 fn render_tool_detail(state: &McpViewState, area: Rect, buf: &mut Buffer) {
     let focused = state.active_pane == McpViewPane::ToolDetail;
-    let border_style = if focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) };
+    let border_style = if focused {
+        Style::default().fg(CLAURST_ACCENT)
+    } else {
+        Style::default().fg(CLAURST_PANEL_BORDER)
+    };
 
     // If error is expanded, show full error text in this pane
     if state.error_expanded {
@@ -347,6 +425,7 @@ fn render_tool_detail(state: &McpViewState, area: Rect, buf: &mut Buffer) {
                     .title(" Error Detail [e: close] ")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Red))
+                    .style(Style::default().bg(CLAURST_PANEL_BG).fg(CLAURST_TEXT))
                     .render(area, buf);
                 let inner = Rect {
                     x: area.x + 1,
@@ -366,7 +445,17 @@ fn render_tool_detail(state: &McpViewState, area: Rect, buf: &mut Buffer) {
         }
     }
 
-    Block::default().title(" Tool Detail ").borders(Borders::ALL).border_style(border_style).render(area, buf);
+    Block::default()
+        .title(Span::styled(
+            " Tool Detail ",
+            Style::default()
+                .fg(if focused { CLAURST_ACCENT } else { CLAURST_MUTED })
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .style(Style::default().bg(CLAURST_PANEL_BG).fg(CLAURST_TEXT))
+        .render(area, buf);
 
     let inner = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: area.height.saturating_sub(2) };
 
@@ -380,7 +469,10 @@ fn render_tool_detail(state: &McpViewState, area: Rect, buf: &mut Buffer) {
 
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled(format!("{}:{}", tool.server, tool.name), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{}:{}", tool.server, tool.name),
+            Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD),
+        ),
     ]));
     lines.push(Line::default());
     for line in tool.description.lines() {
@@ -410,7 +502,7 @@ fn render_tool_detail(state: &McpViewState, area: Rect, buf: &mut Buffer) {
         if !server.resources.is_empty() {
             lines.push(Line::from(vec![Span::styled(
                 "Resources:",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(CLAURST_MUTED),
             )]));
             for resource in server.resources.iter().take(3) {
                 lines.push(Line::from(vec![Span::styled(
@@ -423,7 +515,7 @@ fn render_tool_detail(state: &McpViewState, area: Rect, buf: &mut Buffer) {
         if !server.prompts.is_empty() {
             lines.push(Line::from(vec![Span::styled(
                 "Prompts:",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(CLAURST_MUTED),
             )]));
             for prompt in server.prompts.iter().take(3) {
                 lines.push(Line::from(vec![Span::styled(
@@ -437,6 +529,16 @@ fn render_tool_detail(state: &McpViewState, area: Rect, buf: &mut Buffer) {
     Paragraph::new(lines)
         .wrap(ratatui::widgets::Wrap { trim: false })
         .render(inner, buf);
+}
+
+fn pad_line(text: &str, width: u16) -> String {
+    let max_width = width as usize;
+    let mut clipped: String = text.chars().take(max_width).collect();
+    let visible = clipped.chars().count();
+    if visible < max_width {
+        clipped.push_str(&" ".repeat(max_width - visible));
+    }
+    clipped
 }
 
 // ---------------------------------------------------------------------------
@@ -539,5 +641,4 @@ mod tests {
         assert_eq!(terminal.backend().buffer().content(), before.content());
     }
 }
-
 

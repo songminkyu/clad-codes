@@ -17,11 +17,14 @@ use std::sync::Arc;
 // Sub-modules – each contains a full tool implementation.
 pub mod ask_user;
 pub mod bash;
+pub mod pty_bash;
 pub mod brief;
 pub mod config_tool;
 pub mod cron;
 pub mod enter_plan_mode;
 pub mod exit_plan_mode;
+pub mod apply_patch;
+pub mod batch_edit;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
@@ -47,15 +50,20 @@ pub mod repl_tool;
 pub mod synthetic_output;
 pub mod team_tool;
 pub mod remote_trigger;
+pub mod formatter;
 
 // Re-exports for convenience.
+pub use formatter::try_format_file;
 pub use ask_user::AskUserQuestionTool;
 pub use bash::BashTool;
+pub use pty_bash::PtyBashTool;
 pub use brief::BriefTool;
 pub use config_tool::ConfigTool;
 pub use cron::{CronCreateTool, CronDeleteTool, CronListTool};
 pub use enter_plan_mode::EnterPlanModeTool;
 pub use exit_plan_mode::ExitPlanModeTool;
+pub use apply_patch::ApplyPatchTool;
+pub use batch_edit::BatchEditTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
@@ -165,6 +173,11 @@ impl ShellState {
 static SHELL_STATE_REGISTRY: once_cell::sync::Lazy<dashmap::DashMap<String, Arc<parking_lot::Mutex<ShellState>>>> =
     once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
+/// Process-global registry of `SnapshotManager` instances keyed by session_id.
+/// Used by tools to record pre-write snapshots and by `/undo` to revert them.
+static SNAPSHOT_REGISTRY: once_cell::sync::Lazy<dashmap::DashMap<String, Arc<parking_lot::Mutex<claurst_core::SnapshotManager>>>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+
 /// Return the persistent `ShellState` for the given session, creating one if needed.
 pub fn session_shell_state(session_id: &str) -> Arc<parking_lot::Mutex<ShellState>> {
     SHELL_STATE_REGISTRY
@@ -176,6 +189,19 @@ pub fn session_shell_state(session_id: &str) -> Arc<parking_lot::Mutex<ShellStat
 /// Remove the shell state for a session (e.g. when the session ends).
 pub fn clear_session_shell_state(session_id: &str) {
     SHELL_STATE_REGISTRY.remove(session_id);
+}
+
+/// Return the persistent `SnapshotManager` for the given session, creating one if needed.
+pub fn session_snapshot(session_id: &str) -> Arc<parking_lot::Mutex<claurst_core::SnapshotManager>> {
+    SNAPSHOT_REGISTRY
+        .entry(session_id.to_string())
+        .or_insert_with(|| Arc::new(parking_lot::Mutex::new(claurst_core::SnapshotManager::new())))
+        .clone()
+}
+
+/// Remove the snapshot manager for a session (e.g. when the session ends).
+pub fn clear_session_snapshot(session_id: &str) {
+    SNAPSHOT_REGISTRY.remove(session_id);
 }
 
 /// Shared context passed to every tool invocation.
@@ -312,10 +338,12 @@ pub trait Tool: Send + Sync {
 /// Return all built-in tools (excluding AgentTool, which lives in cc-query).
 pub fn all_tools() -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(BashTool),
+        Box::new(PtyBashTool),
         Box::new(FileReadTool),
         Box::new(FileEditTool),
         Box::new(FileWriteTool),
+        Box::new(BatchEditTool),
+        Box::new(ApplyPatchTool),
         Box::new(GlobTool),
         Box::new(GrepTool),
         Box::new(WebFetchTool),
@@ -551,7 +579,7 @@ mod tests {
 
     #[test]
     fn test_bash_tool_permission_level() {
-        assert_eq!(BashTool.permission_level(), PermissionLevel::Execute);
+        assert_eq!(PtyBashTool.permission_level(), PermissionLevel::Execute);
     }
 
     #[test]
@@ -573,7 +601,7 @@ mod tests {
 
     #[test]
     fn test_tool_to_definition() {
-        let def = BashTool.to_definition();
+        let def = PtyBashTool.to_definition();
         assert_eq!(def.name, "Bash");
         assert!(!def.description.is_empty());
         assert!(def.input_schema.is_object());

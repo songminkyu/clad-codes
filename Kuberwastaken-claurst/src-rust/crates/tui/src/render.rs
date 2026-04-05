@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use crate::agents_view::render_agents_menu;
 use crate::context_viz::render_context_viz;
 use crate::export_dialog::render_export_dialog;
-use crate::app::{App, SystemAnnotation, SystemMessageStyle, ToolStatus};
+use crate::app::{App, ContextMenuKind, SystemAnnotation, SystemMessageStyle, ToolStatus};
 use crate::rustle::{rustle_lines, RustlePose};
 use crate::diff_viewer::render_diff_dialog;
 use crate::model_picker::render_model_picker;
@@ -21,6 +21,9 @@ use crate::memory_update_notification::render_memory_update_notification;
 use crate::invalid_config_dialog::render_invalid_config_dialog;
 use crate::bypass_permissions_dialog::render_bypass_permissions_dialog;
 use crate::onboarding_dialog::render_onboarding_dialog;
+use crate::dialog_select::render_dialog_select;
+use crate::key_input_dialog::render_key_input_dialog;
+use crate::device_auth_dialog::render_device_auth_dialog;
 use crate::elicitation_dialog::render_elicitation_dialog;
 use crate::figures;
 use crate::hooks_config_menu::render_hooks_config_menu;
@@ -30,6 +33,7 @@ use crate::messages::{RenderContext, render_markdown, render_message};
 use crate::notifications::render_notification_banner;
 use crate::overlays::{
     render_global_search, render_help_overlay, render_history_search_overlay, render_rewind_flow,
+    CLAURST_ACCENT,
 };
 use crate::plugin_views::render_plugin_hints;
 use crate::privacy_screen::render_privacy_screen;
@@ -72,6 +76,45 @@ fn spinner_color(app: &App) -> Color {
         }
     }
     Color::Yellow
+}
+
+fn is_modal_open(app: &App) -> bool {
+    app.permission_request.is_some()
+        || app.rewind_flow.visible
+        || app.tasks_overlay.visible
+        || app.help_overlay.visible
+        || app.show_help
+        || app.history_search_overlay.visible
+        || app.history_search.is_some()
+        || app.settings_screen.visible
+        || app.theme_screen.visible
+        || app.privacy_screen.visible
+        || app.stats_dialog.open
+        || app.mcp_view.open
+        || app.agents_menu.open
+        || app.diff_viewer.open
+        || app.global_search.open
+        || app.feedback_survey.visible
+        || app.memory_file_selector.visible
+        || app.hooks_config_menu.visible
+        || app.overage_upsell.visible
+        || app.voice_mode_notice.visible
+        || app.memory_update_notification.visible
+        || app.desktop_upsell.visible
+        || app.invalid_config_dialog.visible
+        || app.bypass_permissions_dialog.visible
+        || app.onboarding_dialog.visible
+        || app.connect_dialog.visible
+        || app.key_input_dialog.visible
+        || app.device_auth_dialog.visible
+        || app.command_palette.visible
+        || app.elicitation.visible
+        || app.model_picker.visible
+        || app.session_browser.visible
+        || app.session_branching.visible
+        || app.export_dialog.visible
+        || app.context_viz.visible
+        || app.mcp_approval.visible
 }
 
 // -----------------------------------------------------------------------
@@ -254,6 +297,7 @@ struct RenderedLineItem {
     line: Line<'static>,
     search_text: String,
     is_header: bool,
+    message_index: Option<usize>,
 }
 
 impl VirtualItem for RenderedLineItem {
@@ -326,6 +370,7 @@ thread_local! {
 /// Render the entire application into the current frame.
 pub fn render_app(frame: &mut Frame, app: &App) {
     let size = frame.area();
+    app.last_selectable_area.set(size);
 
     // Fill the entire frame with a black background so the terminal's default
     // color (blue on Windows) doesn't bleed through cells not covered by widgets.
@@ -346,7 +391,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     } else {
         0
     };
-    let prompt_height = input_height(&app.prompt_input);
+    let prompt_height = input_height(&app.prompt_input) + 1; // +1 for model/mode status line
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -366,6 +411,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_status_row(frame, app, chunks[2]);
     }
     render_input(frame, app, chunks[3], prompt_focused);
+    app.last_input_area.set(chunks[3]);
     if suggestions_height > 0 {
         render_prompt_suggestions(frame, app, chunks[4]);
     }
@@ -495,7 +541,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_desktop_upsell_startup(&app.desktop_upsell, size, frame.buffer_mut());
     }
 
-    // Invalid config/settings dialog (shown when settings.json or CLAUDE.md is malformed)
+    // Invalid config/settings dialog (shown when settings.json or AGENTS.md is malformed)
     if app.invalid_config_dialog.visible {
         render_invalid_config_dialog(frame, &app.invalid_config_dialog, size);
     }
@@ -508,6 +554,26 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     // First-launch onboarding dialog (shown after bypass dialog, below elicitation)
     if app.onboarding_dialog.visible {
         render_onboarding_dialog(frame, &app.onboarding_dialog, size);
+    }
+
+    // Connect-a-provider dialog (/connect command)
+    if app.connect_dialog.visible {
+        render_dialog_select(frame, &app.connect_dialog, size);
+    }
+
+    // API key input dialog (opened from /connect for key-based providers)
+    if app.key_input_dialog.visible {
+        render_key_input_dialog(frame, &app.key_input_dialog, size);
+    }
+
+    // Device code / browser auth dialog (GitHub Copilot, Anthropic OAuth)
+    if app.device_auth_dialog.visible {
+        render_device_auth_dialog(frame, &app.device_auth_dialog, size);
+    }
+
+    // Ctrl+K command palette
+    if app.command_palette.visible {
+        render_dialog_select(frame, &app.command_palette, size);
     }
 
     // MCP elicitation dialog (highest priority modal — rendered last to sit on top)
@@ -554,25 +620,16 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_mcp_approval_dialog(&app.mcp_approval, size, frame.buffer_mut());
     }
 
-    // Notification banner (bottom of overlays stack so it's always visible)
-    if !app.notifications.is_empty() {
+    let modal_active = is_modal_open(app);
+
+    // Notification banner stays out of the way when a modal owns the screen.
+    if !modal_active && !app.notifications.is_empty() {
         render_notification_banner(frame, &app.notifications, size);
     }
 
     // ---- Text selection highlight (topmost post-pass) ---------------------
-    // Only show selection when no full-screen modal overlay is active.
-    let modal_active = app.settings_screen.visible
-        || app.theme_screen.visible
-        || app.privacy_screen.visible
-        || app.bypass_permissions_dialog.visible
-        || app.rewind_flow.visible
-        || app.help_overlay.visible
-        || app.global_search.open;
-    if !modal_active {
-        apply_selection_highlight(frame, app);
-        // Render context menu on top of selection
-        render_context_menu(frame, app);
-    }
+    apply_selection_highlight(frame, app);
+    render_context_menu(frame, app);
 }
 
 /// Post-render pass: invert colours on selected cells and extract the
@@ -586,30 +643,37 @@ fn apply_selection_highlight(frame: &mut Frame, app: &App) {
         return;
     }
 
-    // Restrict selection to message pane area only
-    let msg_area = app.last_msg_area.get();
-
-    // Validate selection is within message area bounds
-    if anchor.0 < msg_area.x
-        || anchor.0 >= msg_area.x.saturating_add(msg_area.width)
-        || anchor.1 < msg_area.y
-        || anchor.1 >= msg_area.y.saturating_add(msg_area.height)
-    {
-        // Anchor is outside message area — clear selection
+    let selectable_area = app.last_selectable_area.get();
+    if selectable_area.width == 0 || selectable_area.height == 0 {
         return;
     }
 
-    let msg_max_row = msg_area.y.saturating_add(msg_area.height).saturating_sub(1);
-    let msg_max_col = msg_area.x.saturating_add(msg_area.width).saturating_sub(1);
+    // Validate selection is within selectable bounds
+    if anchor.0 < selectable_area.x
+        || anchor.0 >= selectable_area.x.saturating_add(selectable_area.width)
+        || anchor.1 < selectable_area.y
+        || anchor.1 >= selectable_area.y.saturating_add(selectable_area.height)
+    {
+        return;
+    }
 
-    // Clamp anchor and focus to message pane bounds
+    let max_row = selectable_area
+        .y
+        .saturating_add(selectable_area.height)
+        .saturating_sub(1);
+    let max_col = selectable_area
+        .x
+        .saturating_add(selectable_area.width)
+        .saturating_sub(1);
+
+    // Clamp anchor and focus to selectable bounds
     let anchor = (
-        anchor.0.clamp(msg_area.x, msg_max_col),
-        anchor.1.clamp(msg_area.y, msg_max_row),
+        anchor.0.clamp(selectable_area.x, max_col),
+        anchor.1.clamp(selectable_area.y, max_row),
     );
     let focus = (
-        focus.0.clamp(msg_area.x, msg_max_col),
-        focus.1.clamp(msg_area.y, msg_max_row),
+        focus.0.clamp(selectable_area.x, max_col),
+        focus.1.clamp(selectable_area.y, max_row),
     );
 
     // Normalise so start ≤ end (row-major order).
@@ -621,10 +685,10 @@ fn apply_selection_highlight(frame: &mut Frame, app: &App) {
 
     let buf = frame.buffer_mut();
     let mut text = String::new();
-    let last_row = end.1.min(msg_max_row);
+    let last_row = end.1.min(max_row);
     for row in start.1..=last_row {
-        let col_from = if row == start.1 { start.0 } else { msg_area.x };
-        let col_to = if row == end.1 { end.0 } else { msg_max_col };
+        let col_from = if row == start.1 { start.0 } else { selectable_area.x };
+        let col_to = if row == end.1 { end.0 } else { max_col };
         for col in col_from..=col_to {
             if let Some(cell) = buf.cell_mut((col, row)) {
                 let sym = cell.symbol().to_owned();
@@ -649,20 +713,22 @@ fn apply_selection_highlight(frame: &mut Frame, app: &App) {
 /// Render a right-click context menu at the specified position.
 fn render_context_menu(frame: &mut Frame, app: &App) {
     if let Some(menu) = app.context_menu_state {
-        let items = [
-            ("Copy", !app.selection_text.borrow().is_empty()),
-            ("Copy as MD", !app.messages.is_empty()),
-            ("Copy Plain", !app.messages.is_empty()),
-            ("Copy Code", !app.messages.is_empty()),
-            ("Copy JSON", !app.messages.is_empty()),
-            ("Paste", true),
-            ("Cut", !app.selection_text.borrow().is_empty()),
-            ("Select All", true),
-            ("Clear", app.selection_anchor.is_some()),
-        ];
+        let selection_present = !app.selection_text.borrow().trim().is_empty();
+        let items: Vec<(&str, bool)> = match menu.kind {
+            ContextMenuKind::Message { message_index } => vec![
+                ("Copy", app.messages.get(message_index).is_some()),
+                ("Fork new chat", app.messages.get(message_index).is_some()),
+            ],
+            ContextMenuKind::Selection => vec![("Copy", selection_present)],
+        };
 
-        let menu_height = (items.len() as u16).min(15); // Limit to 15 items max
-        let menu_width = 16; // Increased width for longer labels
+        let menu_height = (items.len() as u16).saturating_add(2);
+        let menu_width = items
+            .iter()
+            .map(|(label, _)| label.len())
+            .max()
+            .unwrap_or(4)
+            .saturating_add(4) as u16;
 
         // Clamp menu position to screen bounds
         let screen = frame.area();
@@ -680,7 +746,8 @@ fn render_context_menu(frame: &mut Frame, app: &App) {
         let menu_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .style(Style::default().fg(Color::White).bg(Color::DarkGray));
+            .style(Style::default().fg(Color::White).bg(Color::Rgb(24, 24, 30)))
+            .border_style(Style::default().fg(CLAURST_ACCENT));
         menu_block.render(menu_area, frame.buffer_mut());
 
         // Render menu items
@@ -702,17 +769,18 @@ fn render_context_menu(frame: &mut Frame, app: &App) {
             let fg_color = if *enabled {
                 if is_selected { Color::Black } else { Color::White }
             } else {
-                Color::Gray // Disabled items appear grayed
-            };
-
-            let bg_color = if is_selected {
-                if *enabled { Color::Cyan } else { Color::DarkGray }
-            } else {
                 Color::DarkGray
             };
 
+            let bg_color = if is_selected {
+                if *enabled { CLAURST_ACCENT } else { Color::Rgb(24, 24, 30) }
+            } else {
+                Color::Rgb(24, 24, 30)
+            };
+
             let style = Style::default().fg(fg_color).bg(bg_color);
-            let padded_label = format!(" {:<12} ", label);
+            let padded_label =
+                format!(" {:<width$} ", label, width = menu_width.saturating_sub(2) as usize);
 
             if let Some(cell) = frame.buffer_mut().cell_mut((inner.x, y)) {
                 cell.set_symbol(&padded_label[0..1.min(padded_label.len())]);
@@ -789,6 +857,8 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
             render_startup_notices(frame, app, na);
         }
     } else if app.messages.is_empty() && app.streaming_text.is_empty() {
+        app.last_msg_area.set(Rect::default());
+        app.message_row_map.borrow_mut().clear();
         render_welcome_box(frame, app, content_area);
         return;
     }
@@ -837,6 +907,19 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
         max_scroll.saturating_sub(app.scroll_offset)
     };
 
+    let visible_rows: std::collections::HashMap<u16, usize> = lines
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(msg_area.height as usize)
+        .filter_map(|(idx, item)| {
+            item.message_index.map(|message_index| {
+                (msg_area.y.saturating_add((idx.saturating_sub(scroll)) as u16), message_index)
+            })
+        })
+        .collect();
+    *app.message_row_map.borrow_mut() = visible_rows;
+
     // No border — messages render directly into the area.
     let mut list = VirtualList::new();
     list.viewport_height = msg_area.height;
@@ -849,7 +932,22 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
 
     list.render(msg_area, frame.buffer_mut());
 
-    // "â†“ N new messages" indicator when scrolled up and new messages arrived.
+    // Scrollbar: show only when content overflows the viewport.
+    if content_height > visible_height {
+        use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+
+        let mut scrollbar_state = ScrollbarState::new(content_height as usize)
+            .position(scroll)
+            .viewport_content_length(visible_height as usize);
+
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .thumb_style(Style::default().fg(Color::Rgb(233, 30, 99)))  // pink thumb
+            .track_style(Style::default().fg(Color::Rgb(40, 40, 50)));  // dark track
+
+        frame.render_stateful_widget(scrollbar, msg_area, &mut scrollbar_state);
+    }
+
+    // “â†” N new messages” indicator when scrolled up and new messages arrived.
     if app.new_messages_while_scrolled > 0 && msg_area.height > 4 && msg_area.width > 20 {
         let indicator = format!(
             " \u{2193} {} new message{} ",
@@ -926,11 +1024,16 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         } else {
             let tool_names = build_tool_names(&app.messages);
             let mut raw: Vec<Line> = Vec::new();
+            let mut message_indices: Vec<Option<usize>> = Vec::new();
             let mut header_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
             let total = app.messages.len();
             for i in 0..=total {
                 for ann in app.system_annotations.iter().filter(|a| a.after_index == i) {
+                    let ann_start = raw.len();
                     render_system_annotation_lines(&mut raw, ann, width as usize);
+                    message_indices.extend(
+                        std::iter::repeat(None).take(raw.len().saturating_sub(ann_start)),
+                    );
                 }
                 if i < total {
                     // Mark the first line of each message as a section header
@@ -939,6 +1042,9 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
                     if raw.len() > msg_start {
                         header_indices.insert(msg_start);
                     }
+                    message_indices.extend(
+                        std::iter::repeat(Some(i)).take(raw.len().saturating_sub(msg_start)),
+                    );
                 }
             }
             let items: Vec<RenderedLineItem> = raw
@@ -947,6 +1053,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
                 .map(|(idx, line)| RenderedLineItem {
                     search_text: flatten_line_text(&line),
                     is_header: header_indices.contains(&idx),
+                    message_index: message_indices.get(idx).copied().flatten(),
                     line,
                 })
                 .collect();
@@ -1000,6 +1107,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
     items.extend(live.into_iter().map(|line| RenderedLineItem {
         search_text: flatten_line_text(&line),
         is_header: false,
+        message_index: None,
         line,
     }));
     items
@@ -1090,8 +1198,6 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
         "Welcome back!".to_string()
     };
     let rustle = rustle_lines(&RustlePose::Default);
-    let model_line = format!("{} \u{00b7} API Usage Billing", app.model_name);
-
     let mut left_lines: Vec<Line> = Vec::new();
     left_lines.push(Line::from(Span::styled(
         welcome_msg,
@@ -1107,10 +1213,22 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
         left_lines.push(Line::from(spans));
     }
     left_lines.push(Line::from(""));
-    left_lines.push(Line::from(Span::styled(
-        model_line,
-        Style::default().fg(Color::DarkGray),
-    )));
+    // Only show model line if credentials are configured
+    if app.has_credentials {
+        let model_display = if let Some((provider, model)) = app.model_name.split_once('/') {
+            if provider == "anthropic" {
+                model.to_string()
+            } else {
+                format!("{} [{}]", model, provider)
+            }
+        } else {
+            app.model_name.clone()
+        };
+        left_lines.push(Line::from(Span::styled(
+            format!("{} \u{00b7} API Usage", model_display),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
     left_lines.push(Line::from(Span::styled(
         cwd,
         Style::default().fg(Color::DarkGray),
@@ -1121,7 +1239,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     // --- Right column ---
     let tip_text = claurst_core::tips::select_tip(0)
         .map(|t| t.content.to_string())
-        .unwrap_or_else(|| "Run /init to create a CLAUDE.md file with instructions for Claude".to_string());
+        .unwrap_or_else(|| "Edit AGENTS.md to add instructions for Claurst".to_string());
 
     let mut right_lines: Vec<Line> = Vec::new();
     right_lines.push(Line::from(Span::styled(
@@ -1358,9 +1476,58 @@ fn render_tool_block_lines(lines: &mut Vec<Line<'static>>, block: &crate::app::T
 // -----------------------------------------------------------------------
 
 fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
+    // Split: 1-row model/mode status line + remaining rows for the prompt input.
+    let (status_area, input_area) = if area.height > 2 {
+        let splits = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(area);
+        (Some(splits[0]), splits[1])
+    } else {
+        // Not enough room for the extra line — skip the status row.
+        (None, area)
+    };
+
+    // Render model + agent mode status line above the prompt.
+    if let Some(status_area) = status_area {
+        let agent_mode = match app.agent_mode.as_deref() {
+            Some(m) => m,
+            None if app.plan_mode => "plan",
+            _ => "build",
+        };
+
+        let pink = Color::Rgb(233, 30, 99);
+        let dim = Color::Rgb(80, 80, 80);
+
+        let status_line = if app.has_credentials {
+            // Show model (strip provider prefix for compact display).
+            let model_short = if let Some((_, model)) = app.model_name.split_once('/') {
+                model
+            } else {
+                &app.model_name
+            };
+            Line::from(vec![
+                Span::styled(format!(" {} ", model_short), Style::default().fg(Color::White)),
+                Span::styled("\u{00b7}", Style::default().fg(dim)),
+                Span::styled(format!(" {} ", agent_mode), Style::default().fg(pink)),
+                Span::styled("\u{00b7}", Style::default().fg(dim)),
+                Span::styled(" Ctrl+A: model  Ctrl+K: commands", Style::default().fg(dim)),
+            ])
+        } else {
+            // No credentials — show hint instead of a stale model name
+            Line::from(vec![
+                Span::styled(" /connect", Style::default().fg(pink)),
+                Span::styled(" to set up a provider", Style::default().fg(dim)),
+                Span::styled("  \u{00b7}  ", Style::default().fg(dim)),
+                Span::styled("Ctrl+K: commands", Style::default().fg(dim)),
+            ])
+        };
+        frame.render_widget(Paragraph::new(vec![status_line]), status_area);
+    }
+
     render_prompt_input(
         &app.prompt_input,
-        area,
+        input_area,
         frame.buffer_mut(),
         focused,
         if app.is_streaming {
@@ -1626,15 +1793,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         spans
     };
 
-    // Right side: notifications take priority, otherwise build status parts
-    let right_spans: Vec<Span> = if let Some(notification) = app.notifications.current() {
-        vec![Span::styled(
-            notification.message.clone(),
-            Style::default()
-                .fg(notification.kind.color())
-                .add_modifier(Modifier::BOLD),
-        )]
-    } else {
+    // Right side: status metrics and lightweight badges.
+    let right_spans: Vec<Span> = {
         let mut parts: Vec<Span> = Vec::new();
 
         // 1. Context window usage — show "N% until auto-compact" mirroring TS TokenWarning
@@ -1746,7 +1906,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             }
             parts.push(Span::styled(
                 format!("[{}]", badge),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(CLAURST_ACCENT),
             ));
         }
 
@@ -1784,6 +1944,17 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 .filter(|c| c.is_ascii_graphic() || *c == ' ')
                 .collect();
             parts.push(Span::styled(clean, Style::default().fg(Color::DarkGray)));
+        }
+
+        // 8b. Update available indicator — shown when a newer version was found.
+        if let Some(ref version) = app.update_available {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            parts.push(Span::styled(
+                format!("↑ v{} available — /upgrade", version),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
         }
 
         // 8. Bridge badge

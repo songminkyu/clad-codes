@@ -98,6 +98,7 @@ glob = { workspace = true }
 tokio-util = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
+rusqlite = { workspace = true }
 # Optional: real audio capture for voice input (gated behind the `voice` feature)
 cpal = { version = "0.15", optional = true }
 

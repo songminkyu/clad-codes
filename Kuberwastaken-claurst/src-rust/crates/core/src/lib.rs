@@ -3,14 +3,33 @@
 //
 // All sub-modules are defined inline below.
 
+// Branded provider / model identifier newtypes.
+pub mod provider_id;
+pub use provider_id::{ProviderId, ModelId};
+
 // Session transcript persistence (JSONL, matches TS sessionStorage.ts schema).
 pub mod session_storage;
+
+// Session sharing — HTTP upload to a share endpoint + local text export.
+pub mod session_share;
+pub use session_share::{share_session, export_session_text};
+
+// SQLite-backed session storage (faster alternative to JSONL).
+pub mod sqlite_storage;
+pub use sqlite_storage::{SqliteSessionStore, SessionSummary};
 
 // Attachment pipeline — assembles per-turn context attachments (T1-6).
 pub mod attachments;
 
 // Git utilities (T4-3).
 pub mod git_utils;
+
+// Credential storage for provider API keys and OAuth tokens.
+pub mod auth_store;
+pub use auth_store::{AuthStore, StoredCredential};
+
+// GitHub Device Code Flow (RFC 8628) for OAuth device authorization.
+pub mod device_code;
 
 // Utility modules ported from src/utils/
 pub mod token_budget;
@@ -24,7 +43,7 @@ pub mod auto_mode;
 pub mod remote_session;
 pub mod cloud_session;
 
-// CLAUDE.md hierarchical memory loading (T4-1).
+// AGENTS.md hierarchical memory loading (T4-1).
 pub mod claudemd;
 
 // Message manipulation utilities (T4-2).
@@ -33,11 +52,22 @@ pub mod message_utils;
 // Per-session file modification history (T4-6).
 pub mod file_history;
 
+// Snapshot/undo system — tracks file changes per session for /undo support.
+pub mod snapshot;
+
 // Feature flag management via GrowthBook.
 pub mod feature_flags;
 
 // MCP resource prompt template rendering with variable substitution.
 pub mod mcp_templates;
+
+// IDE environment detection (VS Code, Cursor, JetBrains, …).
+pub mod ide;
+pub use ide::{IdeKind, detect_ide};
+
+// Background update checker — compares running version against GitHub releases.
+pub mod update_check;
+pub use update_check::{check_for_updates, UpdateInfo};
 
 // Re-export commonly used types at the crate root
 pub use error::{ClaudeError, Result};
@@ -45,10 +75,15 @@ pub use types::{
     ContentBlock, ImageSource, DocumentSource, CitationsConfig, Message, MessageContent,
     MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
 };
-pub use config::{Config, McpServerConfig, OutputFormat, PermissionMode, Settings, Theme};
+pub use config::{AgentDefinition, Config, CommandTemplate, FormatterConfig, McpServerConfig, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, default_agents, strip_jsonc_comments, substitute_env_vars};
+
+// Skill discovery: filesystem and git URL skill loading.
+pub mod skill_discovery;
+pub use skill_discovery::{DiscoveredSkill, discover_skills, parse_skill_file};
 pub use cost::CostTracker;
 pub use history::ConversationSession;
 pub use feature_flags::FeatureFlagManager;
+pub use snapshot::SnapshotManager;
 pub use permissions::{
     AutoPermissionHandler, InteractivePermissionHandler,
     ManagedAutoPermissionHandler, ManagedInteractivePermissionHandler,
@@ -578,6 +613,93 @@ pub mod config {
         pub blocking: bool,
     }
 
+    // ---- AgentDefinition -------------------------------------------------
+
+    fn default_agent_access() -> String {
+        "full".to_string()
+    }
+
+    fn default_true() -> bool {
+        true
+    }
+
+    /// Definition of a named agent with per-agent model, permissions,
+    /// temperature, and system prompt.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct AgentDefinition {
+        /// Display name / description
+        pub description: Option<String>,
+        /// Model override for this agent (e.g., "anthropic/claude-haiku-4-5")
+        pub model: Option<String>,
+        /// Temperature override
+        pub temperature: Option<f64>,
+        /// System prompt prefix (prepended before the main system prompt)
+        pub prompt: Option<String>,
+        /// Permission restriction: "full", "read-only", "search-only"
+        #[serde(default = "default_agent_access")]
+        pub access: String,
+        /// Whether to show in @agent autocomplete
+        #[serde(default = "default_true")]
+        pub visible: bool,
+        /// Max agentic turns for this agent (overrides global)
+        pub max_turns: Option<u32>,
+        /// ANSI color for display: "cyan", "magenta", "green", etc.
+        pub color: Option<String>,
+    }
+
+    impl Default for AgentDefinition {
+        fn default() -> Self {
+            Self {
+                description: None,
+                model: None,
+                temperature: None,
+                prompt: None,
+                access: default_agent_access(),
+                visible: true,
+                max_turns: None,
+                color: None,
+            }
+        }
+    }
+
+    // ---- ProviderConfig --------------------------------------------------
+
+    /// Per-provider configuration: API keys, base URLs, and options.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ProviderConfig {
+        /// API key (overrides environment variable)
+        pub api_key: Option<String>,
+        /// Override the default base URL for this provider
+        pub api_base: Option<String>,
+        /// Whether this provider is enabled (default: true)
+        #[serde(default = "default_true")]
+        pub enabled: bool,
+        /// Model ID whitelist (empty = allow all)
+        #[serde(default)]
+        pub models_whitelist: Vec<String>,
+        /// Model ID blacklist
+        #[serde(default)]
+        pub models_blacklist: Vec<String>,
+        /// Provider-specific options (passed through to provider implementation)
+        #[serde(default)]
+        pub options: HashMap<String, serde_json::Value>,
+    }
+
+    impl Default for ProviderConfig {
+        fn default() -> Self {
+            Self {
+                api_key: None,
+                api_base: None,
+                enabled: true,
+                models_whitelist: Vec::new(),
+                models_blacklist: Vec::new(),
+                options: HashMap::new(),
+            }
+        }
+    }
+
+    // ---- Config ----------------------------------------------------------
+
     /// Top-level configuration values, merged from CLI args + settings file + env.
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
     pub struct Config {
@@ -611,6 +733,29 @@ pub mod config {
         /// Event hooks: map of event → list of hook commands.
         #[serde(default)]
         pub hooks: HashMap<HookEvent, Vec<HookEntry>>,
+        /// Active provider ID (default: "anthropic")
+        #[serde(default)]
+        pub provider: Option<String>,
+        /// Per-provider configurations
+        #[serde(default)]
+        pub provider_configs: HashMap<String, ProviderConfig>,
+        /// Formatter configurations (copied from Settings on load).
+        #[serde(default)]
+        pub formatter: HashMap<String, FormatterConfig>,
+        /// User-defined command templates (copied from Settings on load).
+        #[serde(default)]
+        pub commands: HashMap<String, CommandTemplate>,
+        /// Named agent definitions (copied from Settings on load).
+        #[serde(default)]
+        pub agents: HashMap<String, AgentDefinition>,
+        /// Skill-discovery configuration (copied from Settings on load).
+        #[serde(default)]
+        pub skills: SkillsConfig,
+        /// Optional URL for the session-share service.  When set, `/share`
+        /// POSTs the session to this endpoint and returns the resulting URL.
+        /// When absent, `/share` falls back to a local Markdown export.
+        #[serde(default, rename = "shareEndpoint")]
+        pub share_endpoint: Option<String>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -660,6 +805,19 @@ pub mod config {
         "stdio".to_string()
     }
 
+    // ---- SkillsConfig ----------------------------------------------------
+
+    /// Configuration for the skill-discovery system.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct SkillsConfig {
+        /// Additional directories to search for skill `.md` files.
+        #[serde(default)]
+        pub paths: Vec<String>,
+        /// Git repository URLs to fetch skills from (cloned once, then cached).
+        #[serde(default)]
+        pub urls: Vec<String>,
+    }
+
     // ---- Settings --------------------------------------------------------
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -687,6 +845,55 @@ pub mod config {
         /// App version at last launch — used to detect upgrades and show release notes.
         #[serde(default, rename = "lastSeenVersion")]
         pub last_seen_version: Option<String>,
+        /// Active provider ID at the settings level (e.g. "anthropic", "openai").
+        #[serde(default)]
+        pub provider: Option<String>,
+        /// Per-provider configurations stored in settings.json.
+        #[serde(default)]
+        pub providers: HashMap<String, ProviderConfig>,
+        /// User-defined slash command templates.
+        #[serde(default)]
+        pub commands: HashMap<String, CommandTemplate>,
+        /// Formatter configurations keyed by a user-defined name.
+        #[serde(default)]
+        pub formatter: HashMap<String, FormatterConfig>,
+        /// Named agent definitions (overrides built-in defaults).
+        #[serde(default)]
+        pub agents: HashMap<String, AgentDefinition>,
+        /// Skill-discovery configuration (extra paths and git URLs).
+        #[serde(default)]
+        pub skills: SkillsConfig,
+    }
+
+    /// A user-defined slash command template.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct CommandTemplate {
+        /// The template string; `$ARGUMENTS` gets replaced with user input.
+        pub template: String,
+        /// Optional description shown in /help.
+        pub description: Option<String>,
+        /// Optional agent to use (e.g. "plan").
+        pub agent: Option<String>,
+        /// Optional model override (e.g. "anthropic/claude-haiku-4-5").
+        pub model: Option<String>,
+    }
+
+    /// Configuration for a file formatter tool.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct FormatterConfig {
+        /// Command to run, e.g. `["prettier", "--write"]`.
+        pub command: Vec<String>,
+        /// File extensions this formatter handles, e.g. `[".ts", ".tsx", ".js"]`.
+        pub extensions: Vec<String>,
+        /// Whether this formatter is disabled.
+        #[serde(default)]
+        pub disabled: bool,
+    }
+
+    impl Default for FormatterConfig {
+        fn default() -> Self {
+            Self { command: Vec::new(), extensions: Vec::new(), disabled: false }
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -698,13 +905,78 @@ pub mod config {
         pub custom_system_prompt: Option<String>,
     }
 
+    /// Return the three built-in named agent definitions.
+    /// User-defined agents in `settings.json` can override these by name.
+    pub fn default_agents() -> HashMap<String, AgentDefinition> {
+        let mut m = HashMap::new();
+        m.insert("build".to_string(), AgentDefinition {
+            description: Some("Full-access agent for implementing features and fixing bugs".to_string()),
+            model: None,
+            temperature: None,
+            prompt: Some("You are the build agent. You have full access to read, write, and execute. Focus on implementing the requested changes completely and correctly.".to_string()),
+            access: "full".to_string(),
+            visible: true,
+            max_turns: None,
+            color: Some("cyan".to_string()),
+        });
+        m.insert("plan".to_string(), AgentDefinition {
+            description: Some("Read-only agent for analyzing code and planning changes".to_string()),
+            model: None,
+            temperature: None,
+            prompt: Some("You are the plan agent. You can read files and analyze code but cannot write files or execute commands. Focus on understanding the codebase and describing what changes should be made.".to_string()),
+            access: "read-only".to_string(),
+            visible: true,
+            max_turns: Some(20),
+            color: Some("yellow".to_string()),
+        });
+        m.insert("explore".to_string(), AgentDefinition {
+            description: Some("Fast search-only agent for code exploration".to_string()),
+            model: None,
+            temperature: None,
+            prompt: Some("You are the explore agent. You can search and read files. Focus on quickly finding relevant code and answering questions about the codebase.".to_string()),
+            access: "search-only".to_string(),
+            visible: true,
+            max_turns: Some(15),
+            color: Some("green".to_string()),
+        });
+        m
+    }
+
     impl Config {
-        /// Resolve the effective model, falling back to the compile-time default.
+        /// Resolve the effective model, falling back to a provider-appropriate default.
+        ///
+        /// When a non-Anthropic provider is active and no model is explicitly set,
+        /// returns that provider's canonical default model instead of `DEFAULT_MODEL`
+        /// (which is Claude-specific).
         pub fn effective_model(&self) -> &str {
-            self.model
-                .as_deref()
-                .unwrap_or(crate::constants::DEFAULT_MODEL)
+            if let Some(ref m) = self.model {
+                return m;
+            }
+            match self.provider.as_deref() {
+                Some("openai") => "gpt-4o",
+                Some("google") => "gemini-2.5-flash",
+                Some("groq") => "llama-3.3-70b-versatile",
+                Some("cerebras") => "llama-3.3-70b",
+                Some("deepseek") => "deepseek-chat",
+                Some("mistral") => "mistral-large-latest",
+                Some("xai") => "grok-2",
+                Some("openrouter") => "anthropic/claude-sonnet-4",
+                Some("togetherai") | Some("together-ai") => "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+                Some("perplexity") => "sonar-pro",
+                Some("cohere") => "command-r-plus",
+                Some("deepinfra") => "meta-llama/Llama-3.3-70B-Instruct",
+                Some("github-copilot") => "gpt-4o",
+                Some("ollama") => "llama3.2",
+                Some("lmstudio") => "default",
+                Some("llamacpp") => "default",
+                Some("azure") => "gpt-4o",
+                Some("amazon-bedrock") => "anthropic.claude-sonnet-4-6-v1",
+                Some("venice") => "llama-3.3-70b",
+                _ => crate::constants::DEFAULT_MODEL, // Anthropic default
+            }
         }
+
+
 
         /// Resolve the effective max-tokens.
         pub fn effective_max_tokens(&self) -> u32 {
@@ -730,7 +1002,7 @@ pub mod config {
         }
 
         /// Resolve the prompt text for the selected output style, including
-        /// user-defined styles loaded from `~/.claude/output-styles/`.
+        /// user-defined styles loaded from `~/.claurst/output-styles/`.
         pub fn resolve_output_style_prompt(&self) -> Option<String> {
             let style_name = self.output_style.as_deref().unwrap_or("default");
             let styles = crate::output_styles::all_styles(&Settings::config_dir());
@@ -746,7 +1018,7 @@ pub mod config {
                 .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
         }
 
-        /// Async variant: also checks `~/.claude/oauth_tokens.json`.
+        /// Async variant: also checks `~/.claurst/oauth_tokens.json`.
         /// Returns `(credential, use_bearer_auth)`.
         /// - For Console OAuth flow: credential is the stored API key, bearer=false.
         /// - For Claude.ai OAuth flow: credential is the access token, bearer=true.
@@ -821,11 +1093,11 @@ pub mod config {
     }
 
     impl Settings {
-        /// The per-user configuration directory (`~/.claude`).
+        /// The per-user configuration directory (`~/.claurst`).
         pub fn config_dir() -> PathBuf {
             dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
-                .join(".claude")
+                .join(".claurst")
         }
 
         /// Full path to the global settings JSON file.
@@ -876,6 +1148,237 @@ pub mod config {
             std::fs::write(&path, content)?;
             Ok(())
         }
+
+        /// Return the effective `Config`, merging top-level provider settings
+        /// into the embedded `config` field.
+        ///
+        /// - `settings.provider` wins over `settings.config.provider` (if set).
+        /// - `settings.providers` entries are merged into `config.provider_configs`,
+        ///   with the embedded config values taking precedence for keys already present.
+        pub fn effective_config(&self) -> Config {
+            let mut config = self.config.clone();
+            // Top-level `provider` key overrides config.provider when set.
+            if self.provider.is_some() && config.provider.is_none() {
+                config.provider = self.provider.clone();
+            }
+            // Merge top-level `providers` map into config.provider_configs.
+            for (id, pc) in &self.providers {
+                config.provider_configs.entry(id.clone()).or_insert_with(|| pc.clone());
+            }
+            // Copy top-level formatters and commands into config.
+            for (k, v) in &self.formatter {
+                config.formatter.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            for (k, v) in &self.commands {
+                config.commands.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            // Copy top-level agent definitions into config.
+            for (k, v) in &self.agents {
+                config.agents.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            // Copy skills config into effective config (paths and urls merged).
+            for p in &self.skills.paths {
+                if !config.skills.paths.contains(p) {
+                    config.skills.paths.push(p.clone());
+                }
+            }
+            for u in &self.skills.urls {
+                if !config.skills.urls.contains(u) {
+                    config.skills.urls.push(u.clone());
+                }
+            }
+            config
+        }
+
+        /// Load settings from all config levels and merge them.
+        /// Priority: project > global.
+        pub async fn load_hierarchical(cwd: &std::path::Path) -> Self {
+            // 1. Load global settings.
+            let mut merged = Self::load().await.unwrap_or_default();
+            // 2. Find and merge project settings (project wins).
+            if let Some(project_settings) = Self::find_project_settings(cwd).await {
+                merged = Self::merge(merged, project_settings);
+            }
+            merged
+        }
+
+        /// Walk up from `cwd` looking for `.claurst/settings.json` or
+        /// `.claurst/settings.jsonc`.
+        async fn find_project_settings(cwd: &std::path::Path) -> Option<Self> {
+            let global_path = Self::global_settings_path();
+            let mut dir = cwd;
+            loop {
+                // Try .json first, then .jsonc.
+                for name in &["settings.json", "settings.jsonc"] {
+                    let candidate = dir.join(".claurst").join(name);
+                    if candidate.exists() && candidate != global_path {
+                        if let Ok(content) = tokio::fs::read_to_string(&candidate).await {
+                            let stripped = strip_jsonc_comments(&content);
+                            if let Ok(s) = serde_json::from_str::<Self>(&stripped) {
+                                return Some(s);
+                            }
+                        }
+                        // Found a file but couldn't parse — stop here, don't go up.
+                        return None;
+                    }
+                }
+                match dir.parent() {
+                    Some(parent) => dir = parent,
+                    None => break,
+                }
+            }
+            None
+        }
+
+        /// Merge two settings with `override_settings` taking priority.
+        /// Simple strategy: override wins for all scalar fields; Vecs are
+        /// concatenated (deduped); HashMaps are merged (override wins on collision).
+        fn merge(base: Self, over: Self) -> Self {
+            // Helper to merge two HashMaps (over wins on key collision).
+            fn merge_map<K: std::hash::Hash + Eq + Clone, V: Clone>(
+                mut base: HashMap<K, V>,
+                over: HashMap<K, V>,
+            ) -> HashMap<K, V> {
+                for (k, v) in over { base.insert(k, v); }
+                base
+            }
+            // Merge the embedded Config structs.
+            let merged_config = Config {
+                api_key: over.config.api_key.or(base.config.api_key),
+                model: over.config.model.or(base.config.model),
+                max_tokens: over.config.max_tokens.or(base.config.max_tokens),
+                permission_mode: over.config.permission_mode,
+                theme: over.config.theme,
+                output_style: over.config.output_style.or(base.config.output_style),
+                auto_compact: over.config.auto_compact || base.config.auto_compact,
+                compact_threshold: if over.config.compact_threshold != 0.0 {
+                    over.config.compact_threshold
+                } else {
+                    base.config.compact_threshold
+                },
+                verbose: over.config.verbose || base.config.verbose,
+                output_format: over.config.output_format,
+                mcp_servers: { let mut v = base.config.mcp_servers; v.extend(over.config.mcp_servers); v },
+                lsp_servers: { let mut v = base.config.lsp_servers; v.extend(over.config.lsp_servers); v },
+                allowed_tools: { let mut v = base.config.allowed_tools; v.extend(over.config.allowed_tools); v.dedup(); v },
+                disallowed_tools: { let mut v = base.config.disallowed_tools; v.extend(over.config.disallowed_tools); v.dedup(); v },
+                env: merge_map(base.config.env, over.config.env),
+                enable_all_mcp_servers: over.config.enable_all_mcp_servers || base.config.enable_all_mcp_servers,
+                custom_system_prompt: over.config.custom_system_prompt.or(base.config.custom_system_prompt),
+                append_system_prompt: over.config.append_system_prompt.or(base.config.append_system_prompt),
+                disable_claude_mds: over.config.disable_claude_mds || base.config.disable_claude_mds,
+                project_dir: over.config.project_dir.or(base.config.project_dir),
+                workspace_paths: { let mut v = base.config.workspace_paths; v.extend(over.config.workspace_paths); v },
+                additional_dirs: { let mut v = base.config.additional_dirs; v.extend(over.config.additional_dirs); v },
+                hooks: merge_map(base.config.hooks, over.config.hooks),
+                provider: over.config.provider.or(base.config.provider),
+                provider_configs: merge_map(base.config.provider_configs, over.config.provider_configs),
+                formatter: merge_map(base.config.formatter, over.config.formatter),
+                commands: merge_map(base.config.commands, over.config.commands),
+                agents: merge_map(base.config.agents, over.config.agents),
+                skills: {
+                    let mut paths = base.config.skills.paths;
+                    for p in over.config.skills.paths { if !paths.contains(&p) { paths.push(p); } }
+                    let mut urls = base.config.skills.urls;
+                    for u in over.config.skills.urls { if !urls.contains(&u) { urls.push(u); } }
+                    SkillsConfig { paths, urls }
+                },
+                share_endpoint: over.config.share_endpoint.or(base.config.share_endpoint),
+            };
+            Self {
+                config: merged_config,
+                version: over.version.or(base.version),
+                projects: merge_map(base.projects, over.projects),
+                remote_control_at_startup: over.remote_control_at_startup || base.remote_control_at_startup,
+                permission_rules: { let mut v = base.permission_rules; v.extend(over.permission_rules); v },
+                enabled_plugins: { let mut s = base.enabled_plugins; s.extend(over.enabled_plugins); s },
+                disabled_plugins: { let mut s = base.disabled_plugins; s.extend(over.disabled_plugins); s },
+                has_completed_onboarding: over.has_completed_onboarding || base.has_completed_onboarding,
+                last_seen_version: over.last_seen_version.or(base.last_seen_version),
+                provider: over.provider.or(base.provider),
+                providers: merge_map(base.providers, over.providers),
+                commands: merge_map(base.commands, over.commands),
+                formatter: merge_map(base.formatter, over.formatter),
+                agents: merge_map(base.agents, over.agents),
+                skills: {
+                    let mut paths = base.skills.paths;
+                    for p in over.skills.paths { if !paths.contains(&p) { paths.push(p); } }
+                    let mut urls = base.skills.urls;
+                    for u in over.skills.urls { if !urls.contains(&u) { urls.push(u); } }
+                    SkillsConfig { paths, urls }
+                },
+            }
+        }
+    }
+
+    /// Strip `//` line-comments and `/* */` block-comments from a JSON string
+    /// (JSONC format), preserving newlines for error-message line numbers.
+    pub fn strip_jsonc_comments(input: &str) -> String {
+        let mut result = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+        let mut in_string = false;
+        let mut prev_char = '\0';
+
+        while let Some(ch) = chars.next() {
+            if in_string {
+                if ch == '"' && prev_char != '\\' { in_string = false; }
+                result.push(ch);
+                prev_char = ch;
+                continue;
+            }
+            if ch == '"' {
+                in_string = true;
+                result.push(ch);
+                prev_char = ch;
+                continue;
+            }
+            if ch == '/' {
+                match chars.peek() {
+                    Some('/') => {
+                        // Line comment — skip to end of line.
+                        for c in chars.by_ref() { if c == '\n' { result.push('\n'); break; } }
+                    }
+                    Some('*') => {
+                        // Block comment — skip until `*/`.
+                        chars.next();
+                        let mut prev = '\0';
+                        for c in chars.by_ref() {
+                            if prev == '*' && c == '/' { break; }
+                            if c == '\n' { result.push('\n'); }
+                            prev = c;
+                        }
+                    }
+                    _ => result.push(ch),
+                }
+                prev_char = '\0';
+                continue;
+            }
+            result.push(ch);
+            prev_char = ch;
+        }
+        result
+    }
+
+    /// Replace `{env:VARNAME}` patterns in a string with environment variable
+    /// values.  Missing variables are replaced with an empty string.
+    pub fn substitute_env_vars(s: &str) -> String {
+        let mut result = s.to_string();
+        loop {
+            match result.find("{env:") {
+                None => break,
+                Some(start) => {
+                    match result[start..].find('}') {
+                        None => break,
+                        Some(rel_end) => {
+                            let var_name = result[start + 5..start + rel_end].to_string();
+                            let value = std::env::var(&var_name).unwrap_or_default();
+                            result.replace_range(start..start + rel_end + 1, &value);
+                        }
+                    }
+                }
+            }
+        }
+        result
     }
 }
 
@@ -907,10 +1410,10 @@ pub mod constants {
          effort-2025-11-24";
 
     // File system
-    pub const CLAUDE_MD_FILENAME: &str = "CLAUDE.md";
+    pub const CLAUDE_MD_FILENAME: &str = "AGENTS.md";
     pub const SETTINGS_FILENAME: &str = "settings.json";
     pub const HISTORY_FILENAME: &str = "conversations";
-    pub const CONFIG_DIR_NAME: &str = ".claude";
+    pub const CONFIG_DIR_NAME: &str = ".claurst";
 
     // Tool names
     pub const TOOL_NAME_BASH: &str = "Bash";
@@ -934,6 +1437,8 @@ pub mod constants {
     pub const TOOL_NAME_ASK_USER: &str = "AskUserQuestion";
     pub const TOOL_NAME_MCP: &str = "mcp";
     pub const TOOL_NAME_NOTEBOOK_EDIT: &str = "NotebookEdit";
+    pub const TOOL_NAME_BATCH_EDIT: &str = "BatchEdit";
+    pub const TOOL_NAME_APPLY_PATCH: &str = "ApplyPatch";
 
     // Session ID prefixes
     pub const SESSION_ID_PREFIX_BASH: &str = "b";
@@ -999,7 +1504,7 @@ pub mod context {
             parts.join("\n\n")
         }
 
-        /// User context (date, CLAUDE.md memories, etc.)
+        /// User context (date, AGENTS.md memories, etc.)
         pub async fn build_user_context(&self) -> String {
             let mut parts = vec![];
 
@@ -1049,14 +1554,14 @@ pub mod context {
             Some(result)
         }
 
-        /// Walk up from cwd looking for CLAUDE.md files and the global one.
+        /// Walk up from cwd looking for AGENTS.md files and the global one.
         async fn find_and_read_claude_md(&self) -> Option<String> {
             let mut claude_mds = vec![];
 
-            // Global ~/.claude/CLAUDE.md
+            // Global ~/.claurst/AGENTS.md
             if let Some(home) = dirs::home_dir() {
                 let global_claude_md =
-                    home.join(".claude").join(crate::constants::CLAUDE_MD_FILENAME);
+                    home.join(".claurst").join(crate::constants::CLAUDE_MD_FILENAME);
                 if global_claude_md.exists() {
                     if let Ok(content) = tokio::fs::read_to_string(&global_claude_md).await {
                         claude_mds.push(format!(
@@ -1068,7 +1573,7 @@ pub mod context {
                 }
             }
 
-            // Walk from cwd up to filesystem root, collecting CLAUDE.md
+            // Walk from cwd up to filesystem root, collecting AGENTS.md
             let mut dir = Some(self.cwd.as_path());
             let mut project_mds: Vec<String> = vec![];
             while let Some(d) = dir {
@@ -1927,6 +2432,12 @@ pub mod history {
         /// Saved checkpoints (rewind points) within this session.
         #[serde(default)]
         pub checkpoints: Vec<SessionCheckpoint>,
+        /// ID of the parent session this was forked from (via /fork).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub parent_session_id: Option<String>,
+        /// Message index in the parent session at which this fork was created.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub fork_point_message_index: Option<usize>,
     }
 
     impl ConversationSession {
@@ -1947,6 +2458,8 @@ pub mod history {
                 total_cost: 0.0,
                 total_tokens: 0,
                 checkpoints: vec![],
+                parent_session_id: None,
+                fork_point_message_index: None,
             }
         }
 
@@ -2009,7 +2522,7 @@ pub mod history {
         crate::config::Settings::config_dir().join("sessions")
     }
 
-    /// Save a session to `~/.claude/sessions/<id>.json`.
+    /// Save a session to `~/.claurst/sessions/<id>.json`.
     pub async fn save_session(session: &ConversationSession) -> anyhow::Result<()> {
         let dir = sessions_dir();
         tokio::fs::create_dir_all(&dir).await?;
@@ -2125,6 +2638,8 @@ pub mod history {
             total_cost: 0.0,
             total_tokens: 0,
             checkpoints: vec![],
+            parent_session_id: None,
+            fork_point_message_index: None,
         };
         save_session(&branched).await?;
         Ok(branched)
@@ -2455,7 +2970,9 @@ pub mod oauth {
 
     // ---- Production OAuth endpoints & constants ----
 
-    pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+    // NOTE: This client ID is registered to Anthropic's official Claude Code CLI.
+    // It will NOT work for Claurst. Users should use an API key from console.anthropic.com.
+    pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"; // Anthropic's — will not work for Claurst
     pub const CONSOLE_AUTHORIZE_URL: &str = "https://platform.claude.com/oauth/authorize";
     pub const CLAUDE_AI_AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
     pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
@@ -2483,7 +3000,7 @@ pub mod oauth {
 
     // ---- Stored token struct ----
 
-    /// Persisted OAuth tokens (saved to `~/.claude/oauth_tokens.json`).
+    /// Persisted OAuth tokens (saved to `~/.claurst/oauth_tokens.json`).
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
     pub struct OAuthTokens {
         pub access_token: String,
@@ -2538,7 +3055,7 @@ pub mod oauth {
         pub fn token_file_path() -> std::path::PathBuf {
             dirs::home_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join(".claude")
+                .join(".claurst")
                 .join("oauth_tokens.json")
         }
 

@@ -2,6 +2,7 @@
 
 use crate::bridge_state::BridgeConnectionState;
 use crate::context_viz::ContextVizState;
+use crate::dialog_select::{DialogSelectState, SelectItem};
 use crate::export_dialog::{ExportDialogState, ExportFormat};
 use crate::dialogs::PermissionRequest;
 use crate::diff_viewer::{DiffViewerState, build_turn_diff};
@@ -42,11 +43,13 @@ use tracing::debug;
 
 const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("advisor", "Set or unset the server-side advisor model"),
+    ("agent", "List available agents or show agent details"),
     ("agents", "Browse agent definitions and active agents"),
     ("changes", "Inspect changes from the current session"),
     ("clear", "Clear the conversation transcript"),
     ("compact", "Compact the conversation context"),
     ("config", "Open settings"),
+    ("connect", "Connect an AI provider"),
     ("context", "Show context window and rate limit usage"),
     ("copy", "Copy the last assistant response to clipboard"),
     ("cost", "Show cost breakdown"),
@@ -57,21 +60,23 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("export", "Export conversation"),
     ("fast", "Toggle fast mode"),
     ("feedback", "Open session feedback survey"),
+    ("fork", "Fork session into a new branch"),
     ("heapdump", "Show process memory and diagnostic information"),
     ("help", "Show help"),
     ("hooks", "Browse configured hooks (read-only)"),
-    ("init", "Initialize CLAUDE.md for this project"),
+    ("init", "Initialize AGENTS.md for this project"),
     ("insights", "Generate a session analysis report with conversation statistics"),
     ("install-slack-app", "Install the Claurst Slack integration"),
     ("keybindings", "Show keybinding configuration"),
-    ("login", "Log in to Claude"),
-    ("logout", "Log out of Claude"),
+    ("login", "Log in to Claurst"),
+    ("logout", "Log out of Claurst"),
     ("mcp", "Browse configured MCP servers"),
-    ("memory", "Browse and open CLAUDE.md memory files"),
+    ("memory", "Browse and open AGENTS.md memory files"),
     ("model", "Change the AI model"),
     ("output-style", "Toggle output style (auto/stream/verbose)"),
     ("plugin", "Manage plugins (list/info/enable/disable/reload)"),
     ("privacy", "Open privacy settings"),
+    ("providers", "List available AI providers and their status"),
     ("quit", "Quit Claurst"),
     ("rename", "Rename this session"),
     ("resume", "Resume a previous session"),
@@ -86,6 +91,85 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("vim", "Toggle vim keybindings"),
     ("voice", "Toggle voice input mode"),
 ];
+
+// ---------------------------------------------------------------------------
+// Provider connection helpers
+// ---------------------------------------------------------------------------
+
+/// Return the environment variable name for a given provider ID.
+#[allow(dead_code)]
+fn get_env_var_for_provider(id: &str) -> &'static str {
+    match id {
+        "anthropic" => "ANTHROPIC_API_KEY",
+        "openai" => "OPENAI_API_KEY",
+        "google" | "google-vertex" => "GOOGLE_API_KEY",
+        "github-copilot" => "GITHUB_TOKEN",
+        "groq" => "GROQ_API_KEY",
+        "cerebras" => "CEREBRAS_API_KEY",
+        "sambanova" => "SAMBANOVA_API_KEY",
+        "deepseek" => "DEEPSEEK_API_KEY",
+        "mistral" => "MISTRAL_API_KEY",
+        "openrouter" => "OPENROUTER_API_KEY",
+        "togetherai" => "TOGETHER_API_KEY",
+        "perplexity" => "PERPLEXITY_API_KEY",
+        "cohere" => "COHERE_API_KEY",
+        "xai" => "XAI_API_KEY",
+        "deepinfra" => "DEEPINFRA_API_KEY",
+        "azure" => "AZURE_API_KEY",
+        "amazon-bedrock" => "AWS_ACCESS_KEY_ID",
+        "sap-ai-core" => "AICORE_SERVICE_KEY",
+        "gitlab" => "GITLAB_TOKEN",
+        "cloudflare-ai-gateway" | "cloudflare-workers-ai" => "CLOUDFLARE_API_TOKEN",
+        "vercel" => "AI_GATEWAY_API_KEY",
+        "helicone" => "HELICONE_API_KEY",
+        "huggingface" => "HF_TOKEN",
+        "nvidia" => "NVIDIA_API_KEY",
+        "alibaba" => "DASHSCOPE_API_KEY",
+        "venice" => "VENICE_API_KEY",
+        "moonshotai" => "MOONSHOT_API_KEY",
+        "zhipuai" => "ZHIPU_API_KEY",
+        "siliconflow" => "SILICONFLOW_API_KEY",
+        "nebius" => "NEBIUS_API_KEY",
+        "novita" => "NOVITA_API_KEY",
+        "ovhcloud" => "OVHCLOUD_API_KEY",
+        "scaleway" => "SCALEWAY_API_KEY",
+        "vultr" => "VULTR_API_KEY",
+        "baseten" => "BASETEN_API_KEY",
+        "friendli" => "FRIENDLI_TOKEN",
+        "upstage" => "UPSTAGE_API_KEY",
+        "stepfun" => "STEPFUN_API_KEY",
+        "fireworks" => "FIREWORKS_API_KEY",
+        _ => "API_KEY",
+    }
+}
+
+/// Return a URL hint for obtaining an API key from a given provider.
+#[allow(dead_code)]
+fn get_url_for_provider(id: &str) -> &'static str {
+    match id {
+        "anthropic" => "console.anthropic.com",
+        "openai" => "platform.openai.com/api-keys",
+        "google" => "aistudio.google.com/apikey",
+        "github-copilot" => "github.com/settings/tokens",
+        "groq" => "console.groq.com/keys",
+        "cerebras" => "cloud.cerebras.ai",
+        "sambanova" => "cloud.sambanova.ai",
+        "deepseek" => "platform.deepseek.com/api_keys",
+        "mistral" => "console.mistral.ai/api-keys",
+        "openrouter" => "openrouter.ai/keys",
+        "togetherai" => "api.together.xyz/settings/api-keys",
+        "perplexity" => "perplexity.ai/settings/api",
+        "cohere" => "dashboard.cohere.com/api-keys",
+        "xai" => "console.x.ai",
+        "deepinfra" => "deepinfra.com/dash/api_keys",
+        "azure" => "portal.azure.com",
+        "amazon-bedrock" => "console.aws.amazon.com/bedrock",
+        "huggingface" => "huggingface.co/settings/tokens",
+        "nvidia" => "build.nvidia.com",
+        "venice" => "venice.ai/settings/api",
+        _ => "the provider's website",
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Supporting types
@@ -131,20 +215,24 @@ pub struct ContextMenuState {
     pub y: u16,
     /// Currently selected menu item index (0-based).
     pub selected_index: usize,
+    /// What the context menu is acting on.
+    pub kind: ContextMenuKind,
+}
+
+/// What content the context menu is currently targeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextMenuKind {
+    /// A specific transcript message.
+    Message { message_index: usize },
+    /// The current text selection anywhere in the frame.
+    Selection,
 }
 
 /// Available context menu items.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextMenuItem {
     Copy,
-    CopyAsMarkdown,
-    CopyAsPlaintext,
-    CopyCodeBlocks,
-    CopyAsJson,
-    Paste,
-    Cut,
-    SelectAll,
-    Clear,
+    Fork,
 }
 
 /// State for the Go to Line dialog (Ctrl+G in message pane).
@@ -260,7 +348,7 @@ impl HistorySearch {
 
 /// Attempt to copy text to the system clipboard using platform CLI tools.
 /// Returns true if successful.
-fn try_copy_to_clipboard(text: &str) -> bool {
+pub fn try_copy_to_clipboard(text: &str) -> bool {
     // Windows
     #[cfg(target_os = "windows")]
     {
@@ -345,6 +433,19 @@ fn key_event_to_keystroke(key: &KeyEvent) -> Option<ParsedKeystroke> {
 }
 
 // ---------------------------------------------------------------------------
+// Focus target
+// ---------------------------------------------------------------------------
+
+/// Which area of the TUI currently has keyboard focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusTarget {
+    /// Keyboard input goes to the prompt editor.
+    Input,
+    /// Keyboard input goes to the transcript/message pane (scroll, etc.).
+    Transcript,
+}
+
+// ---------------------------------------------------------------------------
 // App struct
 // ---------------------------------------------------------------------------
 
@@ -382,10 +483,15 @@ pub struct App {
     pub token_budget: Option<u32>,
     pub cost_usd: f64,
     pub model_name: String,
+    /// Whether the app has valid API credentials configured.
+    /// False = show the in-TUI provider setup dialog on startup.
+    pub has_credentials: bool,
     /// Current effort level (controls extended-thinking budget_tokens).
     pub effort_level: EffortLevel,
     /// Whether fast mode is currently active (model locked to FAST_MODE_MODEL).
     pub fast_mode: bool,
+    /// Current agent mode name: "build", "plan", "explore", etc.
+    pub agent_mode: Option<String>,
     pub agent_status: Vec<(String, String)>,
     pub history_search: Option<HistorySearch>,
     pub keybindings: KeybindingResolver,
@@ -478,7 +584,7 @@ pub struct App {
     pub diff_viewer: DiffViewerState,
     /// Session-quality feedback survey overlay.
     pub feedback_survey: crate::feedback_survey::FeedbackSurveyState,
-    /// Memory file selector overlay (CLAUDE.md browser).
+    /// Memory file selector overlay (AGENTS.md browser).
     pub memory_file_selector: crate::memory_file_selector::MemoryFileSelectorState,
     /// Read-only hooks configuration browser.
     pub hooks_config_menu: crate::hooks_config_menu::HooksConfigMenuState,
@@ -488,7 +594,7 @@ pub struct App {
     pub voice_mode_notice: crate::voice_mode_notice::VoiceModeNoticeState,
     /// Desktop app upsell startup dialog.
     pub desktop_upsell: crate::desktop_upsell_startup::DesktopUpsellStartupState,
-    /// Startup error dialog for malformed settings.json or CLAUDE.md.
+    /// Startup error dialog for malformed settings.json or AGENTS.md.
     pub invalid_config_dialog: crate::invalid_config_dialog::InvalidConfigDialogState,
     /// Memory update notification banner.
     pub memory_update_notification: crate::memory_update_notification::MemoryUpdateNotificationState,
@@ -516,7 +622,27 @@ pub struct App {
     pub bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState,
     /// First-launch onboarding welcome dialog.
     pub onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState,
-    /// Whether Claude was launched from the user's home directory.
+    /// API key input dialog (opened from /connect for key-based providers).
+    pub key_input_dialog: crate::key_input_dialog::KeyInputDialogState,
+    /// Device code / browser auth dialog (GitHub Copilot device flow, Anthropic OAuth).
+    pub device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState,
+    /// When set, the main loop should spawn the async auth task for this provider.
+    pub device_auth_pending: Option<String>,
+    /// Shared provider registry for dynamic model fetching.
+    pub provider_registry: Option<std::sync::Arc<claurst_api::ProviderRegistry>>,
+    /// Model registry populated from models.dev — single source of truth for
+    /// all provider models shown in the `/model` picker.
+    pub model_registry: claurst_api::ModelRegistry,
+    /// When `true`, the main event loop should spawn an async task to fetch
+    /// the model list from the current provider's `list_models()` API.
+    pub model_picker_fetch_pending: bool,
+    /// Credential store for provider API keys and OAuth tokens.
+    pub auth_store: claurst_core::AuthStore,
+    /// Connect-a-provider dialog (/connect command).
+    pub connect_dialog: DialogSelectState,
+    /// Ctrl+K command palette overlay.
+    pub command_palette: DialogSelectState,
+    /// Whether Claurst was launched from the user's home directory.
     /// Shown as a startup notice: "Note: You have launched claude in your home directory…"
     pub home_dir_warning: bool,
     /// Output style: "auto" | "stream" | "verbose".
@@ -549,7 +675,8 @@ pub struct App {
     /// Receiver for model-list results fetched in the background when the
     /// /model picker opens.  Drained each frame so models appear as soon as
     /// the fetch completes.
-    pub model_fetch_rx: Option<tokio::sync::mpsc::Receiver<Vec<crate::model_picker::ModelEntry>>>,
+    pub model_fetch_rx:
+        Option<tokio::sync::mpsc::Receiver<Result<Vec<crate::model_picker::ModelEntry>, ()>>>,
 
     // ---- Context window & rate limit info ----------------------------------
 
@@ -573,8 +700,16 @@ pub struct App {
     pub thinking_expanded: std::collections::HashSet<u64>,
     /// The message pane area from the last render frame (used for mouse hit testing).
     pub last_msg_area: Cell<ratatui::layout::Rect>,
+    /// The frame region that supports text selection.
+    pub last_selectable_area: Cell<ratatui::layout::Rect>,
+    /// The prompt input area from the last render frame (used for focus routing).
+    pub last_input_area: Cell<ratatui::layout::Rect>,
+    /// Which area of the TUI currently has keyboard focus.
+    pub focus: FocusTarget,
     /// Maps virtual_row_index → thinking_block_hash for click detection.
     pub thinking_row_map: RefCell<std::collections::HashMap<u16, u64>>,
+    /// Maps screen row → transcript message index for right-click hit testing.
+    pub message_row_map: RefCell<std::collections::HashMap<u16, usize>>,
     /// Total message lines from the last render (used for virtual row mapping).
     pub total_message_lines: Cell<usize>,
     /// Scroll offset from the last render frame (used for selection validation).
@@ -610,6 +745,11 @@ pub struct App {
     /// Before showing the dialog for a bash command, the first whitespace-delimited
     /// word is checked against this set; a match silently auto-approves the request.
     pub bash_prefix_allowlist: std::collections::HashSet<String>,
+
+    // ---- Auto-update notification ----------------------------------------
+    /// If a newer version was found during background update check, this holds
+    /// the latest version string (e.g. "0.1.0"). Shown in the footer status bar.
+    pub update_available: Option<String>,
 }
 
 const SPINNER_VERBS: &[&str] = &[
@@ -699,8 +839,10 @@ impl App {
             token_budget: Self::load_token_budget(),
             cost_usd: 0.0,
             model_name,
+            has_credentials: true, // overridden by caller when no key is configured
             effort_level: EffortLevel::Normal,
             fast_mode: false,
+            agent_mode: None,
             agent_status: Vec::new(),
             history_search: None,
             keybindings: KeybindingResolver::new(&user_keybindings),
@@ -756,6 +898,91 @@ impl App {
             go_to_line_dialog: GoToLineDialog::new(),
             bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
             onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState::new(),
+            key_input_dialog: crate::key_input_dialog::KeyInputDialogState::new(),
+            device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState::new(),
+            device_auth_pending: None,
+            provider_registry: None,
+            model_registry: {
+                let mut reg = claurst_api::ModelRegistry::new();
+                // Try to load cached models.dev data from disk.
+                let cache_path = dirs::cache_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join("claurst")
+                    .join("models.json");
+                reg.load_cache(&cache_path);
+                reg
+            },
+            model_picker_fetch_pending: false,
+            auth_store: claurst_core::AuthStore::load(),
+            connect_dialog: {
+                let items = vec![
+                    // -- RECOMMENDED --
+                    SelectItem { id: "anthropic".into(), title: "Anthropic".into(), description: "".into(), category: "Recommended".into(), badge: None },
+                    SelectItem { id: "openai".into(), title: "OpenAI".into(), description: "".into(), category: "Recommended".into(), badge: None },
+                    SelectItem { id: "google".into(), title: "Google".into(), description: "".into(), category: "Recommended".into(), badge: None },
+                    SelectItem { id: "github-copilot".into(), title: "GitHub Copilot".into(), description: "".into(), category: "Recommended".into(), badge: None },
+                    // -- FAST & FREE --
+                    SelectItem { id: "groq".into(), title: "Groq".into(), description: "".into(), category: "Fast & Free".into(), badge: Some("FREE".into()) },
+                    SelectItem { id: "cerebras".into(), title: "Cerebras".into(), description: "".into(), category: "Fast & Free".into(), badge: Some("FREE".into()) },
+                    SelectItem { id: "sambanova".into(), title: "SambaNova".into(), description: "".into(), category: "Fast & Free".into(), badge: Some("FREE".into()) },
+                    // -- LOCAL (no key needed) --
+                    SelectItem { id: "ollama".into(), title: "Ollama".into(), description: "Run models locally".into(), category: "Local".into(), badge: Some("LOCAL".into()) },
+                    SelectItem { id: "lmstudio".into(), title: "LM Studio".into(), description: "Local model server".into(), category: "Local".into(), badge: Some("LOCAL".into()) },
+                    SelectItem { id: "llamacpp".into(), title: "llama.cpp".into(), description: "C++ inference server".into(), category: "Local".into(), badge: Some("LOCAL".into()) },
+                    // -- AFFORDABLE --
+                    SelectItem { id: "deepseek".into(), title: "DeepSeek".into(), description: "".into(), category: "Affordable".into(), badge: None },
+                    SelectItem { id: "mistral".into(), title: "Mistral".into(), description: "".into(), category: "Affordable".into(), badge: None },
+                    SelectItem { id: "openrouter".into(), title: "OpenRouter".into(), description: "100+ models \u{00b7} One key".into(), category: "Aggregator".into(), badge: None },
+                    SelectItem { id: "togetherai".into(), title: "Together AI".into(), description: "".into(), category: "Affordable".into(), badge: None },
+                    SelectItem { id: "perplexity".into(), title: "Perplexity".into(), description: "Search-augmented AI".into(), category: "Affordable".into(), badge: None },
+                    SelectItem { id: "cohere".into(), title: "Cohere".into(), description: "".into(), category: "Affordable".into(), badge: None },
+                    SelectItem { id: "xai".into(), title: "xAI".into(), description: "".into(), category: "Affordable".into(), badge: None },
+                    SelectItem { id: "deepinfra".into(), title: "DeepInfra".into(), description: "".into(), category: "Affordable".into(), badge: None },
+                    // -- ENTERPRISE --
+                    SelectItem { id: "azure".into(), title: "Azure OpenAI".into(), description: "".into(), category: "Enterprise".into(), badge: None },
+                    SelectItem { id: "amazon-bedrock".into(), title: "AWS Bedrock".into(), description: "".into(), category: "Enterprise".into(), badge: None },
+                    SelectItem { id: "google-vertex".into(), title: "Google Vertex AI".into(), description: "".into(), category: "Enterprise".into(), badge: None },
+                    SelectItem { id: "sap-ai-core".into(), title: "SAP AI Core".into(), description: "Enterprise AI platform".into(), category: "Enterprise".into(), badge: None },
+                    SelectItem { id: "gitlab".into(), title: "GitLab Duo".into(), description: "AI in GitLab".into(), category: "Enterprise".into(), badge: None },
+                    // -- CLOUD / GATEWAY --
+                    SelectItem { id: "cloudflare-ai-gateway".into(), title: "Cloudflare AI Gateway".into(), description: "".into(), category: "Gateway".into(), badge: None },
+                    SelectItem { id: "cloudflare-workers-ai".into(), title: "Cloudflare Workers AI".into(), description: "Edge AI inference".into(), category: "Gateway".into(), badge: None },
+                    SelectItem { id: "vercel".into(), title: "Vercel AI Gateway".into(), description: "AI SDK gateway".into(), category: "Gateway".into(), badge: None },
+                    SelectItem { id: "helicone".into(), title: "Helicone".into(), description: "AI observability gateway".into(), category: "Gateway".into(), badge: None },
+                    // -- MORE PROVIDERS --
+                    SelectItem { id: "huggingface".into(), title: "Hugging Face".into(), description: "".into(), category: "More Providers".into(), badge: None },
+                    SelectItem { id: "nvidia".into(), title: "Nvidia".into(), description: "".into(), category: "More Providers".into(), badge: None },
+                    SelectItem { id: "alibaba".into(), title: "".into(), description: "".into(), category: "More Providers".into(), badge: None },
+                    SelectItem { id: "venice".into(), title: "Venice AI".into(), description: "Privacy-first AI".into(), category: "More Providers".into(), badge: None },
+                    SelectItem { id: "moonshotai".into(), title: "".into(), description: "".into(), category: "More Providers".into(), badge: None },
+                    SelectItem { id: "zhipuai".into(), title: "".into(), description: "".into(), category: "More Providers".into(), badge: None },
+                    SelectItem { id: "siliconflow".into(), title: "SiliconFlow".into(), description: "".into(), category: "More Providers".into(), badge: None },
+                    SelectItem { id: "nebius".into(), title: "Nebius".into(), description: "".into(), category: "More Providers".into(), badge: None },
+                    SelectItem { id: "novita".into(), title: "Novita".into(), description: "".into(), category: "More Providers".into(), badge: None },
+                    SelectItem { id: "ovhcloud".into(), title: "OVHcloud".into(), description: "EU-hosted AI".into(), category: "More Providers".into(), badge: None },
+                    SelectItem { id: "scaleway".into(), title: "Scaleway".into(), description: "EU cloud AI".into(), category: "More Providers".into(), badge: None },
+                    SelectItem { id: "vultr".into(), title: "Vultr".into(), description: "Cloud inference".into(), category: "More Providers".into(), badge: None },
+                    SelectItem { id: "baseten".into(), title: "Baseten".into(), description: "Model serving".into(), category: "More Providers".into(), badge: None },
+                    SelectItem { id: "friendli".into(), title: "Friendli".into(), description: "Serverless inference".into(), category: "More Providers".into(), badge: None },
+                    SelectItem { id: "upstage".into(), title: "Upstage".into(), description: "".into(), category: "More Providers".into(), badge: None },
+                    SelectItem { id: "stepfun".into(), title: "StepFun".into(), description: "".into(), category: "More Providers".into(), badge: None },
+                    SelectItem { id: "fireworks".into(), title: "Fireworks AI".into(), description: "Fast inference".into(), category: "More Providers".into(), badge: None },
+                ];
+                DialogSelectState::new("Connect a Provider", items)
+            },
+            command_palette: {
+                let items: Vec<SelectItem> = PROMPT_SLASH_COMMANDS
+                    .iter()
+                    .map(|(name, desc)| SelectItem {
+                        id: format!("/{}", name),
+                        title: format!("/{}", name),
+                        description: desc.to_string(),
+                        category: "Commands".to_string(),
+                        badge: None,
+                    })
+                    .collect();
+                DialogSelectState::new("Command Palette", items)
+            },
             home_dir_warning: false,
             output_style: "auto".to_string(),
             pr_number: None,
@@ -768,7 +995,7 @@ impl App {
             auto_compact_threshold: 95,
             voice_recorder: {
                 // Check whether voice input has been enabled via the /voice command
-                // (stored in ~/.claude/ui-settings.json).  We also accept
+                // (stored in ~/.claurst/ui-settings.json).  We also accept
                 // CLAURST_VOICE_ENABLED=1 as an override for easier testing.
                 let voice_on = std::env::var("CLAURST_VOICE_ENABLED")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -804,7 +1031,11 @@ impl App {
             agent_type_badge: None,
             thinking_expanded: std::collections::HashSet::new(),
             last_msg_area: Cell::new(ratatui::layout::Rect::default()),
+            last_selectable_area: Cell::new(ratatui::layout::Rect::default()),
+            last_input_area: Cell::new(ratatui::layout::Rect::default()),
+            focus: FocusTarget::Input,
             thinking_row_map: RefCell::new(std::collections::HashMap::new()),
+            message_row_map: RefCell::new(std::collections::HashMap::new()),
             total_message_lines: Cell::new(0),
             last_render_scroll_offset: Cell::new(0),
             selection_anchor: None,
@@ -817,6 +1048,7 @@ impl App {
             scroll_accel: 3.0,
             scroll_last_time: None,
             bash_prefix_allowlist: std::collections::HashSet::new(),
+            update_available: None,
         }
     }
 
@@ -840,10 +1072,89 @@ impl App {
         None
     }
 
-    /// Update the active model name (also updates cost tracker).
-    pub fn set_model(&mut self, model: String) {
+    fn display_default_model_for_provider(&self, provider_id: &str) -> String {
+        if let Some(best) = self.model_registry.best_model_for_provider(provider_id) {
+            if provider_id == "anthropic" {
+                best
+            } else {
+                format!("{}/{}", provider_id, best)
+            }
+        } else {
+            crate::model_picker::default_model_for_provider(provider_id)
+        }
+    }
+
+    fn persist_provider_and_model(&self) {
+        let mut settings = Settings::load_sync().unwrap_or_default();
+        settings.provider = self.config.provider.clone();
+        settings.config.provider = self.config.provider.clone();
+        settings.config.model = self.config.model.clone();
+        let _ = settings.save_sync();
+    }
+
+    fn infer_provider_from_model(model: &str) -> Option<String> {
+        if let Some((provider, _)) = model.split_once('/') {
+            let known = [
+                "anthropic",
+                "openai",
+                "google",
+                "groq",
+                "cerebras",
+                "deepseek",
+                "mistral",
+                "xai",
+                "openrouter",
+                "github-copilot",
+                "cohere",
+                "perplexity",
+                "togetherai",
+                "together-ai",
+                "deepinfra",
+                "venice",
+                "ollama",
+                "lmstudio",
+                "llamacpp",
+                "azure",
+                "amazon-bedrock",
+            ];
+            if known.contains(&provider) {
+                return Some(provider.to_string());
+            }
+        }
+
+        if model.starts_with("claude") {
+            Some("anthropic".to_string())
+        } else if model.starts_with("gpt-")
+            || model.starts_with("o1")
+            || model.starts_with("o3")
+            || model.starts_with("o4")
+        {
+            Some("openai".to_string())
+        } else if model.starts_with("gemini") || model.starts_with("gemma") {
+            Some("google".to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Switch the active provider while clearing any explicit model override.
+    fn set_provider_default(&mut self, provider_id: String) {
+        self.config.provider = Some(provider_id.clone());
+        self.config.model = None;
+
+        let model = self.display_default_model_for_provider(&provider_id);
         self.cost_tracker.set_model(&model);
         self.model_name = model;
+    }
+
+    /// Update the active model name (also updates config + cost tracker).
+    pub fn set_model(&mut self, model: String) {
+        self.cost_tracker.set_model(&model);
+        self.model_name = model.clone();
+        self.config.model = Some(model.clone());
+        if let Some(provider) = Self::infer_provider_from_model(&model) {
+            self.config.provider = Some(provider);
+        }
     }
 
     /// Apply a theme by name, persisting it to config.
@@ -928,27 +1239,41 @@ impl App {
                 self.hooks_config_menu.open();
                 true
             }
+            "connect" => {
+                self.connect_dialog.open();
+                true
+            }
             "model" => {
-                let current = self.model_name.clone();
+                let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+
+                // Reload cache from disk in case the background models.dev fetch
+                // has written new data since we last opened the picker.
+                let cache_path = dirs::cache_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join("claurst")
+                    .join("models.json");
+                if cache_path.exists() {
+                    self.model_registry.load_cache(&cache_path);
+                }
+
+                // Get models from the registry (models.dev data); falls back to
+                // hardcoded when the registry has no data for this provider.
+                let models = crate::model_picker::models_for_provider_from_registry(
+                    provider,
+                    &self.model_registry,
+                );
+                self.model_picker.set_models(models);
+                self.model_picker_fetch_pending = true;
+
+                let provider_prefix = format!("{}/", provider);
+                let current = self
+                    .model_name
+                    .strip_prefix(&provider_prefix)
+                    .unwrap_or(self.model_name.as_str())
+                    .to_string();
                 let effort = self.effort_level;
                 let fast = self.fast_mode;
                 self.model_picker.open_with_state(&current, effort, fast);
-
-                // Kick off a background fetch of the model list if we don't
-                // already have a fresh list and aren't already loading.
-                if !self.model_picker.models_loaded && !self.model_picker.loading_models {
-                    if let Ok(client) = claurst_api::AnthropicClient::from_config(&self.config) {
-                        let (tx, rx) = tokio::sync::mpsc::channel(1);
-                        self.model_fetch_rx = Some(rx);
-                        self.model_picker.loading_models = true;
-                        tokio::spawn(async move {
-                            let entries =
-                                crate::model_picker::ModelPickerState::fetch_models(&client)
-                                    .await;
-                            let _ = tx.send(entries).await;
-                        });
-                    }
-                }
 
                 true
             }
@@ -992,11 +1317,11 @@ impl App {
                     PermissionMode::Default
                 };
                 self.status_message = Some(if self.plan_mode {
-                    "Plan mode ON — Claude will plan before acting.".to_string()
+                    "Plan mode ON — Claurst will plan before acting.".to_string()
                 } else {
                     "Plan mode OFF.".to_string()
                 });
-                // Allow CLI path to also run (sends UserMessage to Claude).
+                // Allow CLI path to also run (sends UserMessage to Claurst).
                 false
             }
             "compact" => {
@@ -1132,8 +1457,17 @@ impl App {
         self.hooks_config_menu.close();
         self.model_picker.close();
         self.session_browser.close();
+        self.session_branching.close();
+        self.tasks_overlay.close();
         self.export_dialog.dismiss();
         self.context_viz.close();
+        self.connect_dialog.close();
+        self.command_palette.close();
+        self.key_input_dialog.close();
+        self.device_auth_dialog.close();
+        self.settings_screen.close();
+        self.theme_screen.close();
+        self.privacy_screen.close();
     }
 
     /// Perform the export based on the selected format. Returns the path written.
@@ -1685,29 +2019,6 @@ impl App {
             }
         }
 
-        let key_context = self.current_key_context();
-        if let Some(keystroke) = key_event_to_keystroke(&key) {
-            let had_pending_chord = self.keybindings.has_pending_chord();
-            match self.keybindings.process(keystroke, &key_context) {
-                KeybindingResult::Action(action) => {
-                    return self.handle_keybinding_action(&action);
-                }
-                KeybindingResult::Unbound | KeybindingResult::Pending => return false,
-                KeybindingResult::NoMatch if had_pending_chord => return false,
-                KeybindingResult::NoMatch => {}
-            }
-        } else {
-            self.keybindings.cancel_chord();
-        }
-
-        // Clear any active text selection on key press (except Ctrl+C which copies it).
-        let is_copy = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
-        if !is_copy && self.selection_anchor.is_some() {
-            self.selection_anchor = None;
-            self.selection_focus = None;
-            *self.selection_text.borrow_mut() = String::new();
-        }
-
         // Bypass-permissions dialog: highest-priority gate — user must accept or the
         // session exits immediately. Mirrors TS BypassPermissionsModeDialog.tsx.
         if self.bypass_permissions_dialog.visible {
@@ -1755,6 +2066,161 @@ impl App {
             return false;
         }
 
+        // Device code / browser auth dialog (GitHub Copilot, Anthropic OAuth)
+        if self.device_auth_dialog.visible {
+            match key.code {
+                KeyCode::Esc => {
+                    self.device_auth_dialog.close();
+                }
+                _ if matches!(self.device_auth_dialog.status, crate::device_auth_dialog::DeviceAuthStatus::Success(_)) => {
+                    // Any key after success -> store credential and close
+                    if let crate::device_auth_dialog::DeviceAuthStatus::Success(ref token) = self.device_auth_dialog.status {
+                        let provider_id = self.device_auth_dialog.provider_id.clone();
+                        let provider_name = self.device_auth_dialog.provider_name.clone();
+                        let token = token.clone();
+                        let credential = if provider_id == "github-copilot" {
+                            claurst_core::StoredCredential::OAuthToken {
+                                access: token.clone(),
+                                refresh: token,
+                                expires: 0,
+                            }
+                        } else {
+                            claurst_core::StoredCredential::ApiKey { key: token }
+                        };
+                        self.auth_store.set(
+                            &provider_id,
+                            credential,
+                        );
+                        self.set_provider_default(provider_id.clone());
+                        self.persist_provider_and_model();
+                        self.has_credentials = true;
+                        self.status_message = Some(format!(
+                            "Connected to {}! Use /model to pick a model.",
+                            provider_name
+                        ));
+                    }
+                    self.device_auth_dialog.close();
+                }
+                _ if matches!(self.device_auth_dialog.status, crate::device_auth_dialog::DeviceAuthStatus::Error(_)) => {
+                    // Any key after error -> close
+                    self.device_auth_dialog.close();
+                }
+                _ => {} // Ignore other keys while waiting
+            }
+            return false;
+        }
+
+        // API key input dialog (opened from /connect for key-based providers)
+        if self.key_input_dialog.visible {
+            match key.code {
+                KeyCode::Esc => {
+                    self.key_input_dialog.close();
+                }
+                KeyCode::Enter => {
+                    let api_key = self.key_input_dialog.take_key();
+                    let provider_id = self.key_input_dialog.provider_id.clone();
+                    let provider_name = self.key_input_dialog.provider_name.clone();
+                    if !api_key.is_empty() {
+                        self.auth_store.set(
+                            &provider_id,
+                            claurst_core::StoredCredential::ApiKey { key: api_key },
+                        );
+                        self.set_provider_default(provider_id.clone());
+                        self.persist_provider_and_model();
+                        self.has_credentials = true;
+                        self.status_message = Some(format!(
+                            "Connected to {}! Use /model to pick a model.",
+                            provider_name
+                        ));
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.key_input_dialog.backspace();
+                }
+                KeyCode::Char(c) => {
+                    self.key_input_dialog.insert_char(c);
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        // Connect-a-provider dialog (/connect command)
+        if self.connect_dialog.visible {
+            match key.code {
+                KeyCode::Esc => { self.connect_dialog.close(); }
+                KeyCode::Up => { self.connect_dialog.move_up(); }
+                KeyCode::Down => { self.connect_dialog.move_down(); }
+                KeyCode::PageUp => { self.connect_dialog.page_up(); }
+                KeyCode::PageDown => { self.connect_dialog.page_down(); }
+                KeyCode::Enter => {
+                    if let Some(selected) = self.connect_dialog.selected().cloned() {
+                        self.connect_dialog.close();
+
+                        match selected.id.as_str() {
+                            // Local providers — activate immediately, no key needed
+                            "ollama" | "lmstudio" | "llamacpp" => {
+                                self.set_provider_default(selected.id.clone());
+                                self.persist_provider_and_model();
+                                self.has_credentials = true;
+                                self.status_message = Some(format!(
+                                    "Switched to {}! Use /model to pick a model.",
+                                    selected.title
+                                ));
+                            }
+                            "anthropic" => {
+                                // Anthropic: use API key from console.anthropic.com
+                                // (OAuth requires a registered app which Claurst doesn't have)
+                                self.key_input_dialog.open("anthropic".into(), "Anthropic (API Key)".into());
+                            }
+                            "github-copilot" => {
+                                // GitHub Copilot: device code flow with Claurst's registered OAuth app
+                                self.device_auth_dialog.open("github-copilot".into(), "GitHub Copilot".into());
+                                self.device_auth_pending = Some("github-copilot".to_string());
+                            }
+                            // AWS Bedrock — accept a bearer token via key input dialog
+                            "amazon-bedrock" => {
+                                self.key_input_dialog
+                                    .open("amazon-bedrock".into(), "AWS Bedrock (Bearer Token)".into());
+                            }
+                            // All other providers — open API key input dialog
+                            _ => {
+                                self.key_input_dialog
+                                    .open(selected.id.clone(), selected.title.clone());
+                            }
+                        }
+                    }
+                }
+                KeyCode::Backspace => { self.connect_dialog.filter_pop(); }
+                KeyCode::Char(c) => { self.connect_dialog.filter_push(c); }
+                _ => {}
+            }
+            return false;
+        }
+
+        // Command palette (Ctrl+K)
+        if self.command_palette.visible {
+            match key.code {
+                KeyCode::Esc => { self.command_palette.close(); }
+                KeyCode::Up => { self.command_palette.move_up(); }
+                KeyCode::Down => { self.command_palette.move_down(); }
+                KeyCode::PageUp => { self.command_palette.page_up(); }
+                KeyCode::PageDown => { self.command_palette.page_down(); }
+                KeyCode::Enter => {
+                    if let Some(selected) = self.command_palette.selected().cloned() {
+                        self.command_palette.close();
+                        // Put the command in the input and signal for execution
+                        self.prompt_input.replace_text(selected.id.clone());
+                        return true; // signal to submit this as input
+                    }
+                }
+                KeyCode::Backspace => { self.command_palette.filter_pop(); }
+                KeyCode::Char(c) => { self.command_palette.filter_push(c); }
+                _ => {}
+            }
+            return false;
+        }
+
         // Invalid-config dialog intercepts Enter/Esc to dismiss
         if self.invalid_config_dialog.visible {
             match key.code {
@@ -1784,9 +2250,18 @@ impl App {
                         if let Some(e) = effort {
                             self.effort_level = e;
                         }
-                        self.set_model(model_id.clone());
+                        // Store explicit selections in the canonical
+                        // "provider/model" form for non-Anthropic providers.
+                        let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+                        let full_model = if provider == "anthropic" {
+                            model_id.clone()
+                        } else {
+                            format!("{}/{}", provider, model_id)
+                        };
+                        self.set_model(full_model.clone());
+                        self.persist_provider_and_model();
                         let effort_hint = effort.map(|e| format!(" [{}]", e.label())).unwrap_or_default();
-                        self.status_message = Some(format!("Model: {}{}", model_id, effort_hint));
+                        self.status_message = Some(format!("Model: {}{}", full_model, effort_hint));
                     }
                 }
                 KeyCode::Backspace => self.model_picker.pop_filter_char(),
@@ -2176,6 +2651,30 @@ impl App {
             }
         }
 
+        // ---- Keybinding processor (runs AFTER all dialog checks) ----------
+        let key_context = self.current_key_context();
+        if let Some(keystroke) = key_event_to_keystroke(&key) {
+            let had_pending_chord = self.keybindings.has_pending_chord();
+            match self.keybindings.process(keystroke, &key_context) {
+                KeybindingResult::Action(action) => {
+                    return self.handle_keybinding_action(&action);
+                }
+                KeybindingResult::Unbound | KeybindingResult::Pending => return false,
+                KeybindingResult::NoMatch if had_pending_chord => return false,
+                KeybindingResult::NoMatch => {}
+            }
+        } else {
+            self.keybindings.cancel_chord();
+        }
+
+        // Clear any active text selection on key press (except Ctrl+C which copies it).
+        let is_copy = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+        if !is_copy && self.selection_anchor.is_some() {
+            self.selection_anchor = None;
+            self.selection_focus = None;
+            *self.selection_text.borrow_mut() = String::new();
+        }
+
         // ---- Voice hold-to-talk (Alt+V toggles recording on/off) ----------
         if key.code == KeyCode::Char('v')
             && key.modifiers.contains(KeyModifiers::ALT)
@@ -2284,6 +2783,29 @@ impl App {
             return false;
         }
 
+        // ---- Focus state machine: transcript mode --------------------------
+        // When the transcript pane has focus, intercept Escape and scroll keys.
+        // Printable characters switch focus back to Input and fall through so the
+        // keystroke is processed normally by the prompt editor below.
+        if self.focus == FocusTarget::Transcript {
+            match key.code {
+                KeyCode::Esc => {
+                    self.focus = FocusTarget::Input;
+                    return false;
+                }
+                KeyCode::PageUp | KeyCode::PageDown => {
+                    // Let these fall through to the normal scroll handling below.
+                }
+                KeyCode::Char(_) if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    // Printable char: switch focus to Input and process normally.
+                    self.focus = FocusTarget::Input;
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             // ---- Quit / cancel ----------------------------------------
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2343,10 +2865,19 @@ impl App {
                 self.help_overlay.toggle();
             }
 
-            // ---- Emacs-style kill ring operations ----------------------
+            // ---- Ctrl+A: Open model picker ----
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+                self.intercept_slash_command("model");
+            }
+
+            // ---- Ctrl+K: Command palette (or Emacs kill-line if input has text) ----
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
-                self.prompt_input.kill_line();
-                self.refresh_prompt_input();
+                if self.prompt_input.is_empty() {
+                    self.command_palette.open();
+                } else {
+                    self.prompt_input.kill_line();
+                    self.refresh_prompt_input();
+                }
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
                 self.prompt_input.kill_line_backward();
@@ -2466,6 +2997,22 @@ impl App {
                 self.new_messages_while_scrolled = 0;
                 self.scroll_offset = 0;
                 return true;
+            }
+
+            // ---- Message boundary navigation (Alt+Up/Alt+Down) ----------
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+                // Jump up by ~20 lines (approximate message boundary).
+                self.scroll_offset = self.scroll_offset.saturating_add(20);
+                self.auto_scroll = false;
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                // Jump down by ~20 lines (approximate message boundary).
+                let new_off = self.scroll_offset.saturating_sub(20);
+                self.scroll_offset = new_off;
+                if new_off == 0 {
+                    self.auto_scroll = true;
+                    self.new_messages_while_scrolled = 0;
+                }
             }
 
             // ---- Input history navigation ------------------------------
@@ -3216,9 +3763,9 @@ impl App {
     /// Returns (start_row, end_row) for the line.
     #[allow(dead_code)]
     fn find_line_boundaries(&self, row: u16) -> Option<(u16, u16)> {
-        let msg_area = self.last_msg_area.get();
-        let line_start = msg_area.y;
-        let line_end = msg_area.y.saturating_add(msg_area.height).saturating_sub(1);
+        let selectable_area = self.last_selectable_area.get();
+        let line_start = selectable_area.y;
+        let line_end = selectable_area.y.saturating_add(selectable_area.height).saturating_sub(1);
 
         if row >= line_start && row <= line_end {
             Some((row, row))
@@ -3227,12 +3774,30 @@ impl App {
         }
     }
 
+    fn context_menu_items(kind: ContextMenuKind) -> &'static [ContextMenuItem] {
+        match kind {
+            ContextMenuKind::Message { .. } => &[ContextMenuItem::Copy, ContextMenuItem::Fork],
+            ContextMenuKind::Selection => &[ContextMenuItem::Copy],
+        }
+    }
+
+    fn message_index_at_row(&self, row: u16) -> Option<usize> {
+        self.message_row_map.borrow().get(&row).copied()
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+        self.selection_focus = None;
+        *self.selection_text.borrow_mut() = String::new();
+    }
+
     /// Show context menu at the given position.
-    fn show_context_menu(&mut self, x: u16, y: u16) {
+    fn show_context_menu(&mut self, x: u16, y: u16, kind: ContextMenuKind) {
         self.context_menu_state = Some(ContextMenuState {
             x,
             y,
             selected_index: 0,
+            kind,
         });
     }
 
@@ -3244,8 +3809,7 @@ impl App {
     /// Handle context menu navigation with arrow keys.
     fn navigate_context_menu(&mut self, direction: KeyCode) {
         if let Some(mut menu) = self.context_menu_state {
-            // Copy (4 variants) + Paste, Cut, Select All, Clear = 8 items
-            let item_count = 9;
+            let item_count = Self::context_menu_items(menu.kind).len();
             match direction {
                 KeyCode::Up => {
                     menu.selected_index = menu.selected_index.saturating_sub(1);
@@ -3262,32 +3826,36 @@ impl App {
     /// Execute the currently selected context menu item.
     fn execute_context_menu_item(&mut self) {
         if let Some(menu) = self.context_menu_state {
-            let items = [
-                ContextMenuItem::Copy,
-                ContextMenuItem::CopyAsMarkdown,
-                ContextMenuItem::CopyAsPlaintext,
-                ContextMenuItem::CopyCodeBlocks,
-                ContextMenuItem::CopyAsJson,
-                ContextMenuItem::Paste,
-                ContextMenuItem::Cut,
-                ContextMenuItem::SelectAll,
-                ContextMenuItem::Clear,
-            ];
+            let items = Self::context_menu_items(menu.kind);
 
             if menu.selected_index < items.len() {
                 let item = items[menu.selected_index];
-                self.handle_context_menu_action(item);
+                self.handle_context_menu_action(item, menu.kind);
             }
         }
         self.dismiss_context_menu();
     }
 
     /// Handle a context menu action.
-    fn handle_context_menu_action(&mut self, item: ContextMenuItem) {
+    fn handle_context_menu_action(&mut self, item: ContextMenuItem, kind: ContextMenuKind) {
         match item {
             ContextMenuItem::Copy => {
-                let text = self.selection_text.borrow();
-                if !text.is_empty() {
+                let text = match kind {
+                    ContextMenuKind::Message { message_index } => self
+                        .messages
+                        .get(message_index)
+                        .map(|message| message.get_all_text()),
+                    ContextMenuKind::Selection => {
+                        let selected = self.selection_text.borrow().trim().to_string();
+                        if selected.is_empty() {
+                            None
+                        } else {
+                            Some(selected)
+                        }
+                    }
+                };
+
+                if let Some(text) = text {
                     if crate::message_copy::copy_to_clipboard(&text) {
                         self.notifications.push(
                             NotificationKind::Info,
@@ -3304,109 +3872,13 @@ impl App {
                     debug!("Copy action triggered, text: {} chars", text.len());
                 }
             }
-            ContextMenuItem::CopyAsMarkdown => {
-                if let Some(msg) = self.messages.last() {
-                    let markdown = crate::message_copy::copy_as_markdown(msg);
-                    if crate::message_copy::copy_to_clipboard(&markdown) {
-                        self.notifications.push(
-                            NotificationKind::Info,
-                            "Copied as Markdown.".to_string(),
-                            Some(3),
-                        );
-                    } else {
-                        self.notifications.push(
-                            NotificationKind::Warning,
-                            "Failed to copy to clipboard.".to_string(),
-                            Some(3),
-                        );
-                    }
+            ContextMenuItem::Fork => {
+                if let ContextMenuKind::Message { message_index } = kind {
+                    let branch_point = message_index + 1;
+                    self.prompt_input.replace_text(format!("/fork {}", branch_point));
+                    self.status_message =
+                        Some(format!("Fork at message {} - press Enter to confirm", branch_point));
                 }
-            }
-            ContextMenuItem::CopyAsPlaintext => {
-                if let Some(msg) = self.messages.last() {
-                    let plaintext = crate::message_copy::copy_as_plaintext(msg);
-                    if crate::message_copy::copy_to_clipboard(&plaintext) {
-                        self.notifications.push(
-                            NotificationKind::Info,
-                            "Copied as plaintext.".to_string(),
-                            Some(3),
-                        );
-                    } else {
-                        self.notifications.push(
-                            NotificationKind::Warning,
-                            "Failed to copy to clipboard.".to_string(),
-                            Some(3),
-                        );
-                    }
-                }
-            }
-            ContextMenuItem::CopyCodeBlocks => {
-                if let Some(msg) = self.messages.last() {
-                    let code = crate::message_copy::copy_code_blocks(msg);
-                    if crate::message_copy::copy_to_clipboard(&code) {
-                        self.notifications.push(
-                            NotificationKind::Info,
-                            "Copied code blocks.".to_string(),
-                            Some(3),
-                        );
-                    } else {
-                        self.notifications.push(
-                            NotificationKind::Warning,
-                            "Failed to copy to clipboard.".to_string(),
-                            Some(3),
-                        );
-                    }
-                }
-            }
-            ContextMenuItem::CopyAsJson => {
-                if let Some(msg) = self.messages.last() {
-                    let json = crate::message_copy::copy_as_json(msg);
-                    if crate::message_copy::copy_to_clipboard(&json) {
-                        self.notifications.push(
-                            NotificationKind::Info,
-                            "Copied as JSON.".to_string(),
-                            Some(3),
-                        );
-                    } else {
-                        self.notifications.push(
-                            NotificationKind::Warning,
-                            "Failed to copy to clipboard.".to_string(),
-                            Some(3),
-                        );
-                    }
-                }
-            }
-            ContextMenuItem::Paste => {
-                debug!("Paste action triggered");
-            }
-            ContextMenuItem::Cut => {
-                let text = self.selection_text.borrow();
-                if !text.is_empty() {
-                    if crate::message_copy::copy_to_clipboard(&text) {
-                        self.notifications.push(
-                            NotificationKind::Info,
-                            "Cut to clipboard.".to_string(),
-                            Some(3),
-                        );
-                    }
-                    debug!("Cut action triggered, text: {} chars", text.len());
-                    self.selection_anchor = None;
-                    self.selection_focus = None;
-                }
-            }
-            ContextMenuItem::SelectAll => {
-                // Select all messages in the message pane
-                let msg_area = self.last_msg_area.get();
-                self.selection_anchor = Some((msg_area.x, msg_area.y));
-                self.selection_focus = Some((
-                    msg_area.x.saturating_add(msg_area.width).saturating_sub(1),
-                    msg_area.y.saturating_add(msg_area.height).saturating_sub(1),
-                ));
-            }
-            ContextMenuItem::Clear => {
-                self.selection_anchor = None;
-                self.selection_focus = None;
-                *self.selection_text.borrow_mut() = String::new();
             }
         }
     }
@@ -3414,6 +3886,68 @@ impl App {
     /// Process mouse events (trackpad scroll, text selection, etc.).
     pub fn handle_mouse_event(&mut self, mouse_event: MouseEvent) {
         use crossterm::event::MouseButton;
+
+        // Fast-reject mouse-move events — they flood at 60+ Hz and we don't
+        // need hover tracking. Only process clicks, scroll, and drag.
+        if matches!(mouse_event.kind, MouseEventKind::Moved) {
+            return;
+        }
+
+        // ---- Dialog interaction: dismiss on click-outside, scroll/click inside ----
+        // Key-input and device-auth stay outside this gate so their visible text
+        // can still be selected and copied with the mouse.
+        let any_dialog = self.connect_dialog.visible
+            || self.command_palette.visible
+            || self.model_picker.visible
+            || self.export_dialog.visible
+            || self.settings_screen.visible
+            || self.stats_dialog.open
+            || self.context_viz.visible
+            || self.session_browser.visible;
+
+        if any_dialog {
+            match mouse_event.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    // DialogSelect dialogs — check if click is inside for item selection
+                    let in_dialog = if self.connect_dialog.visible {
+                        self.connect_dialog.contains(mouse_event.column, mouse_event.row)
+                    } else if self.command_palette.visible {
+                        self.command_palette.contains(mouse_event.column, mouse_event.row)
+                    } else {
+                        // Other dialogs (model_picker, settings, export, etc.) —
+                        // treat any click as "inside" to prevent accidental dismiss.
+                        // User must press Esc to close these.
+                        true
+                    };
+
+                    if in_dialog {
+                        // Click inside a DialogSelect — select the clicked item
+                        if self.connect_dialog.visible {
+                            self.connect_dialog.handle_mouse_click(mouse_event.row);
+                        } else if self.command_palette.visible {
+                            self.command_palette.handle_mouse_click(mouse_event.row);
+                        }
+                        // Other dialogs: click absorbed, no action needed
+                    } else {
+                        // Click outside a DialogSelect — dismiss and restore input focus
+                        self.close_secondary_views();
+                        self.focus = FocusTarget::Input;
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    // Scroll through dialog items
+                    if self.connect_dialog.visible { self.connect_dialog.move_up(); }
+                    else if self.command_palette.visible { self.command_palette.move_up(); }
+                }
+                MouseEventKind::ScrollDown => {
+                    if self.connect_dialog.visible { self.connect_dialog.move_down(); }
+                    else if self.command_palette.visible { self.command_palette.move_down(); }
+                }
+                _ => {}
+            }
+            return; // Don't process any other mouse events when a dialog is open
+        }
+
         match mouse_event.kind {
             MouseEventKind::ScrollUp => {
                 // Don't consume Ctrl+Scroll — let the terminal handle zoom.
@@ -3421,8 +3955,6 @@ impl App {
                     let step = self.scroll_step();
                     self.scroll_offset = self.scroll_offset.saturating_add(step);
                     self.auto_scroll = false;
-                    self.selection_anchor = None;
-                    self.selection_focus = None;
                 }
             }
             MouseEventKind::ScrollDown => {
@@ -3434,34 +3966,64 @@ impl App {
                         self.auto_scroll = true;
                         self.new_messages_while_scrolled = 0;
                     }
-                    self.selection_anchor = None;
-                    self.selection_focus = None;
                 }
             }
             // ---- Right-click context menu ----------------------------------
             MouseEventKind::Down(MouseButton::Right) => {
                 let msg_area = self.last_msg_area.get();
+                let has_selection = !self.selection_text.borrow().trim().is_empty();
                 if mouse_event.column >= msg_area.x
                     && mouse_event.column < msg_area.x.saturating_add(msg_area.width)
                     && mouse_event.row >= msg_area.y
-                    && mouse_event.row < msg_area.y.saturating_add(msg_area.height) {
-                    self.show_context_menu(mouse_event.column, mouse_event.row);
+                    && mouse_event.row < msg_area.y.saturating_add(msg_area.height)
+                {
+                    if let Some(message_index) = self.message_index_at_row(mouse_event.row) {
+                        self.show_context_menu(
+                            mouse_event.column,
+                            mouse_event.row,
+                            ContextMenuKind::Message { message_index },
+                        );
+                    } else {
+                        self.dismiss_context_menu();
+                    }
+                } else if has_selection {
+                    self.show_context_menu(
+                        mouse_event.column,
+                        mouse_event.row,
+                        ContextMenuKind::Selection,
+                    );
+                } else {
+                    self.dismiss_context_menu();
                 }
             }
 
-            // ---- Text selection ---------------------------------
+            // ---- Text selection / focus routing -------------------------
             MouseEventKind::Down(MouseButton::Left) => {
                 // Dismiss context menu on left click
                 self.dismiss_context_menu();
 
-                let msg_area = self.last_msg_area.get();
-                if msg_area.width == 0 || msg_area.height == 0 {
-                    // Message area not initialized yet
+                let input_area = self.last_input_area.get();
+                let selectable_area = self.last_selectable_area.get();
+
+                let in_input = input_area.width > 0 && input_area.height > 0
+                    && mouse_event.row >= input_area.y
+                    && mouse_event.row < input_area.y.saturating_add(input_area.height)
+                    && mouse_event.column >= input_area.x
+                    && mouse_event.column < input_area.x.saturating_add(input_area.width);
+
+                let in_selectable = selectable_area.width > 0 && selectable_area.height > 0
+                    && mouse_event.row >= selectable_area.y
+                    && mouse_event.row < selectable_area.y.saturating_add(selectable_area.height)
+                    && mouse_event.column >= selectable_area.x
+                    && mouse_event.column < selectable_area.x.saturating_add(selectable_area.width);
+
+                if in_input {
+                    self.focus = FocusTarget::Input;
+                    self.clear_selection();
+                } else if selectable_area.width == 0 || selectable_area.height == 0 {
                     self.click_count = 0;
-                } else if mouse_event.column >= msg_area.x
-                    && mouse_event.column < msg_area.x.saturating_add(msg_area.width)
-                    && mouse_event.row >= msg_area.y
-                    && mouse_event.row < msg_area.y.saturating_add(msg_area.height) {
+                } else if in_selectable {
+                    self.focus = FocusTarget::Transcript;
 
                     let current_pos = (mouse_event.column, mouse_event.row);
                     let now = std::time::Instant::now();
@@ -3471,9 +4033,12 @@ impl App {
                         self.click_count += 1;
                         if self.click_count >= 3 {
                             // Triple-click: select entire line
-                            self.selection_anchor = Some((msg_area.x, current_pos.1));
+                            self.selection_anchor = Some((selectable_area.x, current_pos.1));
                             self.selection_focus = Some((
-                                msg_area.x.saturating_add(msg_area.width).saturating_sub(1),
+                                selectable_area
+                                    .x
+                                    .saturating_add(selectable_area.width)
+                                    .saturating_sub(1),
                                 current_pos.1,
                             ));
                             self.click_count = 0; // Reset for next click sequence
@@ -3495,41 +4060,34 @@ impl App {
                     self.last_click_time = Some(now);
                     self.last_click_position = Some(current_pos);
                 } else {
-                    // Click outside message area resets click count and selection
                     self.click_count = 0;
-                    self.selection_anchor = None;
-                    self.selection_focus = None;
+                    self.clear_selection();
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 // Dismiss context menu on drag
                 self.dismiss_context_menu();
 
-                // Continue drag within message pane bounds
+                // Continue drag — clamp to the selectable frame bounds so dragging
+                // outside extends selection to the edge rather than cancelling.
                 if self.selection_anchor.is_some() {
-                    let msg_area = self.last_msg_area.get();
-                    if msg_area.width > 0 && msg_area.height > 0
-                        && mouse_event.column >= msg_area.x
-                        && mouse_event.column < msg_area.x.saturating_add(msg_area.width)
-                        && mouse_event.row >= msg_area.y
-                        && mouse_event.row < msg_area.y.saturating_add(msg_area.height) {
-                        self.selection_focus = Some((mouse_event.column, mouse_event.row));
+                    let selectable_area = self.last_selectable_area.get();
+                    if selectable_area.width > 0 && selectable_area.height > 0 {
+                        let clamped_col = mouse_event.column
+                            .max(selectable_area.x)
+                            .min(selectable_area.x.saturating_add(selectable_area.width).saturating_sub(1));
+                        let clamped_row = mouse_event.row
+                            .max(selectable_area.y)
+                            .min(selectable_area.y.saturating_add(selectable_area.height).saturating_sub(1));
+                        self.selection_focus = Some((clamped_col, clamped_row));
                         self.click_count = 0; // Reset on drag to prevent further double-clicks
-                    } else if mouse_event.column < msg_area.x
-                        || mouse_event.column >= msg_area.x.saturating_add(msg_area.width)
-                        || mouse_event.row < msg_area.y
-                        || mouse_event.row >= msg_area.y.saturating_add(msg_area.height) {
-                        // Drag went outside message area - cancel selection
-                        self.selection_anchor = None;
-                        self.selection_focus = None;
                     }
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 // Clear if no actual drag (single click = no selection)
                 if self.selection_anchor == self.selection_focus {
-                    self.selection_anchor = None;
-                    self.selection_focus = None;
+                    self.clear_selection();
                 }
             }
             _ => {}
@@ -3561,7 +4119,7 @@ impl App {
                 }
                 self.is_streaming = true;
                 match stream_evt {
-                    claurst_api::StreamEvent::ContentBlockDelta { delta, .. } => {
+                    claurst_api::AnthropicStreamEvent::ContentBlockDelta { delta, .. } => {
                         // Reset stall timer on any incoming delta — we're making progress.
                         self.stall_start = None;
                         match delta {
@@ -3575,7 +4133,7 @@ impl App {
                             _ => {}
                         }
                     }
-                    claurst_api::StreamEvent::MessageStop => {
+                    claurst_api::AnthropicStreamEvent::MessageStop => {
                         self.is_streaming = false;
                         self.spinner_verb = None;
                         self.stall_start = None;
@@ -3739,17 +4297,69 @@ impl App {
 
             // Expire old notifications
             self.notifications.tick();
+            self.memory_update_notification.tick();
 
             // Drain background model-fetch results (non-blocking).
             if let Some(ref mut rx) = self.model_fetch_rx {
-                if let Ok(entries) = rx.try_recv() {
-                    let current = self.model_name.clone();
-                    self.model_picker.set_models(entries);
-                    // Re-apply the current-model highlight so it stays accurate.
-                    for m in &mut self.model_picker.models {
-                        m.is_current = m.id == current;
+                match rx.try_recv() {
+                    Ok(Ok(entries)) => {
+                        let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+                        let provider_prefix = format!("{}/", provider);
+                        let current = self
+                            .model_name
+                            .strip_prefix(&provider_prefix)
+                            .unwrap_or(self.model_name.as_str())
+                            .to_string();
+                        self.model_picker.set_models(entries);
+                        // Re-apply the current-model highlight so it stays accurate.
+                        for m in &mut self.model_picker.models {
+                            m.is_current = m.id == current;
+                        }
+                        self.model_fetch_rx = None;
                     }
-                    self.model_fetch_rx = None;
+                    Ok(Err(()))
+                    | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        self.model_picker.loading_models = false;
+                        self.model_fetch_rx = None;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                }
+            }
+
+            // Spawn async provider model-list fetch when requested.
+            if self.model_picker_fetch_pending {
+                self.model_picker_fetch_pending = false;
+                let provider_id_str = self.config.provider.clone().unwrap_or_else(|| "anthropic".to_string());
+                if let Some(ref registry) = self.provider_registry {
+                    let pid = claurst_core::ProviderId::new(&provider_id_str);
+                    if let Some(provider) = registry.get(&pid) {
+                        let provider = provider.clone();
+                        let (tx, rx) = tokio::sync::mpsc::channel(1);
+                        self.model_fetch_rx = Some(rx);
+                        self.model_picker.loading_models = true;
+                        tokio::spawn(async move {
+                            match provider.list_models().await {
+                                Ok(models) => {
+                                    let entries: Vec<crate::model_picker::ModelEntry> = models
+                                        .into_iter()
+                                        .map(|m| {
+                                            let ctx_k = m.context_window / 1000;
+                                            crate::model_picker::ModelEntry {
+                                                id: m.id.to_string(),
+                                                display_name: m.name.clone(),
+                                                description: format!("{}K context", ctx_k),
+                                                is_current: false,
+                                            }
+                                        })
+                                        .collect();
+                                    let _ = tx.send(Ok(entries)).await;
+                                }
+                                Err(_) => {
+                                    let _ = tx.send(Err(())).await;
+                                }
+                            }
+                        });
+                    }
                 }
             }
 
@@ -3874,65 +4484,7 @@ impl App {
                         self.refresh_prompt_input();
                     }
                     Event::Mouse(mouse_event) => {
-                        use crossterm::event::MouseButton;
-                        match mouse_event.kind {
-                            MouseEventKind::ScrollUp => {
-                                // Don't consume Ctrl+Scroll — let the terminal handle zoom.
-                                if !mouse_event.modifiers.contains(KeyModifiers::CONTROL) {
-                                    let step = self.scroll_step();
-                                    self.scroll_offset = self.scroll_offset.saturating_add(step);
-                                    self.auto_scroll = false;
-                                    self.selection_anchor = None;
-                                    self.selection_focus = None;
-                                }
-                            }
-                            MouseEventKind::ScrollDown => {
-                                if !mouse_event.modifiers.contains(KeyModifiers::CONTROL) {
-                                    let step = self.scroll_step();
-                                    let new_off = self.scroll_offset.saturating_sub(step);
-                                    self.scroll_offset = new_off;
-                                    if new_off == 0 {
-                                        self.auto_scroll = true;
-                                        self.new_messages_while_scrolled = 0;
-                                    }
-                                    self.selection_anchor = None;
-                                    self.selection_focus = None;
-                                }
-                            }
-                            // ---- Text selection ---------------------------------
-                            MouseEventKind::Down(MouseButton::Left) => {
-                                // Only allow selection within the message pane area
-                                let msg_area = self.last_msg_area.get();
-                                if mouse_event.column >= msg_area.x
-                                    && mouse_event.column < msg_area.x.saturating_add(msg_area.width)
-                                    && mouse_event.row >= msg_area.y
-                                    && mouse_event.row < msg_area.y.saturating_add(msg_area.height) {
-                                    self.selection_anchor = Some((mouse_event.column, mouse_event.row));
-                                    self.selection_focus = Some((mouse_event.column, mouse_event.row));
-                                    *self.selection_text.borrow_mut() = String::new();
-                                }
-                            }
-                            MouseEventKind::Drag(MouseButton::Left) => {
-                                // Continue drag within message pane bounds
-                                if self.selection_anchor.is_some() {
-                                    let msg_area = self.last_msg_area.get();
-                                    if mouse_event.column >= msg_area.x
-                                        && mouse_event.column < msg_area.x.saturating_add(msg_area.width)
-                                        && mouse_event.row >= msg_area.y
-                                        && mouse_event.row < msg_area.y.saturating_add(msg_area.height) {
-                                        self.selection_focus = Some((mouse_event.column, mouse_event.row));
-                                    }
-                                }
-                            }
-                            MouseEventKind::Up(MouseButton::Left) => {
-                                // Clear if no actual drag (single click = no selection)
-                                if self.selection_anchor == self.selection_focus {
-                                    self.selection_anchor = None;
-                                    self.selection_focus = None;
-                                }
-                            }
-                            _ => {}
-                        }
+                        self.handle_mouse_event(mouse_event);
                     }
                     _ => {}
                 }
@@ -4065,6 +4617,54 @@ mod tests {
         assert_eq!(app.output_style, "verbose");
         assert!(app.intercept_slash_command("output-style"));
         assert_eq!(app.output_style, "auto");
+    }
+
+    #[test]
+    fn test_context_menu_fork_targets_clicked_message() {
+        let mut app = make_app();
+        app.add_message(Role::User, "one".to_string());
+        app.add_message(Role::Assistant, "two".to_string());
+        app.add_message(Role::User, "three".to_string());
+
+        app.handle_context_menu_action(
+            ContextMenuItem::Fork,
+            ContextMenuKind::Message { message_index: 1 },
+        );
+
+        assert_eq!(app.prompt_input.text, "/fork 2");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Fork at message 2 - press Enter to confirm")
+        );
+    }
+
+    #[test]
+    fn test_right_click_targets_row_message_instead_of_last_message() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut app = make_app();
+        app.last_msg_area.set(ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        });
+        app.message_row_map.borrow_mut().insert(3, 1);
+
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 12,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert!(matches!(
+            app.context_menu_state,
+            Some(ContextMenuState {
+                kind: ContextMenuKind::Message { message_index: 1 },
+                ..
+            })
+        ));
     }
 
     // ---- Help overlay -------------------------------------------------------

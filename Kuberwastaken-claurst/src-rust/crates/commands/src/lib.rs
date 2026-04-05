@@ -169,6 +169,12 @@ pub struct InsightsCommand;
 pub struct UltrareviewCommand;
 pub struct AdvisorCommand;
 pub struct InstallSlackAppCommand;
+pub struct UndoCommand;
+pub struct ProvidersCommand;
+pub struct ConnectCommand;
+pub struct AgentCommand;
+pub struct SearchCommand;
+pub struct ForkCommand;
 pub struct NamedCommandAdapter {
     pub slash_name: &'static str,
     pub target_name: &'static str,
@@ -370,7 +376,7 @@ fn execute_named_command_from_slash(
 /// Category labels for help grouping.
 fn command_category(name: &str) -> &'static str {
     match name {
-        "clear" | "compact" | "rewind" | "summary" | "export" | "rename" | "branch" => {
+        "clear" | "compact" | "rewind" | "summary" | "export" | "rename" | "branch" | "fork" => {
             "Conversation"
         }
         "model" | "config" | "theme" | "color" | "vim" | "fast" | "effort"
@@ -618,17 +624,43 @@ impl SlashCommand for ExitCommand {
 impl SlashCommand for ModelCommand {
     fn name(&self) -> &str { "model" }
     fn description(&self) -> &str { "Show or change the current model" }
+    fn help(&self) -> &str {
+        "Usage: /model [<model-id>]\n\n\
+         Without arguments, shows the current model.\n\n\
+         With a model ID, switches to that model.  Accepts both bare model\n\
+         names (e.g. claude-sonnet-4-6) and provider-prefixed format\n\
+         (e.g. openai/gpt-4o, google/gemini-2.0-flash).\n\n\
+         Examples:\n\
+           /model                        — show current model\n\
+           /model claude-opus-4-6        — switch to Claude Opus 4.6\n\
+           /model openai/gpt-4o          — switch to GPT-4o via OpenAI\n\
+           /model google/gemini-2.0-flash — switch to Gemini 2.0 Flash"
+    }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let args = args.trim();
         if args.is_empty() {
             CommandResult::Message(format!(
                 "Current model: {}",
                 ctx.config.effective_model()
             ))
         } else {
+            // Accept both "provider/model" and bare model names.
+            // The config stores the full string (including provider prefix when present)
+            // so that downstream dispatch can route to the correct provider.
+            let model_str = args.to_string();
+            let confirmation = if let Some((provider, model)) = model_str.split_once('/') {
+                if provider == "anthropic" {
+                    format!("Switched to {}", model)
+                } else {
+                    format!("Switched to {}/{}", provider, model)
+                }
+            } else {
+                format!("Switched to {}", model_str)
+            };
             let mut new_config = ctx.config.clone();
-            new_config.model = Some(args.trim().to_string());
-            CommandResult::ConfigChange(new_config)
+            new_config.model = Some(model_str);
+            CommandResult::ConfigChangeMessage(new_config, confirmation)
         }
     }
 }
@@ -822,7 +854,7 @@ impl SlashCommand for ColorCommand {
          Named colors: red, green, blue, yellow, cyan, magenta, white, orange, purple\n\
          Hex codes:    #RGB or #RRGGBB\n\
          Reset:        /color default\n\n\
-         The color is persisted to ~/.claude/ui-settings.json and\n\
+         The color is persisted to ~/.claurst/ui-settings.json and\n\
          applied on the next REPL startup."
     }
 
@@ -971,7 +1003,7 @@ impl SlashCommand for OutputStyleCommand {
 #[async_trait]
 impl SlashCommand for KeybindingsCommand {
     fn name(&self) -> &str { "keybindings" }
-    fn description(&self) -> &str { "Create or open ~/.claude/keybindings.json" }
+    fn description(&self) -> &str { "Create or open ~/.claurst/keybindings.json" }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
         let config_dir = Settings::config_dir();
@@ -1037,7 +1069,7 @@ impl SlashCommand for KeybindingsCommand {
 #[async_trait]
 impl SlashCommand for PrivacySettingsCommand {
     fn name(&self) -> &str { "privacy-settings" }
-    fn description(&self) -> &str { "Open Claude privacy settings" }
+    fn description(&self) -> &str { "Open Claurst privacy settings" }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
         let url = "https://claude.ai/settings/data-privacy-controls";
@@ -1273,36 +1305,36 @@ impl SlashCommand for DiffCommand {
 #[async_trait]
 impl SlashCommand for MemoryCommand {
     fn name(&self) -> &str { "memory" }
-    fn description(&self) -> &str { "View, edit, or clear CLAUDE.md memory files" }
+    fn description(&self) -> &str { "View, edit, or clear AGENTS.md memory files" }
     fn help(&self) -> &str {
         "Usage: /memory [edit|clear] [global]\n\n\
-         Shows the content of CLAUDE.md files that provide project context to Claude.\n\
-         Claude reads these files automatically at session start.\n\n\
+         Shows the content of AGENTS.md files that provide project context to Claurst.\n\
+         Claurst reads these files automatically at session start.\n\n\
          Subcommands:\n\
-           /memory              — show all CLAUDE.md files\n\
-           /memory edit         — open project CLAUDE.md in your editor\n\
-           /memory edit global  — open global ~/.claude/CLAUDE.md in your editor\n\
-           /memory clear        — clear the project CLAUDE.md\n\
-           /memory clear global — clear the global ~/.claude/CLAUDE.md\n\n\
+           /memory              — show all AGENTS.md files\n\
+           /memory edit         — open project AGENTS.md in your editor\n\
+           /memory edit global  — open global ~/.claurst/AGENTS.md in your editor\n\
+           /memory clear        — clear the project AGENTS.md\n\
+           /memory clear global — clear the global ~/.claurst/AGENTS.md\n\n\
          Locations checked (in priority order):\n\
-           1. <project>/.claude/CLAUDE.md\n\
-           2. <project>/CLAUDE.md\n\
-           3. ~/.claude/CLAUDE.md  (global)\n\n\
-         Use /init to create a new CLAUDE.md from a template."
+           1. <project>/.claurst/AGENTS.md\n\
+           2. <project>/AGENTS.md\n\
+           3. ~/.claurst/AGENTS.md  (global)\n\n\
+         Use /init to create a new AGENTS.md from a template."
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        let project_claude_dir = ctx.working_dir.join(".claude").join("CLAUDE.md");
-        let project_root = ctx.working_dir.join("CLAUDE.md");
+        let project_claude_dir = ctx.working_dir.join(".claurst").join("AGENTS.md");
+        let project_root = ctx.working_dir.join("AGENTS.md");
         let global_path = dirs::home_dir()
             .unwrap_or_default()
-            .join(".claude")
-            .join("CLAUDE.md");
+            .join(".claurst")
+            .join("AGENTS.md");
 
         let locations = [
-            ("project (.claude/CLAUDE.md)", project_claude_dir.clone()),
-            ("project (CLAUDE.md)", project_root.clone()),
-            ("global (~/.claude/CLAUDE.md)", global_path.clone()),
+            ("project (.claurst/AGENTS.md)", project_claude_dir.clone()),
+            ("project (AGENTS.md)", project_root.clone()),
+            ("global (~/.claurst/AGENTS.md)", global_path.clone()),
         ];
 
         let cmd = args.trim();
@@ -1319,7 +1351,7 @@ impl SlashCommand for MemoryCommand {
                     global_path.clone()
                 }
                 _ => {
-                    // Best project CLAUDE.md
+                    // Best project AGENTS.md
                     if project_root.exists() {
                         project_root.clone()
                     } else if project_claude_dir.exists() {
@@ -1372,12 +1404,12 @@ impl SlashCommand for MemoryCommand {
         if cmd == "clear" || cmd.starts_with("clear ") {
             let target_hint = cmd.strip_prefix("clear").map(|s| s.trim()).unwrap_or("project");
             let (label, target) = match target_hint {
-                "global" => ("global (~/.claude/CLAUDE.md)", global_path.clone()),
+                "global" => ("global (~/.claurst/AGENTS.md)", global_path.clone()),
                 _ => {
                     if project_claude_dir.exists() {
-                        ("project (.claude/CLAUDE.md)", project_claude_dir.clone())
+                        ("project (.claurst/AGENTS.md)", project_claude_dir.clone())
                     } else {
-                        ("project (CLAUDE.md)", project_root.clone())
+                        ("project (AGENTS.md)", project_root.clone())
                     }
                 }
             };
@@ -1390,7 +1422,7 @@ impl SlashCommand for MemoryCommand {
             return match tokio::fs::write(&target, "").await {
                 Ok(_) => CommandResult::Message(format!(
                     "Cleared {} memory file at {}.\n\
-                     Claude will no longer see this content at session start.",
+                     Claurst will no longer see this content at session start.",
                     label,
                     target.display()
                 )),
@@ -1401,7 +1433,7 @@ impl SlashCommand for MemoryCommand {
         }
 
         // ---- /memory (show all) -----------------------------------------------
-        let mut output = String::from("CLAUDE.md Memory Files\n══════════════════════\n");
+        let mut output = String::from("AGENTS.md Memory Files\n══════════════════════\n");
         let mut found_any = false;
 
         for (label, path) in &locations {
@@ -1436,17 +1468,17 @@ impl SlashCommand for MemoryCommand {
 
         if !found_any {
             output.push_str(
-                "\nNo CLAUDE.md files found.\n\
+                "\nNo AGENTS.md files found.\n\
                  Use /init to create one in the current project.\n\
                  Use /memory edit to create and open a memory file."
             );
         } else {
             output.push_str(
                 "\nSubcommands:\n\
-                 /memory edit          — edit project CLAUDE.md\n\
-                 /memory edit global   — edit global ~/.claude/CLAUDE.md\n\
-                 /memory clear         — clear project CLAUDE.md\n\
-                 /memory clear global  — clear global CLAUDE.md"
+                 /memory edit          — edit project AGENTS.md\n\
+                 /memory edit global   — edit global ~/.claurst/AGENTS.md\n\
+                 /memory clear         — clear project AGENTS.md\n\
+                 /memory clear global  — clear global AGENTS.md"
             );
         }
 
@@ -1860,7 +1892,7 @@ impl SlashCommand for DoctorCommand {
                 }
             }
             None => {
-                lines.push("  ✗ No API key found — set ANTHROPIC_API_KEY or run /login".to_string());
+                lines.push("  ✗ No Anthropic API key found — set ANTHROPIC_API_KEY, run /login, or use a different provider".to_string());
             }
         }
         // Show which model is active
@@ -1958,7 +1990,7 @@ impl SlashCommand for DoctorCommand {
             lines.push(format!("  ✗ Config dir missing: {}", config_dir.display()));
         }
 
-        // Settings validation — try loading ~/.claude/settings.json
+        // Settings validation — try loading ~/.claurst/settings.json
         let settings_path = config_dir.join("settings.json");
         if settings_path.exists() {
             match std::fs::read_to_string(&settings_path)
@@ -1985,12 +2017,12 @@ impl SlashCommand for DoctorCommand {
             lines.push("  • settings.json not found (defaults will be used)".to_string());
         }
 
-        // CLAUDE.md
-        let claude_md = ctx.working_dir.join("CLAUDE.md");
+        // AGENTS.md
+        let claude_md = ctx.working_dir.join("AGENTS.md");
         if claude_md.exists() {
-            lines.push("  ✓ CLAUDE.md present in working directory".to_string());
+            lines.push("  ✓ AGENTS.md present in working directory".to_string());
         } else {
-            lines.push("  • No CLAUDE.md in working directory (run /init to create one)".to_string());
+            lines.push("  • No AGENTS.md in working directory (run /init to create one)".to_string());
         }
         lines.push(String::new());
 
@@ -2147,13 +2179,13 @@ impl SlashCommand for LogoutCommand {
 #[async_trait]
 impl SlashCommand for InitCommand {
     fn name(&self) -> &str { "init" }
-    fn description(&self) -> &str { "Initialize a new project with CLAUDE.md" }
+    fn description(&self) -> &str { "Initialize a new project with AGENTS.md" }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
-        let path = ctx.working_dir.join("CLAUDE.md");
+        let path = ctx.working_dir.join("AGENTS.md");
         if path.exists() {
             return CommandResult::Message(format!(
-                "CLAUDE.md already exists at {}",
+                "AGENTS.md already exists at {}",
                 path.display()
             ));
         }
@@ -2167,10 +2199,10 @@ impl SlashCommand for InitCommand {
 
         match tokio::fs::write(&path, default_content).await {
             Ok(()) => CommandResult::Message(format!(
-                "Created CLAUDE.md at {}",
+                "Created AGENTS.md at {}",
                 path.display()
             )),
-            Err(e) => CommandResult::Error(format!("Failed to create CLAUDE.md: {}", e)),
+            Err(e) => CommandResult::Error(format!("Failed to create AGENTS.md: {}", e)),
         }
     }
 }
@@ -2338,7 +2370,7 @@ impl SlashCommand for ReviewCommand {
                 let mut acc = claurst_api::StreamAccumulator::new();
                 while let Some(evt) = rx.recv().await {
                     acc.on_event(&evt);
-                    if matches!(evt, claurst_api::StreamEvent::MessageStop) {
+                    if matches!(evt, claurst_api::AnthropicStreamEvent::MessageStop) {
                         break;
                     }
                 }
@@ -2370,7 +2402,7 @@ impl SlashCommand for ReviewCommand {
                 // Determine owner/repo from git remote
                 if let Some((owner, repo)) = detect_github_owner_repo(&repo_root) {
                     let comment_body = format!(
-                        "## Claude Code Review\n\n{}\n\n---\n*Generated by [Claurst](https://claude.ai/claude-code)*",
+                        "## Claurst Code Review\n\n{}\n\n---\n*Generated by [Claurst](https://claude.ai/claude-code)*",
                         review_text
                     );
 
@@ -2538,7 +2570,7 @@ impl SlashCommand for HooksCommand {
             // so the user knows what to do.
             return CommandResult::Message(
                 "No hooks configured.\n\
-                 Add hooks to ~/.claude/settings.json under the 'hooks' key.\n\
+                 Add hooks to ~/.claurst/settings.json under the 'hooks' key.\n\
                  Example:\n\
                  \x20 \"hooks\": {\n\
                  \x20   \"PreToolUse\": [{ \"matcher\": \"*\", \"hooks\": [{ \"type\": \"command\", \"command\": \"echo $STDIN\" }] }]\n\
@@ -2563,7 +2595,7 @@ impl SlashCommand for McpCommand {
     fn help(&self) -> &str {
         "Usage: /mcp [list|status|auth <server>|connect <server>|logs <server>|resources|prompts|get-prompt ...]\n\n\
          Manages Model Context Protocol (MCP) servers.\n\
-         MCP servers extend Claude with external tools, resources, and prompt templates.\n\n\
+         MCP servers extend Claurst with external tools, resources, and prompt templates.\n\n\
          Subcommands:\n\
            /mcp                        — list configured servers with live status\n\
            /mcp list                   — same as above\n\
@@ -2574,7 +2606,7 @@ impl SlashCommand for McpCommand {
            /mcp resources [server]     — list resources from connected servers\n\
            /mcp prompts [server]       — list prompt templates from connected servers\n\
            /mcp get-prompt <server> <prompt> [key=value ...]  — expand a prompt template\n\n\
-         To add/remove MCP servers, edit ~/.claude/settings.json\n\
+         To add/remove MCP servers, edit ~/.claurst/settings.json\n\
          under the 'mcpServers' key.\n\
          Docs: https://docs.anthropic.com/claude-code/mcp"
     }
@@ -2640,7 +2672,7 @@ impl SlashCommand for McpCommand {
         if ctx.config.mcp_servers.is_empty() {
             return CommandResult::Message(
                 "No MCP servers configured.\n\n\
-                 To add a MCP server, edit ~/.claude/settings.json:\n\
+                 To add a MCP server, edit ~/.claurst/settings.json:\n\
                  {\n\
                    \"mcpServers\": [\n\
                      {\n\
@@ -2799,7 +2831,7 @@ impl McpCommand {
                 "MCP Server '{}' (stdio){}\n\
                  {}\n\n\
                  stdio servers authenticate via environment variables (API keys etc.).\n\
-                 Add required variables to the 'env' block in ~/.claude/settings.json,\n\
+                 Add required variables to the 'env' block in ~/.claurst/settings.json,\n\
                  then restart Claurst or run /mcp connect {} to reconnect.",
                 server_name, token_note, env_note, server_name
             ));
@@ -2815,7 +2847,7 @@ impl McpCommand {
                         "MCP OAuth — '{}'\n\
                          Opening browser for authentication...\n\
                          If the browser did not open, visit:\n\n  {}\n\n\
-                         After authorizing, the token will be saved to:\n  ~/.claude/mcp-tokens/{}.json\n\n\
+                         After authorizing, the token will be saved to:\n  ~/.claurst/mcp-tokens/{}.json\n\n\
                          Then run /mcp connect {} to reconnect.",
                         server_name, auth_url, server_name, server_name
                     ));
@@ -2845,9 +2877,9 @@ impl McpCommand {
              Server URL: {}\n\n\
              To authenticate:\n\
              1. Open the server URL in your browser and complete OAuth\n\
-             2. The token is saved to ~/.claude/mcp-tokens/{}.json\n\
+             2. The token is saved to ~/.claurst/mcp-tokens/{}.json\n\
              3. Restart Claurst — the token will be used automatically\n\n\
-             Token storage: ~/.claude/mcp-tokens/{}.json",
+             Token storage: ~/.claurst/mcp-tokens/{}.json",
             server_name, token_note, server_url, server_name, server_name
         ))
     }
@@ -2917,7 +2949,7 @@ impl McpCommand {
                 CommandResult::Message(format!(
                     "The MCP manager is not running in this session.\n\
                      To connect '{}', restart Claurst — servers connect automatically\n\
-                     on startup using the configuration in ~/.claude/settings.json.\n\
+                     on startup using the configuration in ~/.claurst/settings.json.\n\
                      \n\
                      If the server requires authentication, run /mcp auth {} first.",
                     server_name, server_name
@@ -2952,7 +2984,7 @@ impl McpCommand {
                              The runtime MCP manager reconnects servers automatically.\n\
                              If the server stays disconnected:\n\
                              1. Check authentication: /mcp auth {}\n\
-                             2. Verify the command/URL in ~/.claude/settings.json\n\
+                             2. Verify the command/URL in ~/.claurst/settings.json\n\
                              3. Restart Claurst to force a full reconnect",
                             server_name,
                             manager.server_status(server_name).display(),
@@ -3418,6 +3450,53 @@ impl SlashCommand for SessionCommand {
     }
 }
 
+// ---- /fork ---------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for ForkCommand {
+    fn name(&self) -> &str { "fork" }
+    fn description(&self) -> &str { "Fork the current session into a new branch" }
+    fn help(&self) -> &str {
+        "Usage: /fork [message_index]\n\n\
+         Fork the current session at the specified message index (or at the\n\
+         current point if no index is given).  Creates a new session containing\n\
+         messages up to the fork point.\n\n\
+         Examples:\n\
+           /fork        \u{2014} fork at the current end of the conversation\n\
+           /fork 5      \u{2014} fork after message 5"
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let fork_index: Option<usize> = args.trim().parse().ok();
+        let messages = &ctx.messages;
+        let fork_at = fork_index.unwrap_or(messages.len()).min(messages.len());
+        let forked_messages: Vec<_> = messages[..fork_at].to_vec();
+
+        let mut new_session = claurst_core::history::ConversationSession::new(
+            ctx.config.effective_model().to_string(),
+        );
+        new_session.messages = forked_messages;
+        new_session.parent_session_id = Some(ctx.session_id.clone());
+        new_session.fork_point_message_index = Some(fork_at);
+        new_session.title = Some(format!(
+            "Fork of {}",
+            ctx.session_title.as_deref().unwrap_or("session")
+        ));
+        new_session.working_dir = Some(
+            ctx.working_dir.to_string_lossy().to_string(),
+        );
+
+        let new_id = new_session.id.clone();
+        match claurst_core::history::save_session(&new_session).await {
+            Ok(()) => CommandResult::Message(format!(
+                "Session forked at message {}. New session: {}\nUse /resume {} to switch to it.",
+                fork_at, new_id, new_id
+            )),
+            Err(e) => CommandResult::Error(format!("Failed to save forked session: {}", e)),
+        }
+    }
+}
+
 // ---- /thinking -----------------------------------------------------------
 
 #[async_trait]
@@ -3437,7 +3516,7 @@ impl SlashCommand for ThinkingCommand {
         } else {
             CommandResult::Message(format!(
                 "Extended thinking is available with {}.\n\
-                 You can request thinking by asking Claude to 'think step by step' or \
+                 You can request thinking by asking Claurst to 'think step by step' or \
                  'think carefully before answering'.",
                 model
             ))
@@ -3727,15 +3806,15 @@ impl SlashCommand for ExportCommand {
 impl SlashCommand for SkillsCommand {
     fn name(&self) -> &str { "skills" }
     fn aliases(&self) -> Vec<&str> { vec!["skill"] }
-    fn description(&self) -> &str { "List available skills in .claude/commands/" }
+    fn description(&self) -> &str { "List available skills in .claurst/commands/" }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         let mut found: Vec<String> = Vec::new();
         let dirs = [
-            ctx.working_dir.join(".claude").join("commands"),
+            ctx.working_dir.join(".claurst").join("commands"),
             dirs::home_dir()
                 .unwrap_or_default()
-                .join(".claude")
+                .join(".claurst")
                 .join("commands"),
         ];
 
@@ -3784,19 +3863,48 @@ impl SlashCommand for SkillsCommand {
             }
         }
 
-        if found.is_empty() {
+        // Include discovered skills from .claurst/skills/ and configured paths/URLs.
+        let discovered = claurst_core::discover_skills(
+            &ctx.working_dir,
+            &ctx.config.skills,
+        );
+
+        let mut output = if found.is_empty() && discovered.is_empty() {
             return CommandResult::Message(
-                "No skills found.\nCreate .md files in .claude/commands/ to define skills.\n\
-                 Example: .claude/commands/review.md".to_string(),
+                "No skills found.\nCreate .md files in .claurst/commands/ to define skills.\n\
+                 Example: .claurst/commands/review.md".to_string(),
             );
+        } else if found.is_empty() {
+            String::new()
+        } else {
+            found.sort();
+            format!(
+                "Available skills ({}):\n{}",
+                found.len(),
+                found.iter().map(|s| format!("  /{}", s)).collect::<Vec<_>>().join("\n")
+            )
+        };
+
+        if !discovered.is_empty() {
+            let mut disc_list: Vec<(&String, &claurst_core::DiscoveredSkill)> =
+                discovered.iter().collect();
+            disc_list.sort_by_key(|(name, _)| name.as_str());
+
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(&format!("\nDiscovered skills ({}):\n", disc_list.len()));
+            for (name, skill) in disc_list {
+                output.push_str(&format!(
+                    "  /{} — {} ({})\n",
+                    name,
+                    skill.description,
+                    skill.source_path.display()
+                ));
+            }
         }
 
-        found.sort();
-        CommandResult::Message(format!(
-            "Available skills ({}):\n{}",
-            found.len(),
-            found.iter().map(|s| format!("  /{}", s)).collect::<Vec<_>>().join("\n")
-        ))
+        CommandResult::Message(output.trim_end().to_string())
     }
 }
 
@@ -4124,7 +4232,7 @@ impl SlashCommand for SummaryCommand {
 #[async_trait]
 impl SlashCommand for CommitCommand {
     fn name(&self) -> &str { "commit" }
-    fn description(&self) -> &str { "Ask Claude to commit staged changes" }
+    fn description(&self) -> &str { "Ask Claurst to commit staged changes" }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
         let extra = if args.trim().is_empty() {
@@ -4144,7 +4252,7 @@ impl SlashCommand for CommitCommand {
 }
 
 // ---------------------------------------------------------------------------
-// UI settings helpers (stored in ~/.claude/ui-settings.json)
+// UI settings helpers (stored in ~/.claurst/ui-settings.json)
 // These hold things not present in the core Config struct.
 // ---------------------------------------------------------------------------
 
@@ -5110,7 +5218,7 @@ impl SlashCommand for VimCommand {
         "Usage: /vim [on|off]\n\n\
          Toggles vim keybinding mode in the REPL input.\n\
          When enabled, use Esc to switch between INSERT and NORMAL modes.\n\n\
-         The setting is persisted to ~/.claude/ui-settings.json."
+         The setting is persisted to ~/.claurst/ui-settings.json."
     }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
@@ -5159,7 +5267,7 @@ impl SlashCommand for VoiceCommand {
         "Usage: /voice [on|off]\n\n\
          Enables or disables voice input (hold-to-talk).\n\
          Voice requires a Claude.ai subscription with the voice scope enabled.\n\
-         Setting is persisted to ~/.claude/ui-settings.json."
+         Setting is persisted to ~/.claurst/ui-settings.json."
     }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
@@ -5225,13 +5333,13 @@ impl SlashCommand for UpgradeCommand {
                 return CommandResult::Message(format!(
                     "Current version: {current}\n\
                      Could not check for updates (HTTP client error: {e})\n\
-                     Visit https://github.com/anthropics/claude-code/releases for updates."
+                     Visit https://github.com/kuberwastaken/claurst/releases for updates."
                 ))
             }
         };
 
         let resp = client
-            .get("https://api.github.com/repos/anthropics/claude-code/releases/latest")
+            .get("https://api.github.com/repos/kuberwastaken/claurst/releases/latest")
             .send()
             .await;
 
@@ -5249,7 +5357,7 @@ impl SlashCommand for UpgradeCommand {
                 let url = json
                     .get("html_url")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("https://github.com/anthropics/claude-code/releases");
+                    .unwrap_or("https://github.com/kuberwastaken/claurst/releases");
 
                 if tag == current || tag == "unknown" {
                     CommandResult::Message(format!(
@@ -5274,13 +5382,13 @@ impl SlashCommand for UpgradeCommand {
                 CommandResult::Message(format!(
                     "Current version: v{current}\n\
                      Could not check for updates (HTTP {status}).\n\
-                     Visit https://github.com/anthropics/claude-code/releases for updates."
+                     Visit https://github.com/kuberwastaken/claurst/releases for updates."
                 ))
             }
             Err(e) => CommandResult::Message(format!(
                 "Current version: v{current}\n\
                  Could not check for updates: {e}\n\
-                 Visit https://github.com/anthropics/claude-code/releases for updates."
+                 Visit https://github.com/kuberwastaken/claurst/releases for updates."
             )),
         }
     }
@@ -5320,13 +5428,13 @@ impl SlashCommand for ReleaseNotesCommand {
             Err(_) => {
                 return CommandResult::Message(format!(
                     "Claurst {tag} release notes:\n\
-                     Visit https://github.com/anthropics/claude-code/releases/tag/{tag}"
+                     Visit https://github.com/kuberwastaken/claurst/releases/tag/{tag}"
                 ))
             }
         };
 
         let url = format!(
-            "https://api.github.com/repos/anthropics/claude-code/releases/tags/{}",
+            "https://api.github.com/repos/kuberwastaken/claurst/releases/tags/{}",
             tag
         );
 
@@ -5360,17 +5468,17 @@ impl SlashCommand for ReleaseNotesCommand {
             }
             Ok(r) if r.status().as_u16() == 404 => CommandResult::Message(format!(
                 "No release found for {tag}.\n\
-                 View all releases: https://github.com/anthropics/claude-code/releases"
+                 View all releases: https://github.com/kuberwastaken/claurst/releases"
             )),
             Ok(r) => CommandResult::Message(format!(
                 "Could not fetch release notes (HTTP {}).\n\
-                 View at: https://github.com/anthropics/claude-code/releases/tag/{}",
+                 View at: https://github.com/kuberwastaken/claurst/releases/tag/{}",
                 r.status(),
                 tag
             )),
             Err(e) => CommandResult::Message(format!(
                 "Could not fetch release notes: {e}\n\
-                 View at: https://github.com/anthropics/claude-code/releases/tag/{tag}"
+                 View at: https://github.com/kuberwastaken/claurst/releases/tag/{tag}"
             )),
         }
     }
@@ -5385,7 +5493,7 @@ impl SlashCommand for RateLimitOptionsCommand {
     fn help(&self) -> &str {
         "Usage: /rate-limit-options\n\n\
          Displays available rate limit tiers and the current tier for your account.\n\
-         Rate limits depend on your Claude plan (Free, Pro, Max, API)."
+         Rate limits depend on your Claurst plan (Free, Pro, Max, API)."
     }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
@@ -5440,7 +5548,7 @@ impl SlashCommand for StatuslineCommand {
     fn help(&self) -> &str {
         "Usage: /statusline [show|hide] [cost|tokens|model|time|all]\n\n\
          Controls which items appear in the TUI status bar at the bottom.\n\
-         Settings are persisted to ~/.claude/ui-settings.json.\n\n\
+         Settings are persisted to ~/.claurst/ui-settings.json.\n\n\
          Examples:\n\
            /statusline               — show current configuration\n\
            /statusline show cost     — show cost in status line\n\
@@ -5534,7 +5642,7 @@ impl SlashCommand for SecurityReviewCommand {
     fn description(&self) -> &str { "Run a security review of the current project" }
     fn help(&self) -> &str {
         "Usage: /security-review [path]\n\n\
-         Asks Claude to perform a security review of the codebase.\n\
+         Asks Claurst to perform a security review of the codebase.\n\
          Analyzes for common vulnerabilities: injection attacks, auth issues,\n\
          secrets exposure, unsafe deserialization, path traversal, etc."
     }
@@ -5826,7 +5934,7 @@ impl SlashCommand for InstallSlackAppCommand {
     fn help(&self) -> &str {
         "Usage: /install-slack-app\n\n\
          Opens instructions for installing the Claurst Slack app.\n\
-         Requires a Claude for Enterprise subscription."
+         Requires a Claurst for Enterprise subscription."
     }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
@@ -5834,12 +5942,12 @@ impl SlashCommand for InstallSlackAppCommand {
             "Claurst Slack Integration\n\
              ─────────────────────────────\n\
              To install Claurst in Slack:\n\n\
-             1. Ensure you have a Claude for Enterprise subscription\n\
+             1. Ensure you have a Claurst for Enterprise subscription\n\
              2. Visit your Anthropic Console → Integrations → Slack\n\
              3. Click \"Add to Slack\" and authorize the app\n\
-             4. Invite @Claude to any channel with: /invite @Claude\n\n\
+             4. Invite @Claurst to any channel with: /invite @Claurst\n\n\
              In Slack, you can then:\n\
-             • Mention @Claude to ask questions in any channel\n\
+             • Mention @Claurst to ask questions in any channel\n\
              • Use /claude for direct commands\n\
              • Share code snippets for review\n\n\
              See: https://docs.anthropic.com/claude-code/slack"
@@ -5859,7 +5967,7 @@ impl SlashCommand for FastCommand {
         "Usage: /fast [on|off]\n\n\
          Fast mode switches to a faster, more economical model variant\n\
          (claude-haiku) for quick responses. Toggle without argument to switch.\n\
-         The setting is persisted to ~/.claude/ui-settings.json."
+         The setting is persisted to ~/.claurst/ui-settings.json."
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
@@ -5958,7 +6066,7 @@ impl SlashCommand for ThinkBackCommand {
             return CommandResult::Message(
                 "No thinking traces found in this session.\n\
                  Thinking traces appear when the model uses extended thinking mode.\n\
-                 Try asking Claude to 'think step by step' or 'think carefully'."
+                 Try asking Claurst to 'think step by step' or 'think carefully'."
                     .to_string(),
             );
         }
@@ -6137,6 +6245,81 @@ impl SlashCommand for ColorSetCommand {
             )),
             Err(e) => CommandResult::Error(format!("Failed to save color: {}", e)),
         }
+    }
+}
+
+// ---- /search -------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for SearchCommand {
+    fn name(&self) -> &str { "search" }
+    fn description(&self) -> &str { "Search across all sessions" }
+    fn help(&self) -> &str {
+        "Usage: /search <query>\n\n\
+         Searches session titles and message content in the local SQLite\n\
+         session database (~/.claurst/sessions.db).  Returns the 50 best\n\
+         matching sessions, ordered by most recently updated.\n\n\
+         Example: /search refactor authentication"
+    }
+
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let query = args.trim();
+        if query.is_empty() {
+            return CommandResult::Error(
+                "Usage: /search <query>\n\
+                 Provide a search term to look up across all sessions."
+                    .to_string(),
+            );
+        }
+
+        let db_path = claurst_core::config::Settings::config_dir().join("sessions.db");
+
+        let store = match claurst_core::SqliteSessionStore::open(&db_path) {
+            Ok(s) => s,
+            Err(e) => {
+                return CommandResult::Error(format!(
+                    "Failed to open session database: {}\n\
+                     The database is created automatically once sessions are stored.",
+                    e
+                ))
+            }
+        };
+
+        let results = match store.search_sessions(query) {
+            Ok(r) => r,
+            Err(e) => {
+                return CommandResult::Error(format!(
+                    "Search failed: {}",
+                    e
+                ))
+            }
+        };
+
+        if results.is_empty() {
+            return CommandResult::Message(format!(
+                "No sessions found matching \"{}\".",
+                query
+            ));
+        }
+
+        let mut out = format!(
+            "Search results for \"{}\": {} session(s)\n\n",
+            query,
+            results.len()
+        );
+        for s in &results {
+            let title = s.title.as_deref().unwrap_or("(untitled)");
+            out.push_str(&format!(
+                "  [{}] {} — {} ({} messages, updated {})\n",
+                &s.id[..s.id.len().min(12)],
+                title,
+                s.model,
+                s.message_count,
+                &s.updated_at[..s.updated_at.len().min(10)],
+            ));
+        }
+        out.push_str("\nTip: use /resume <session-id> to continue a session.");
+        CommandResult::Message(out)
     }
 }
 
@@ -6325,7 +6508,7 @@ impl SlashCommand for TeleportCommand {
          \n\
          /teleport export [--output <file>]\n\
          \x20 Serialize the current session to a .teleport JSON bundle.\n\
-         \x20 Defaults to ~/.claude/teleport_<session_id>.json\n\
+         \x20 Defaults to ~/.claurst/teleport_<session_id>.json\n\
          \n\
          /teleport import <file>\n\
          \x20 Load a .teleport bundle and restore messages, working dir, and\n\
@@ -6368,10 +6551,10 @@ impl SlashCommand for TeleportCommand {
                     if let Some(p) = explicit {
                         p
                     } else {
-                        // Default: ~/.claude/teleport_<session_id>.json
+                        // Default: ~/.claurst/teleport_<session_id>.json
                         let base = dirs::home_dir()
                             .unwrap_or_else(|| std::path::PathBuf::from("."))
-                            .join(".claude");
+                            .join(".claurst");
                         let _ = std::fs::create_dir_all(&base);
                         base.join(format!("teleport_{}.json", ctx.session_id))
                     }
@@ -7172,6 +7355,227 @@ impl SlashCommand for NamedCommandAdapter {
     }
 }
 
+// ---- /undo ---------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for UndoCommand {
+    fn name(&self) -> &str { "undo" }
+    fn description(&self) -> &str { "Revert file changes made by a tool call in this session" }
+    fn help(&self) -> &str {
+        "Usage: /undo [<tool_use_id>]\n\n\
+         Without an argument, lists all tool calls that modified files in this session.\n\n\
+         With a tool_use_id argument, reverts all file changes made by that specific tool\n\
+         call (restoring files to their state before the tool ran).\n\n\
+         Examples:\n\
+           /undo                   — list recent edits\n\
+           /undo toolu_01XYZ...    — revert that specific tool call"
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        // Retrieve the SnapshotManager from the per-session registry.
+        let session_id = ctx.session_id.clone();
+        let snap = claurst_tools::session_snapshot(&session_id);
+        let snap = snap.lock();
+
+        let args = args.trim();
+
+        if args.is_empty() {
+            // List mode: show all recorded tool calls and the files they touched.
+            let changes = snap.list_changes();
+            if changes.is_empty() {
+                return CommandResult::Message(
+                    "No file changes recorded for this session yet.".to_string(),
+                );
+            }
+
+            let mut lines = vec!["Recorded file changes this session:".to_string()];
+            for (id, paths) in &changes {
+                lines.push(format!("  {} ({} file(s)):", id, paths.len()));
+                for p in paths {
+                    lines.push(format!("      {}", p));
+                }
+            }
+            lines.push(String::new());
+            lines.push("Run /undo <tool_use_id> to revert a specific set of changes.".to_string());
+            return CommandResult::Message(lines.join("\n"));
+        }
+
+        // Revert mode.
+        let tool_use_id = args;
+        let (reverted, errors) = snap.revert(tool_use_id);
+
+        if reverted.is_empty() && errors.is_empty() {
+            return CommandResult::Error(format!(
+                "No changes found for tool_use_id '{}'. Use /undo with no arguments to list available IDs.",
+                tool_use_id
+            ));
+        }
+
+        let mut msg = format!(
+            "Reverted {} file(s) for tool call '{}':",
+            reverted.len(),
+            tool_use_id
+        );
+        for p in &reverted {
+            msg.push_str(&format!("\n  {}", p));
+        }
+        if !errors.is_empty() {
+            msg.push_str("\n\nErrors:");
+            for e in &errors {
+                msg.push_str(&format!("\n  {}", e));
+            }
+        }
+
+        CommandResult::Message(msg)
+    }
+}
+
+// ---- /providers -------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for ProvidersCommand {
+    fn name(&self) -> &str { "providers" }
+    fn description(&self) -> &str { "List available AI providers and their status" }
+    fn help(&self) -> &str {
+        "Usage: /providers\n\nList all providers registered in the model registry with their\nmodel counts, context windows, and pricing information."
+    }
+
+    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let registry = claurst_api::ModelRegistry::new();
+        let all = registry.list_all();
+
+        if all.is_empty() {
+            return CommandResult::Message("No providers available.".to_string());
+        }
+
+        // Group by provider
+        use std::collections::HashMap;
+        let mut by_provider: HashMap<String, Vec<_>> = HashMap::new();
+        for entry in &all {
+            by_provider
+                .entry(entry.info.provider_id.to_string())
+                .or_default()
+                .push(entry);
+        }
+
+        // Sort providers alphabetically for stable output
+        let mut provider_keys: Vec<String> = by_provider.keys().cloned().collect();
+        provider_keys.sort();
+
+        let mut lines = vec!["Available providers:\n".to_string()];
+        for provider in &provider_keys {
+            let models = &by_provider[provider];
+            lines.push(format!("\n{} ({} model{})", provider.to_uppercase(), models.len(),
+                if models.len() == 1 { "" } else { "s" }));
+            for m in models.iter().take(3) {
+                let cost_str = match (m.cost_input, m.cost_output) {
+                    (Some(i), Some(o)) => format!("${:.2}/${:.2} per 1M", i, o),
+                    _ => "free/local".to_string(),
+                };
+                lines.push(format!("  {} — {}K ctx, {}",
+                    m.info.id, m.info.context_window / 1000, cost_str));
+            }
+            if models.len() > 3 {
+                lines.push(format!("  ... and {} more", models.len() - 3));
+            }
+        }
+
+        CommandResult::Message(lines.join("\n"))
+    }
+}
+
+// ---- /connect -------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for ConnectCommand {
+    fn name(&self) -> &str { "connect" }
+    fn description(&self) -> &str { "Connect an AI provider" }
+    fn help(&self) -> &str {
+        "Usage: /connect\n\nOpens the interactive provider picker dialog.\nSelect a provider to see setup instructions."
+    }
+
+    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        // This is handled by the TUI interceptor — opening the connect dialog.
+        CommandResult::Message("Use the connect dialog to set up a provider.".to_string())
+    }
+}
+
+// ---- /agent ---------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for AgentCommand {
+    fn name(&self) -> &str { "agent" }
+    fn description(&self) -> &str { "List available agents or get info about a specific agent" }
+    fn help(&self) -> &str {
+        "Usage: /agent [name]\n\nWithout arguments, lists all available named agents.\nWith a name, shows details for that agent.\n\nTo use an agent, start Claurst with: --agent <name>"
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        use std::collections::HashMap;
+
+        // Merge built-in defaults with user-defined agents (user wins on collision).
+        let mut all_agents: HashMap<String, claurst_core::AgentDefinition> =
+            claurst_core::default_agents();
+        all_agents.extend(ctx.config.agents.clone());
+
+        let agent_name = args.trim();
+
+        if agent_name.is_empty() {
+            // List all visible agents.
+            let mut keys: Vec<&String> = all_agents
+                .iter()
+                .filter(|(_, d)| d.visible)
+                .map(|(k, _)| k)
+                .collect();
+            keys.sort();
+
+            let mut output = "Available agents:\n\n".to_string();
+            for name in keys {
+                let def = &all_agents[name];
+                output.push_str(&format!(
+                    "  @{} — {}\n    access: {}{}\n",
+                    name,
+                    def.description.as_deref().unwrap_or(""),
+                    def.access,
+                    def.max_turns
+                        .map(|t| format!(", max_turns: {}", t))
+                        .unwrap_or_default(),
+                ));
+            }
+            output.push_str("\nUse --agent <name> when starting Claurst to activate an agent.");
+            CommandResult::Message(output)
+        } else if let Some(def) = all_agents.get(agent_name) {
+            // Show details for the named agent.
+            let mut output = format!("Agent: @{}\n", agent_name);
+            if let Some(ref desc) = def.description {
+                output.push_str(&format!("Description: {}\n", desc));
+            }
+            output.push_str(&format!("Access: {}\n", def.access));
+            if let Some(ref model) = def.model {
+                output.push_str(&format!("Model: {}\n", model));
+            }
+            if let Some(t) = def.max_turns {
+                output.push_str(&format!("Max turns: {}\n", t));
+            }
+            if let Some(ref color) = def.color {
+                output.push_str(&format!("Color: {}\n", color));
+            }
+            if let Some(ref prompt) = def.prompt {
+                output.push_str(&format!("\nSystem prompt prefix:\n  {}\n", prompt));
+            }
+            output.push_str(&format!(
+                "\nTo activate: claude --agent {}", agent_name
+            ));
+            CommandResult::Message(output)
+        } else {
+            CommandResult::Error(format!(
+                "Unknown agent '{}'. Run /agent to see available agents.",
+                agent_name
+            ))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -7207,6 +7611,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(PlanCommand),
         Box::new(TasksCommand),
         Box::new(SessionCommand),
+        Box::new(ForkCommand),
         Box::new(ThinkingCommand),
         Box::new(ThemeCommand),
         Box::new(OutputStyleCommand),
@@ -7289,7 +7694,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
             slash_name: "install-github-app",
             target_name: "install-github-app",
             slash_aliases: &[],
-            slash_description: "Set up Claude GitHub Actions for a repository",
+            slash_description: "Set up Claurst GitHub Actions for a repository",
             slash_help: "Usage: /install-github-app",
         }),
         Box::new(NamedCommandAdapter {
@@ -7339,6 +7744,15 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(HeapdumpCommand),
         Box::new(InsightsCommand),
         Box::new(UltrareviewCommand),
+        // Undo / snapshot
+        Box::new(UndoCommand),
+        // Multi-provider support
+        Box::new(ProvidersCommand),
+        Box::new(ConnectCommand),
+        // Named agent system
+        Box::new(AgentCommand),
+        // Session search (SQLite)
+        Box::new(SearchCommand),
     ]
 }
 
@@ -7365,6 +7779,104 @@ pub fn build_help_entries() -> Vec<claurst_tui::overlays::HelpEntry> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// User-defined command templates (Feature 2)
+// ---------------------------------------------------------------------------
+
+/// A slash command backed by a user-defined template in `settings.json`.
+struct TemplateCommand {
+    name: String,
+    template: claurst_core::CommandTemplate,
+}
+
+#[async_trait]
+impl SlashCommand for TemplateCommand {
+    fn name(&self) -> &str { &self.name }
+    fn description(&self) -> &str {
+        self.template.description.as_deref().unwrap_or("Custom command")
+    }
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let mut words = args.split_whitespace();
+        let arg1 = words.next().unwrap_or("");
+        let arg2 = words.next().unwrap_or("");
+        let prompt = self.template.template
+            .replace("$ARGUMENTS", args)
+            .replace("$1", arg1)
+            .replace("$2", arg2);
+        CommandResult::UserMessage(prompt)
+    }
+}
+
+/// Build slash commands from user-defined command templates stored in
+/// `settings.commands`.
+pub fn commands_from_settings(settings: &claurst_core::Settings) -> Vec<Box<dyn SlashCommand>> {
+    settings.commands.iter().map(|(name, template)| {
+        Box::new(TemplateCommand {
+            name: name.clone(),
+            template: template.clone(),
+        }) as Box<dyn SlashCommand>
+    }).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Discovered skill commands (from .claurst/skills/ and git URLs)
+// ---------------------------------------------------------------------------
+
+/// A slash command backed by a discovered skill markdown file.
+struct SkillCommand {
+    name: String,
+    description: String,
+    template: String,
+}
+
+#[async_trait]
+impl SlashCommand for SkillCommand {
+    fn name(&self) -> &str { &self.name }
+    fn description(&self) -> &str { &self.description }
+
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let mut words = args.split_whitespace();
+        let arg1 = words.next().unwrap_or("");
+        let arg2 = words.next().unwrap_or("");
+        let prompt = self.template
+            .replace("$ARGUMENTS", args)
+            .replace("$1", arg1)
+            .replace("$2", arg2);
+        CommandResult::UserMessage(prompt)
+    }
+}
+
+/// Build slash commands from skill markdown files discovered on the filesystem
+/// and from configured git URLs.
+///
+/// Pass the project `cwd` and the `skills` section of the effective config.
+/// Bundled skills take precedence — any discovered skill whose name clashes
+/// with a built-in command will be silently skipped.
+pub fn commands_from_discovered_skills(
+    cwd: &std::path::Path,
+    skills_config: &claurst_core::SkillsConfig,
+) -> Vec<Box<dyn SlashCommand>> {
+    let discovered = claurst_core::discover_skills(cwd, skills_config);
+    // Build a set of built-in command names so we can skip collisions.
+    let all_cmds = all_commands();
+    let builtin_names: std::collections::HashSet<&str> = all_cmds
+        .iter()
+        .map(|c| c.name())
+        .collect();
+
+    discovered
+        .into_values()
+        .filter(|skill| !builtin_names.contains(skill.name.as_str()))
+        .map(|skill| {
+            Box::new(SkillCommand {
+                name: skill.name,
+                description: skill.description,
+                template: skill.template,
+            }) as Box<dyn SlashCommand>
+        })
+        .collect()
+}
+
 /// Execute a slash command string (with leading /).
 pub async fn execute_command(
     input: &str,
@@ -7378,10 +7890,29 @@ pub async fn execute_command(
         return Some(cmd.execute(args, ctx).await);
     }
 
+    // Check user-defined command templates from settings.
+    let cmd_name = name.trim_start_matches('/');
+    if let Some(tmpl) = ctx.config.commands.get(cmd_name).cloned() {
+        let tc = TemplateCommand { name: cmd_name.to_string(), template: tmpl };
+        return Some(tc.execute(args, ctx).await);
+    }
+
+    // Check discovered skill commands (from .claurst/skills/, git URLs, etc.).
+    {
+        let discovered = claurst_core::discover_skills(&ctx.working_dir, &ctx.config.skills);
+        if let Some(skill) = discovered.get(cmd_name) {
+            let sc = SkillCommand {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                template: skill.template.clone(),
+            };
+            return Some(sc.execute(args, ctx).await);
+        }
+    }
+
     // Then check plugin-defined slash commands.
     let project_dir = ctx.working_dir.clone();
     let registry = claurst_plugins::load_plugins(&project_dir, &[]).await;
-    let cmd_name = name.trim_start_matches('/');
     for cmd_def in registry.all_command_defs() {
         if cmd_def.name == cmd_name {
             let adapter = PluginSlashCommandAdapter { def: cmd_def };
@@ -7520,7 +8051,7 @@ mod tests {
         assert!(matches!(result, CommandResult::Message(_)));
         if let CommandResult::Message(msg) = result {
             assert!(
-                msg.contains("claude") || msg.contains("Claude") || msg.contains('.'),
+                msg.contains("claude") || msg.contains("Claurst") || msg.contains('.'),
                 "Version message should contain version number, got: {}",
                 msg
             );

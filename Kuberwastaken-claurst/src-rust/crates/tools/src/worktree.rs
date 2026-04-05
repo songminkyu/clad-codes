@@ -47,6 +47,10 @@ struct EnterWorktreeInput {
     /// Defaults to `.worktrees/<branch>`.
     #[serde(default)]
     path: Option<String>,
+    /// Optional shell command to run inside the new worktree directory after creation.
+    /// Example: "npm install" or "cargo build".
+    #[serde(default)]
+    post_create_command: Option<String>,
 }
 
 #[async_trait]
@@ -68,11 +72,15 @@ impl Tool for EnterWorktreeTool {
             "properties": {
                 "branch": {
                     "type": "string",
-                    "description": "Branch name to create. Defaults to a timestamped name like worktree-1234567890."
+                    "description": "Branch name to create. Defaults to a timestamped name like claurst-20240101-120000."
                 },
                 "path": {
                     "type": "string",
                     "description": "Optional path for the worktree directory. Defaults to .worktrees/<branch>."
+                },
+                "post_create_command": {
+                    "type": "string",
+                    "description": "Optional command to run inside the new worktree after creation (e.g. 'npm install')."
                 }
             }
         })
@@ -102,16 +110,26 @@ impl Tool for EnterWorktreeTool {
             return ToolResult::error(e.to_string());
         }
 
-        // Determine branch name
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        let branch = params
-            .branch
-            .clone()
-            .unwrap_or_else(|| format!("worktree-{}", ts));
+        // Determine branch name — use a human-readable timestamp if none supplied
+        let branch = params.branch.clone().unwrap_or_else(|| {
+            // Format: claurst-YYYYMMDD-HHMMSS
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            // Manual UTC decomposition (no chrono dep in this crate)
+            let s = secs % 60;
+            let m = (secs / 60) % 60;
+            let h = (secs / 3600) % 24;
+            let days = secs / 86400;
+            // Approximate Gregorian calendar for branch name purposes
+            let year = 1970 + days / 365;
+            let day_of_year = days % 365;
+            let month = day_of_year / 30 + 1;
+            let day = day_of_year % 30 + 1;
+            format!("claurst-{:04}{:02}{:02}-{:02}{:02}{:02}", year, month, day, h, m, s)
+        });
 
         // Determine worktree path
         let worktree_path = if let Some(p) = params.path {
@@ -120,9 +138,29 @@ impl Tool for EnterWorktreeTool {
             ctx.working_dir.join(".worktrees").join(&branch)
         };
 
-        // Get current HEAD for change tracking
-        let head = run_git(&ctx.working_dir, &["rev-parse", "HEAD"]).await;
-        let original_head = head.ok().map(|h| h.trim().to_string());
+        // Verify we are inside a git repository before attempting worktree creation
+        let head_result = run_git(&ctx.working_dir, &["rev-parse", "HEAD"]).await;
+        let original_head = match &head_result {
+            Ok(h) => Some(h.trim().to_string()),
+            Err(e) => {
+                let msg = e.to_lowercase();
+                if msg.contains("not a git repository") || msg.contains("fatal") {
+                    return ToolResult::error(format!(
+                        "Cannot create worktree: the current directory '{}' is not inside a git repository.",
+                        ctx.working_dir.display()
+                    ));
+                }
+                None
+            }
+        };
+
+        // Check if the target path already exists
+        if worktree_path.exists() {
+            return ToolResult::error(format!(
+                "Cannot create worktree: the path '{}' already exists.                  Provide a different 'path' argument or remove the existing directory.",
+                worktree_path.display()
+            ));
+        }
 
         // Create the worktree
         let worktree_str = worktree_path.to_string_lossy().to_string();
@@ -133,7 +171,23 @@ impl Tool for EnterWorktreeTool {
         .await;
 
         match result {
-            Err(e) => ToolResult::error(format!("Failed to create worktree: {}", e)),
+            Err(e) => {
+                let msg = e.trim().to_string();
+                let friendly = if msg.to_lowercase().contains("already exists") {
+                    format!(
+                        "Failed to create worktree: branch '{}' already exists.                          Use a different branch name or delete the existing branch first.",
+                        branch
+                    )
+                } else if msg.to_lowercase().contains("not a git repository") {
+                    format!(
+                        "Failed to create worktree: '{}' is not inside a git repository.",
+                        ctx.working_dir.display()
+                    )
+                } else {
+                    format!("Failed to create worktree: {}", msg)
+                };
+                ToolResult::error(friendly)
+            }
             Ok(_) => {
                 debug!(
                     branch = %branch,
@@ -149,14 +203,49 @@ impl Tool for EnterWorktreeTool {
                     original_head,
                 });
 
+                // Run optional post-create command in the new worktree directory
+                let post_create_output = if let Some(cmd) = params.post_create_command {
+                    let shell_result = if cfg!(target_os = "windows") {
+                        tokio::process::Command::new("cmd")
+                            .args(["/C", &cmd])
+                            .current_dir(&worktree_path)
+                            .output()
+                            .await
+                    } else {
+                        tokio::process::Command::new("sh")
+                            .args(["-c", &cmd])
+                            .current_dir(&worktree_path)
+                            .output()
+                            .await
+                    };
+                    match shell_result {
+                        Ok(out) if out.status.success() => {
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            format!("\nPost-create command '{}' completed successfully.{}",
+                                cmd,
+                                if stdout.trim().is_empty() { String::new() } else { format!("\nOutput: {}", stdout.trim()) }
+                            )
+                        }
+                        Ok(out) => {
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            format!("\nPost-create command '{}' exited with error.\nStderr: {}",
+                                cmd, stderr.trim())
+                        }
+                        Err(e) => format!("\nCould not run post-create command '{}': {}", cmd, e),
+                    }
+                } else {
+                    String::new()
+                };
+
                 ToolResult::success(format!(
                     "Created worktree at {} on branch '{}'.\n\
                      The working directory is now {}.\n\
-                     Use ExitWorktree to return to {}.",
+                     Use ExitWorktree to return to {}.{}",
                     worktree_path.display(),
                     branch,
                     worktree_path.display(),
                     ctx.working_dir.display(),
+                    post_create_output,
                 ))
                 .with_metadata(json!({
                     "worktree_path": worktree_path.to_string_lossy(),

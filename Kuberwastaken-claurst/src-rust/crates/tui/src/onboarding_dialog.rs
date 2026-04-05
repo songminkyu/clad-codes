@@ -20,7 +20,9 @@ use crate::overlays::centered_rect;
 /// Which page of the onboarding flow we're on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OnboardingPage {
+    /// Shown when no API credentials are configured — provider picker.
     #[default]
+    ProviderSetup,
     Welcome,
     KeyBindings,
     Done,
@@ -40,10 +42,16 @@ impl OnboardingDialogState {
         Self::default()
     }
 
-    /// Show the dialog (called at startup when first-run is detected).
+    /// Show the normal onboarding (first-run with credentials already configured).
     pub fn show(&mut self) {
         self.visible = true;
         self.page = OnboardingPage::Welcome;
+    }
+
+    /// Show the provider setup page (no credentials configured).
+    pub fn show_provider_setup(&mut self) {
+        self.visible = true;
+        self.page = OnboardingPage::ProviderSetup;
     }
 
     pub fn dismiss(&mut self) {
@@ -53,6 +61,7 @@ impl OnboardingDialogState {
     /// Advance to the next page; returns true if we've reached Done and should dismiss.
     pub fn next_page(&mut self) -> bool {
         self.page = match self.page {
+            OnboardingPage::ProviderSetup => OnboardingPage::Done,
             OnboardingPage::Welcome => OnboardingPage::KeyBindings,
             OnboardingPage::KeyBindings => OnboardingPage::Done,
             OnboardingPage::Done => OnboardingPage::Done,
@@ -63,6 +72,7 @@ impl OnboardingDialogState {
     /// Go back to the previous page.
     pub fn prev_page(&mut self) {
         self.page = match self.page {
+            OnboardingPage::ProviderSetup => OnboardingPage::ProviderSetup,
             OnboardingPage::Welcome => OnboardingPage::Welcome,
             OnboardingPage::KeyBindings => OnboardingPage::Welcome,
             OnboardingPage::Done => OnboardingPage::KeyBindings,
@@ -94,10 +104,122 @@ pub fn render_onboarding_dialog(
     frame.render_widget(Clear, dialog_area);
 
     match state.page {
+        OnboardingPage::ProviderSetup => render_provider_setup_page(frame, dialog_area),
         OnboardingPage::Welcome => render_welcome_page(frame, dialog_area),
         OnboardingPage::KeyBindings => render_keybindings_page(frame, dialog_area),
         OnboardingPage::Done => {} // should not be visible
     }
+}
+
+fn render_provider_setup_page(frame: &mut Frame, area: Rect) {
+    // Theme pink — matches the header and mascot
+    let pink = Color::Rgb(233, 30, 99);
+    let dim = Color::Rgb(100, 100, 100);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(vec![
+            Span::styled("─── ", Style::default().fg(pink)),
+            Span::styled(" Connect a Provider ", Style::default().fg(pink).add_modifier(Modifier::BOLD)),
+            Span::styled(" ───", Style::default().fg(pink)),
+        ]))
+        .border_style(Style::default().fg(pink));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let sep = "  ─────────────────────────────────────────────────";
+
+    let lines: Vec<Line<'static>> = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  No credentials found. ", Style::default().fg(Color::White)),
+            Span::styled("Pick a provider below:", Style::default().fg(Color::Rgb(180, 180, 180))),
+        ]),
+        Line::from(""),
+        // ── 1. Anthropic ──────────────────────────────────────
+        Line::from(vec![
+            Span::styled("  1  ", Style::default().fg(pink).add_modifier(Modifier::BOLD)),
+            Span::styled("Anthropic", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("  Claude Opus · Sonnet · Haiku", Style::default().fg(dim)),
+        ]),
+        Line::from(vec![
+            Span::styled("     › ", Style::default().fg(pink)),
+            Span::styled("claurst auth login", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(Span::styled(sep, Style::default().fg(Color::Rgb(45, 45, 55)))),
+        // ── 2. OpenAI ─────────────────────────────────────────
+        Line::from(vec![
+            Span::styled("  2  ", Style::default().fg(pink).add_modifier(Modifier::BOLD)),
+            Span::styled("OpenAI", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("  GPT-4o · o3 · o4-mini", Style::default().fg(dim)),
+        ]),
+        Line::from(vec![
+            Span::styled("     › ", Style::default().fg(pink)),
+            Span::styled("set OPENAI_API_KEY=<key>", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("  then restart", Style::default().fg(dim)),
+        ]),
+        Line::from(Span::styled(sep, Style::default().fg(Color::Rgb(45, 45, 55)))),
+        // ── 3. Google ─────────────────────────────────────────
+        Line::from(vec![
+            Span::styled("  3  ", Style::default().fg(pink).add_modifier(Modifier::BOLD)),
+            Span::styled("Google", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("  Gemini 2.5 Pro · Flash", Style::default().fg(dim)),
+        ]),
+        Line::from(vec![
+            Span::styled("     › ", Style::default().fg(pink)),
+            Span::styled("set GOOGLE_API_KEY=<key>", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("  then restart", Style::default().fg(dim)),
+        ]),
+        Line::from(Span::styled(sep, Style::default().fg(Color::Rgb(45, 45, 55)))),
+        // ── 4. Groq ───────────────────────────────────────────
+        Line::from(vec![
+            Span::styled("  4  ", Style::default().fg(pink).add_modifier(Modifier::BOLD)),
+            Span::styled("Groq", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("  Fast inference · Free tier · groq.com/keys", Style::default().fg(dim)),
+        ]),
+        Line::from(vec![
+            Span::styled("     › ", Style::default().fg(pink)),
+            Span::styled("set GROQ_API_KEY=<key>", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("  then restart", Style::default().fg(dim)),
+        ]),
+        Line::from(Span::styled(sep, Style::default().fg(Color::Rgb(45, 45, 55)))),
+        // ── 5. Ollama ─────────────────────────────────────────
+        Line::from(vec![
+            Span::styled("  5  ", Style::default().fg(pink).add_modifier(Modifier::BOLD)),
+            Span::styled("Ollama", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("  Local models · No key needed", Style::default().fg(dim)),
+        ]),
+        Line::from(vec![
+            Span::styled("     › ", Style::default().fg(pink)),
+            Span::styled("claurst --provider ollama", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  + ", Style::default().fg(Color::Rgb(120, 120, 120))),
+            Span::styled("20+ more providers: ", Style::default().fg(Color::Rgb(120, 120, 120))),
+            Span::styled("claurst --help", Style::default().fg(Color::Rgb(150, 150, 150))),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Esc", Style::default().fg(pink)),
+            Span::styled(" dismiss · configure later with ", Style::default().fg(dim)),
+            Span::styled("/providers", Style::default().fg(Color::Rgb(150, 150, 150))),
+        ]),
+        Line::from(vec![Span::styled(
+            "  → 20+ more providers: claurst --help",
+            Style::default().fg(Color::DarkGray),
+        )]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Esc: dismiss  (you can configure later with /providers)",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )]),
+    ];
+
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .render(inner, frame.buffer_mut());
 }
 
 fn render_welcome_page(frame: &mut Frame, area: Rect) {
@@ -128,11 +250,11 @@ fn render_welcome_page(frame: &mut Frame, area: Rect) {
             Style::default().fg(Color::White),
         )]),
         Line::from(vec![Span::styled(
-            "    • Claude can read, edit, and create files in your project.",
+            "    • Claurst can read, edit, and create files in your project.",
             Style::default().fg(Color::White),
         )]),
         Line::from(vec![Span::styled(
-            "    • Claude can run bash commands, search the web, and more.",
+            "    • Claurst can run bash commands, search the web, and more.",
             Style::default().fg(Color::White),
         )]),
         Line::from(""),
@@ -313,7 +435,7 @@ mod tests {
         let content: String = terminal.backend().buffer().clone().content().iter()
             .map(|c| c.symbol().chars().next().unwrap_or(' '))
             .collect();
-        assert!(content.contains("Welcome") || content.contains("Claude"));
+        assert!(content.contains("Welcome") || content.contains("Claurst"));
     }
 
     #[test]

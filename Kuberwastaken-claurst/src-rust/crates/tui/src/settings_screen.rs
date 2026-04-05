@@ -7,10 +7,14 @@
 use claurst_core::config::{Config, Settings};
 use claurst_core::keybindings::default_bindings;
 use claurst_core::output_styles::builtin_styles;
+use crate::overlays::{
+    centered_rect, render_dark_overlay, render_dialog_bg, CLAURST_ACCENT, CLAURST_MUTED,
+    CLAURST_PANEL_BG, CLAURST_TEXT,
+};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
 // ---------------------------------------------------------------------------
@@ -363,48 +367,46 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
         return;
     }
 
+    render_dark_overlay(frame, area);
+
     // 80% width, 90% height, centred
     let w = (area.width * 4 / 5).max(60).min(area.width.saturating_sub(2));
     let h = (area.height * 9 / 10).max(20).min(area.height.saturating_sub(2));
-    let x = area.x + area.width.saturating_sub(w) / 2;
-    let y = area.y + area.height.saturating_sub(h) / 2;
-    let popup = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
-
-    frame.render_widget(Clear, popup);
-
-    // Outer border
-    let outer_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Settings — Claurst ")
-        .border_style(Style::default().fg(Color::Cyan));
-    frame.render_widget(outer_block, popup);
+    let popup = centered_rect(w, h, area);
+    render_dialog_bg(frame, popup);
 
     // Inset inner area
     let inner = Rect {
-        x: popup.x + 1,
+        x: popup.x + 2,
         y: popup.y + 1,
-        width: popup.width.saturating_sub(2),
+        width: popup.width.saturating_sub(4),
         height: popup.height.saturating_sub(2),
     };
 
-    if inner.height < 4 {
+    if inner.height < 6 {
         return;
     }
 
-    // Split into tabs row + content + footer
+    // Split into header + tabs + content + footer
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(1), Constraint::Length(1)])
+        .constraints([Constraint::Length(1), Constraint::Length(2), Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
-    let tabs_area = layout[0];
-    let content_area = layout[1];
-    let footer_area = layout[2];
+    let header_area = layout[0];
+    let tabs_area = layout[1];
+    let content_area = layout[2];
+    let footer_area = layout[3];
+
+    let title = Line::from(vec![
+        Span::styled(" Settings", Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(" — Claurst", Style::default().fg(CLAURST_MUTED)),
+        Span::styled(
+            format!("{:>width$}", "Esc close", width = inner.width.saturating_sub(19) as usize),
+            Style::default().fg(CLAURST_MUTED),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(title).style(Style::default().bg(CLAURST_PANEL_BG)), header_area);
 
     // Tabs bar
     let tab_labels: Vec<Line> = SettingsTab::all()
@@ -415,21 +417,21 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
                     format!(" {} ", t.label()),
                     Style::default()
                         .fg(Color::Black)
-                        .bg(Color::Cyan)
+                        .bg(CLAURST_ACCENT)
                         .add_modifier(Modifier::BOLD),
                 )])
             } else {
                 Line::from(vec![Span::styled(
                     format!(" {} ", t.label()),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(CLAURST_MUTED),
                 )])
             }
         })
         .collect();
 
     let tabs = Tabs::new(tab_labels)
-        .divider(Span::raw(" │ "))
-        .style(Style::default().fg(Color::DarkGray));
+        .divider(Span::styled("  ", Style::default().fg(CLAURST_MUTED)))
+        .style(Style::default().fg(CLAURST_MUTED).bg(CLAURST_PANEL_BG));
     frame.render_widget(tabs, tabs_area);
 
     // Tab content
@@ -438,25 +440,25 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
     // Footer
     let footer = if screen.edit_field.is_some() {
         Line::from(vec![
-            Span::styled(" Enter ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" Enter ", Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)),
             Span::raw("save  "),
             Span::styled(" Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::raw("cancel"),
         ])
     } else {
         Line::from(vec![
-            Span::styled(" Tab ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" Tab ", Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)),
             Span::raw("next tab  "),
-            Span::styled(" ↑↓ ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" ↑↓ ", Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)),
             Span::raw("select  "),
-            Span::styled(" Space/Enter ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" Space/Enter ", Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)),
             Span::raw("toggle  "),
             Span::styled(" Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::raw("close"),
         ])
     };
     let footer_para = Paragraph::new(vec![footer])
-        .style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().fg(CLAURST_MUTED).bg(CLAURST_PANEL_BG))
         .alignment(Alignment::Center);
     frame.render_widget(footer_para, footer_area);
 }
@@ -658,7 +660,7 @@ fn build_display_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
             Span::styled(
                 format!("{}  {:<15}", marker, style.name),
                 Style::default()
-                    .fg(if active { Color::Cyan } else { Color::White })
+                    .fg(if active { CLAURST_ACCENT } else { CLAURST_TEXT })
                     .add_modifier(if active { Modifier::BOLD } else { Modifier::empty() }),
             ),
             Span::styled(style.description.clone(), Style::default().fg(Color::DarkGray)),
@@ -686,7 +688,7 @@ struct PrivacySnapshot {
 }
 
 impl PrivacySnapshot {
-    /// Load privacy fields from `~/.claude/settings.json`.
+    /// Load privacy fields from `~/.claurst/settings.json`.
     fn load() -> Self {
         let path = claurst_core::config::Settings::config_dir().join("settings.json");
         let Ok(content) = std::fs::read_to_string(&path) else { return Self::default(); };
@@ -765,7 +767,7 @@ fn build_privacy_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        "  Note: Edit ~/.claude/settings.json to toggle telemetry/sharing values.",
+        "  Note: Edit ~/.claurst/settings.json to toggle telemetry/sharing values.",
         Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
     )]));
     lines.push(Line::from(""));
@@ -835,7 +837,7 @@ fn build_advanced_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("  {:<20}", srv.name),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!("[{}]", kind), Style::default().fg(Color::DarkGray)),
             ]));
@@ -869,7 +871,7 @@ fn build_advanced_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
                         format!("  {:<20}", event_name),
                         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(filter, Style::default().fg(Color::Cyan)),
+                    Span::styled(filter, Style::default().fg(CLAURST_ACCENT)),
                     Span::styled(blocking.to_string(), Style::default().fg(Color::Red)),
                 ]));
                 lines.push(indent_line(&format!("    cmd: {}", entry.command), Color::DarkGray));
@@ -909,7 +911,7 @@ fn build_keybindings_lines(_screen: &SettingsScreen) -> Vec<Line<'static>> {
     lines.push(section_header("Key Bindings"));
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        "  Edit ~/.claude/keybindings.json to customise bindings.",
+        "  Edit ~/.claurst/keybindings.json to customise bindings.",
         Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
     )]));
     lines.push(Line::from(""));
@@ -965,7 +967,7 @@ fn build_keybindings_lines(_screen: &SettingsScreen) -> Vec<Line<'static>> {
                     Span::styled(
                         format!("{:<25}", chord),
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(CLAURST_ACCENT)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(action.clone(), Style::default().fg(Color::White)),
@@ -986,7 +988,7 @@ fn section_header(title: &str) -> Line<'static> {
     Line::from(vec![Span::styled(
         format!("  {}", title),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(CLAURST_ACCENT)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
     )])
 }
@@ -995,9 +997,9 @@ fn label_value_line(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!("  {:<25}", label),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default().fg(CLAURST_TEXT).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(value.to_string(), Style::default().fg(Color::Cyan)),
+        Span::styled(value.to_string(), Style::default().fg(CLAURST_ACCENT)),
     ])
 }
 
@@ -1028,7 +1030,7 @@ fn toggle_field_lines(
     let row_style = if selected {
         Style::default()
             .fg(Color::Black)
-            .bg(Color::Cyan)
+            .bg(CLAURST_ACCENT)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
@@ -1038,10 +1040,10 @@ fn toggle_field_lines(
         Span::styled(
             format!("  [{}] {:<26}", check_char, label),
             if selected {
-                row_style.fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                row_style.fg(Color::Black).bg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
-                    .fg(if enabled { Color::White } else { Color::DarkGray })
+                    .fg(if enabled { CLAURST_TEXT } else { Color::DarkGray })
                     .add_modifier(if enabled { Modifier::BOLD } else { Modifier::empty() })
             },
         ),
@@ -1054,7 +1056,7 @@ fn toggle_field_lines(
         Span::styled(
             format!("  {}", description),
             if selected {
-                Style::default().fg(Color::Black).bg(Color::Cyan)
+                Style::default().fg(Color::Black).bg(CLAURST_ACCENT)
             } else {
                 Style::default().fg(Color::DarkGray)
             },
@@ -1068,18 +1070,18 @@ fn toggle_field_lines(
             if selected {
                 Style::default()
                     .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .bg(CLAURST_ACCENT)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
-                    .fg(if enabled { Color::White } else { Color::DarkGray })
+                    .fg(if enabled { CLAURST_TEXT } else { Color::DarkGray })
                     .add_modifier(if enabled { Modifier::BOLD } else { Modifier::empty() })
             },
         ),
         Span::styled(
             format!("  {}", description),
             if selected {
-                Style::default().fg(Color::Black).bg(Color::Cyan)
+                Style::default().fg(Color::Black).bg(CLAURST_ACCENT)
             } else {
                 Style::default().fg(Color::DarkGray)
             },
@@ -1114,7 +1116,7 @@ fn field_lines(
     } else if has_pending {
         Color::Magenta
     } else {
-        Color::Cyan
+        CLAURST_ACCENT
     };
 
     let edit_hint = if is_editing {
@@ -1127,7 +1129,7 @@ fn field_lines(
         Line::from(vec![
             Span::styled(
                 format!("  {:<25}", label),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default().fg(CLAURST_TEXT).add_modifier(Modifier::BOLD),
             ),
             Span::styled(display_value, Style::default().fg(value_color)),
             Span::styled(

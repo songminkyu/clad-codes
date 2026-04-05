@@ -3,6 +3,10 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
+use crate::overlays::{
+    CLAURST_ACCENT, CLAURST_MUTED, CLAURST_PANEL_BG, CLAURST_PANEL_BORDER, CLAURST_TEXT,
+};
+
 /// Severity / visual style of a notification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotificationKind {
@@ -45,6 +49,8 @@ impl NotificationQueue {
     /// * `duration_secs` — `None` for persistent, `Some(n)` for auto-expire after *n* seconds.
     pub fn push(&mut self, kind: NotificationKind, msg: String, duration_secs: Option<u64>) {
         let expires_at = duration_secs.map(|secs| Instant::now() + std::time::Duration::from_secs(secs));
+        self.notifications
+            .retain(|n| !(n.kind == kind && n.message == msg));
         let id = format!("notif-{}", self.next_id);
         self.next_id += 1;
         self.notifications.push_back(Notification {
@@ -69,16 +75,16 @@ impl NotificationQueue {
         });
     }
 
-    /// Return the topmost (oldest) active notification, if any.
+    /// Return the currently visible (most recent) notification, if any.
     pub fn current(&self) -> Option<&Notification> {
-        self.notifications.front()
+        self.notifications.back()
     }
 
-    /// Dismiss the currently visible (topmost) notification.
+    /// Dismiss the currently visible notification.
     pub fn dismiss_current(&mut self) {
-        if let Some(n) = self.notifications.front().cloned() {
+        if let Some(n) = self.notifications.back().cloned() {
             if n.dismissible {
-                self.notifications.pop_front();
+                self.notifications.pop_back();
             }
         }
     }
@@ -96,16 +102,16 @@ impl NotificationQueue {
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
 impl NotificationKind {
     pub fn color(&self) -> Color {
         match self {
-            NotificationKind::Info => Color::Cyan,
+            NotificationKind::Info => CLAURST_ACCENT,
             NotificationKind::Warning => Color::Yellow,
             NotificationKind::Error => Color::Red,
-            NotificationKind::Success => Color::Green,
+            NotificationKind::Success => Color::Rgb(80, 200, 120),
         }
     }
 
@@ -126,45 +132,73 @@ pub fn render_notification_banner(frame: &mut Frame, queue: &NotificationQueue, 
         None => return,
     };
 
-    // One-line banner across the top of the provided area, inset slightly
-    let banner_width = area.width.saturating_sub(4);
+    // One-line banner across the top of the provided area, inset slightly.
+    let banner_width = area.width.saturating_sub(6);
     let banner_area = Rect {
-        x: area.x + 2,
-        y: area.y,
+        x: area.x + 3,
+        y: area.y + 1,
         width: banner_width,
-        height: 3,
+        height: 1,
     };
 
     // Only draw if there's room
-    if area.height < 4 || banner_width < 10 {
+    if area.height < 3 || banner_width < 16 {
         return;
     }
 
     let color = notif.kind.color();
     let icon = notif.kind.icon();
 
-    let dismiss_hint = if notif.dismissible { " [Esc to dismiss]" } else { "" };
-    let msg_text = format!(" {} {} {}", icon, notif.message, dismiss_hint);
-    // Truncate if needed
-    let max_inner = banner_width.saturating_sub(2) as usize;
-    let msg_display = if msg_text.len() > max_inner {
-        format!("{}…", &msg_text[..max_inner.saturating_sub(1)])
-    } else {
-        msg_text
-    };
+    let mut spans = vec![
+        Span::styled(format!(" {} ", icon), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(notif.message.clone(), Style::default().fg(CLAURST_TEXT).add_modifier(Modifier::BOLD)),
+    ];
+    if notif.dismissible {
+        spans.push(Span::styled("  Esc dismiss", Style::default().fg(CLAURST_MUTED)));
+    }
 
-    let lines = vec![Line::from(vec![Span::styled(
-        msg_display,
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-    )])];
+    let content_width = spans.iter().map(|span| span.content.len()).sum::<usize>();
+    if content_width > banner_width.saturating_sub(2) as usize {
+        spans = vec![
+            Span::styled(format!(" {} ", icon), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(
+                    "{}…",
+                    notif.message
+                        .chars()
+                        .take(banner_width.saturating_sub(6) as usize)
+                        .collect::<String>()
+                ),
+                Style::default().fg(CLAURST_TEXT).add_modifier(Modifier::BOLD),
+            ),
+        ];
+    }
+    let line = Line::from(spans);
 
     frame.render_widget(Clear, banner_area);
-    let para = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(color)),
+    let para = Paragraph::new(line).style(
+        Style::default()
+            .bg(CLAURST_PANEL_BG)
+            .fg(CLAURST_TEXT)
+            .add_modifier(Modifier::BOLD),
     );
     frame.render_widget(para, banner_area);
+
+    if banner_area.width >= 3 {
+        if let Some(cell) = frame.buffer_mut().cell_mut((banner_area.x, banner_area.y)) {
+            cell.set_bg(CLAURST_PANEL_BG);
+            cell.set_fg(CLAURST_PANEL_BORDER);
+            cell.set_char('▌');
+        }
+        if let Some(cell) = frame
+            .buffer_mut()
+            .cell_mut((banner_area.x.saturating_add(banner_area.width - 1), banner_area.y))
+        {
+            cell.set_bg(CLAURST_PANEL_BG);
+            cell.set_fg(CLAURST_PANEL_BORDER);
+            cell.set_char('▐');
+        }
+    }
 }
 
 #[cfg(test)]
@@ -186,6 +220,24 @@ mod tests {
         let id = q.current().unwrap().id.clone();
         q.dismiss(&id);
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn current_prefers_latest_notification() {
+        let mut q = NotificationQueue::new();
+        q.push(NotificationKind::Warning, "older".to_string(), None);
+        q.push(NotificationKind::Info, "newer".to_string(), Some(3));
+        assert_eq!(q.current().unwrap().message, "newer");
+        q.dismiss_current();
+        assert_eq!(q.current().unwrap().message, "older");
+    }
+
+    #[test]
+    fn duplicate_notification_is_refreshed_not_duplicated() {
+        let mut q = NotificationQueue::new();
+        q.push(NotificationKind::Info, "same".to_string(), Some(3));
+        q.push(NotificationKind::Info, "same".to_string(), Some(5));
+        assert_eq!(q.notifications.len(), 1);
     }
 
     #[test]

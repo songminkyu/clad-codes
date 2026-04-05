@@ -111,6 +111,9 @@ impl Tool for FileWriteTool {
             self.name(),
         );
 
+        // Run any configured formatter for this file type.
+        crate::try_format_file(&path.to_string_lossy(), ctx).await;
+
         let line_count = params.content.lines().count();
         let byte_count = params.content.len();
 

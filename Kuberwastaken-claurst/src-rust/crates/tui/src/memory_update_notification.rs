@@ -1,19 +1,23 @@
 // memory_update_notification.rs — MemoryUpdateNotification surface.
 //
 // Mirrors src/components/memory/MemoryUpdateNotification.tsx.
-// Shown briefly in the message area when Claude updates a memory file
-// (e.g. ~/.claude/CLAUDE.md or a project-local CLAUDE.md).
+// Shown briefly in the message area when Claurst updates a memory file
+// (e.g. ~/.claurst/AGENTS.md or a project-local AGENTS.md).
 //
 // Displays: "Memory updated in {relative_path} · /memory to edit"
 //
 // The surface is a single-row dismissable banner. The caller is responsible
 // for showing it at the right time (e.g. after a memory write tool result).
 
+use std::time::{Duration, Instant};
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Widget};
+
+use crate::overlays::{CLAURST_ACCENT, CLAURST_MUTED, CLAURST_PANEL_BG, CLAURST_TEXT};
 
 // ---------------------------------------------------------------------------
 // Path helpers
@@ -81,6 +85,7 @@ pub struct MemoryUpdateNotificationState {
     pub memory_path: String,
     /// Whether the user has dismissed this notification.
     dismissed: bool,
+    expires_at: Option<Instant>,
 }
 
 impl MemoryUpdateNotificationState {
@@ -95,17 +100,25 @@ impl MemoryUpdateNotificationState {
         self.memory_path = path.to_string();
         self.visible = true;
         self.dismissed = false;
+        self.expires_at = Some(Instant::now() + Duration::from_secs(6));
     }
 
     /// Dismiss the notification.
     pub fn dismiss(&mut self) {
         self.visible = false;
         self.dismissed = true;
+        self.expires_at = None;
     }
 
     /// Height the notification occupies (0 if not visible).
     pub fn height(&self) -> u16 {
         if self.visible { 1 } else { 0 }
+    }
+
+    pub fn tick(&mut self) {
+        if self.visible && self.expires_at.is_some_and(|expires_at| Instant::now() >= expires_at) {
+            self.dismiss();
+        }
     }
 }
 
@@ -136,27 +149,27 @@ pub fn render_memory_update_notification(
 
     let line = Line::from(vec![
         Span::styled(" ", Style::default()),
-        Span::styled("\u{1f9e0} ", Style::default().fg(Color::Cyan)),
-        Span::styled("Memory updated in ", Style::default().fg(Color::White)),
+        Span::styled("\u{1f9e0} ", Style::default().fg(CLAURST_ACCENT)),
+        Span::styled("Memory updated in ", Style::default().fg(CLAURST_TEXT)),
         Span::styled(
             display_path,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(CLAURST_ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" \u{00b7} ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" \u{00b7} ", Style::default().fg(CLAURST_MUTED)),
         Span::styled(
             "/memory",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(CLAURST_ACCENT)
                 .add_modifier(Modifier::UNDERLINED),
         ),
-        Span::styled(" to edit", Style::default().fg(Color::DarkGray)),
-        Span::styled("  [Esc to dismiss]", Style::default().fg(Color::DarkGray)),
+        Span::styled(" to edit", Style::default().fg(CLAURST_MUTED)),
+        Span::styled("  Esc dismiss", Style::default().fg(CLAURST_MUTED)),
     ]);
 
     Paragraph::new(line)
-        .style(Style::default().bg(Color::Rgb(20, 30, 20)))
+        .style(Style::default().bg(CLAURST_PANEL_BG).fg(CLAURST_TEXT))
         .render(notif_area, buf);
 }
 
@@ -173,9 +186,9 @@ mod tests {
     fn memory_notif_show_and_dismiss() {
         let mut state = MemoryUpdateNotificationState::new();
         assert!(!state.visible);
-        state.show("/home/user/.claude/CLAUDE.md");
+        state.show("/home/user/.claurst/AGENTS.md");
         assert!(state.visible);
-        assert_eq!(state.memory_path, "/home/user/.claude/CLAUDE.md");
+        assert_eq!(state.memory_path, "/home/user/.claurst/AGENTS.md");
         state.dismiss();
         assert!(!state.visible);
     }
@@ -183,20 +196,29 @@ mod tests {
     #[test]
     fn memory_notif_can_reshown_after_dismiss() {
         let mut state = MemoryUpdateNotificationState::new();
-        state.show("/tmp/CLAUDE.md");
+        state.show("/tmp/AGENTS.md");
         state.dismiss();
         assert!(!state.visible);
-        state.show("/tmp/other/CLAUDE.md");
+        state.show("/tmp/other/AGENTS.md");
         assert!(state.visible);
-        assert_eq!(state.memory_path, "/tmp/other/CLAUDE.md");
+        assert_eq!(state.memory_path, "/tmp/other/AGENTS.md");
     }
 
     #[test]
     fn memory_notif_height() {
         let mut state = MemoryUpdateNotificationState::new();
         assert_eq!(state.height(), 0);
-        state.show("/tmp/CLAUDE.md");
+        state.show("/tmp/AGENTS.md");
         assert_eq!(state.height(), 1);
+    }
+
+    #[test]
+    fn memory_notif_expires_after_tick() {
+        let mut state = MemoryUpdateNotificationState::new();
+        state.show("/tmp/AGENTS.md");
+        state.expires_at = Some(Instant::now() - Duration::from_secs(1));
+        state.tick();
+        assert!(!state.visible);
     }
 
     #[test]
@@ -211,16 +233,16 @@ mod tests {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_else(|_| "/home/testuser".to_string());
-        let path = format!("{}/CLAUDE.md", home);
+        let path = format!("{}/AGENTS.md", home);
         let result = get_relative_memory_path(&path);
         assert!(result.starts_with("~/"), "expected ~/…, got: {result}");
-        assert!(result.contains("CLAUDE.md"));
+        assert!(result.contains("AGENTS.md"));
     }
 
     #[test]
     fn memory_notif_render_smoke() {
         let mut state = MemoryUpdateNotificationState::new();
-        state.show("/home/user/.claude/CLAUDE.md");
+        state.show("/home/user/.claurst/AGENTS.md");
         let area = Rect { x: 0, y: 0, width: 100, height: 4 };
         let mut buf = ratatui::buffer::Buffer::empty(area);
         render_memory_update_notification(&state, area, &mut buf);

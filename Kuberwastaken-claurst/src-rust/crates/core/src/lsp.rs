@@ -453,6 +453,129 @@ impl LspClient {
         .await
     }
 
+    /// Get hover information at a position (1-based line/column).
+    pub async fn hover(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<Option<String>> {
+        // LSP protocol is 0-based
+        let result = self
+            .send_request_inner(
+                "textDocument/hover",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": {
+                        "line": line.saturating_sub(1),
+                        "character": character.saturating_sub(1),
+                    }
+                }),
+            )
+            .await?;
+
+        if result.is_null() {
+            return Ok(None);
+        }
+
+        // The result can be { contents: MarkupContent | MarkedString | MarkedString[] }
+        let contents = &result["contents"];
+        let text = if let Some(value) = contents.get("value").and_then(|v| v.as_str()) {
+            // MarkupContent { kind, value }
+            value.to_string()
+        } else if let Some(s) = contents.as_str() {
+            // Plain string
+            s.to_string()
+        } else if let Some(arr) = contents.as_array() {
+            // Array of MarkedStrings
+            arr.iter()
+                .filter_map(|item| {
+                    item.get("value")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| item.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        } else {
+            return Ok(None);
+        };
+
+        if text.trim().is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(text))
+        }
+    }
+
+    /// Get definition locations for a position (1-based line/column).
+    /// Returns a list of `"file_path:line"` strings.
+    pub async fn definition(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<Vec<String>> {
+        let result = self
+            .send_request_inner(
+                "textDocument/definition",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": {
+                        "line": line.saturating_sub(1),
+                        "character": character.saturating_sub(1),
+                    }
+                }),
+            )
+            .await?;
+
+        Ok(extract_locations(&result))
+    }
+
+    /// Get all references for a symbol at a position (1-based line/column).
+    pub async fn references(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<Vec<String>> {
+        let result = self
+            .send_request_inner(
+                "textDocument/references",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": {
+                        "line": line.saturating_sub(1),
+                        "character": character.saturating_sub(1),
+                    },
+                    "context": { "includeDeclaration": true }
+                }),
+            )
+            .await?;
+
+        Ok(extract_locations(&result))
+    }
+
+    /// List document symbols for a file.
+    pub async fn document_symbols(&self, uri: &str) -> anyhow::Result<Vec<String>> {
+        let result = self
+            .send_request_inner(
+                "textDocument/documentSymbol",
+                json!({ "textDocument": { "uri": uri } }),
+            )
+            .await?;
+
+        let mut symbols = Vec::new();
+        match &result {
+            serde_json::Value::Array(arr) => {
+                for sym in arr {
+                    collect_symbol(sym, 0, &mut symbols);
+                }
+            }
+            _ => {}
+        }
+        Ok(symbols)
+    }
+
     /// Get cached diagnostics for `file_path`.
     pub fn get_diagnostics(&self, file_path: &str) -> Vec<LspDiagnostic> {
         let uri = path_to_uri(file_path);
@@ -617,6 +740,94 @@ fn parse_diagnostic(
 }
 
 // ---------------------------------------------------------------------------
+// Location / symbol helpers
+// ---------------------------------------------------------------------------
+
+/// Extract a list of `"path:line"` strings from an LSP `Location | Location[]` result.
+fn extract_locations(result: &serde_json::Value) -> Vec<String> {
+    let items: Vec<&serde_json::Value> = if let Some(arr) = result.as_array() {
+        arr.iter().collect()
+    } else if result.is_object() {
+        vec![result]
+    } else {
+        return Vec::new();
+    };
+
+    items
+        .into_iter()
+        .filter_map(|loc| {
+            let uri = loc.get("uri")?.as_str()?;
+            let line = loc
+                .pointer("/range/start/line")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                + 1; // convert to 1-based
+            let col = loc
+                .pointer("/range/start/character")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                + 1;
+            let path = uri_to_path(uri);
+            Some(format!("{}:{}:{}", path, line, col))
+        })
+        .collect()
+}
+
+/// Recursively collect symbol names from a DocumentSymbol or SymbolInformation node.
+fn collect_symbol(sym: &serde_json::Value, depth: usize, out: &mut Vec<String>) {
+    let indent = "  ".repeat(depth);
+    let name = sym
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("<unnamed>");
+    let kind = sym
+        .get("kind")
+        .and_then(|k| k.as_u64())
+        .unwrap_or(0);
+    let kind_str = symbol_kind_name(kind);
+    out.push(format!("{}{} ({})", indent, name, kind_str));
+
+    // DocumentSymbol may have nested children
+    if let Some(children) = sym.get("children").and_then(|c| c.as_array()) {
+        for child in children {
+            collect_symbol(child, depth + 1, out);
+        }
+    }
+}
+
+fn symbol_kind_name(kind: u64) -> &'static str {
+    match kind {
+        1 => "file",
+        2 => "module",
+        3 => "namespace",
+        4 => "package",
+        5 => "class",
+        6 => "method",
+        7 => "property",
+        8 => "field",
+        9 => "constructor",
+        10 => "enum",
+        11 => "interface",
+        12 => "function",
+        13 => "variable",
+        14 => "constant",
+        15 => "string",
+        16 => "number",
+        17 => "boolean",
+        18 => "array",
+        19 => "object",
+        20 => "key",
+        21 => "null",
+        22 => "enum-member",
+        23 => "struct",
+        24 => "event",
+        25 => "operator",
+        26 => "type-parameter",
+        _ => "symbol",
+    }
+}
+
+// ---------------------------------------------------------------------------
 // URI helpers
 // ---------------------------------------------------------------------------
 
@@ -744,6 +955,12 @@ impl LspManager {
         self.configs.iter().find(|s| s.name == name)
     }
 
+    /// Public wrapper: find the first server name that handles `file_path` based on extension.
+    /// Returns `None` when no server is configured for the file's extension.
+    pub fn server_name_for_file_pub(&self, file_path: &str) -> Option<&str> {
+        self.server_name_for_file(file_path)
+    }
+
     /// Find the first server name that handles `file_path` based on extension.
     fn server_name_for_file(&self, file_path: &str) -> Option<&str> {
         let ext = Path::new(file_path)
@@ -869,6 +1086,106 @@ impl LspManager {
             self.opened_files.insert(uri, server_name);
         }
         Ok(())
+    }
+
+    /// Register all servers from a config slice if not already registered.
+    /// Idempotent: servers already present by name are skipped.
+    pub fn seed_from_config(&mut self, configs: &[LspServerConfig]) {
+        for cfg in configs {
+            if !self.configs.iter().any(|c| c.name == cfg.name) {
+                self.register_server(cfg.clone());
+            }
+        }
+    }
+
+    /// Get hover information for `file_path` at the given 1-based position.
+    pub async fn hover(
+        &mut self,
+        file_path: &str,
+        root_dir: &Path,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<Option<String>> {
+        let uri = path_to_uri(file_path);
+        let server_name = self
+            .server_name_for_file(file_path)
+            .ok_or_else(|| {
+                anyhow::anyhow!("No LSP server configured for '{}'", file_path)
+            })?
+            .to_string();
+        self.ensure_started(file_path, root_dir).await?;
+        let client = self
+            .clients
+            .get(&server_name)
+            .ok_or_else(|| anyhow::anyhow!("LSP server '{}' not running", server_name))?;
+        client.hover(&uri, line, character).await
+    }
+
+    /// Get definition locations for `file_path` at the given 1-based position.
+    pub async fn definition(
+        &mut self,
+        file_path: &str,
+        root_dir: &Path,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<Vec<String>> {
+        let uri = path_to_uri(file_path);
+        let server_name = self
+            .server_name_for_file(file_path)
+            .ok_or_else(|| {
+                anyhow::anyhow!("No LSP server configured for '{}'", file_path)
+            })?
+            .to_string();
+        self.ensure_started(file_path, root_dir).await?;
+        let client = self
+            .clients
+            .get(&server_name)
+            .ok_or_else(|| anyhow::anyhow!("LSP server '{}' not running", server_name))?;
+        client.definition(&uri, line, character).await
+    }
+
+    /// Get references for a symbol in `file_path` at the given 1-based position.
+    pub async fn references(
+        &mut self,
+        file_path: &str,
+        root_dir: &Path,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<Vec<String>> {
+        let uri = path_to_uri(file_path);
+        let server_name = self
+            .server_name_for_file(file_path)
+            .ok_or_else(|| {
+                anyhow::anyhow!("No LSP server configured for '{}'", file_path)
+            })?
+            .to_string();
+        self.ensure_started(file_path, root_dir).await?;
+        let client = self
+            .clients
+            .get(&server_name)
+            .ok_or_else(|| anyhow::anyhow!("LSP server '{}' not running", server_name))?;
+        client.references(&uri, line, character).await
+    }
+
+    /// List document symbols for `file_path`.
+    pub async fn document_symbols(
+        &mut self,
+        file_path: &str,
+        root_dir: &Path,
+    ) -> anyhow::Result<Vec<String>> {
+        let uri = path_to_uri(file_path);
+        let server_name = self
+            .server_name_for_file(file_path)
+            .ok_or_else(|| {
+                anyhow::anyhow!("No LSP server configured for '{}'", file_path)
+            })?
+            .to_string();
+        self.ensure_started(file_path, root_dir).await?;
+        let client = self
+            .clients
+            .get(&server_name)
+            .ok_or_else(|| anyhow::anyhow!("LSP server '{}' not running", server_name))?;
+        client.document_symbols(&uri).await
     }
 
     /// Get cached diagnostics for `file_path` across all running servers.

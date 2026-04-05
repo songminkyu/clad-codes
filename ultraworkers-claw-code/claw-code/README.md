@@ -5,11 +5,11 @@
 </p>
 
 <p align="center">
-  <a href="https://star-history.com/#instructkr/claw-code&Date">
+  <a href="https://star-history.com/#ultraworkers/claw-code&Date">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=instructkr/claw-code&type=Date&theme=dark" />
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=instructkr/claw-code&type=Date" />
-      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=instructkr/claw-code&type=Date" width="600" />
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date&theme=dark" />
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date" />
+      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date" width="600" />
     </picture>
   </a>
 </p>
@@ -19,70 +19,41 @@
 </p>
 
 <p align="center">
-  <strong>Better Harness Tools, not merely storing the archive of leaked Claw Code</strong>
+  <strong>Autonomously maintained by lobsters/claws — not by human hands</strong>
 </p>
 
 <p align="center">
-  <a href="https://github.com/sponsors/instructkr"><img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?logo=github&style=for-the-badge" alt="Sponsor on GitHub" /></a>
+  <a href="https://github.com/Yeachan-Heo/clawhip">clawhip</a> ·
+  <a href="https://github.com/code-yeongyu/oh-my-openagent">oh-my-openagent</a> ·
+  <a href="https://github.com/Yeachan-Heo/oh-my-claudecode">oh-my-claudecode</a> ·
+  <a href="https://github.com/Yeachan-Heo/oh-my-codex">oh-my-codex</a> ·
+  <a href="https://discord.gg/6ztZB9jvWq">UltraWorkers Discord</a>
 </p>
 
 > [!IMPORTANT]
-> **Rust port is now in progress** on the [`dev/rust`](https://github.com/instructkr/claw-code/tree/dev/rust) branch and is expected to be merged into main today. The Rust implementation aims to deliver a faster, memory-safe harness runtime. Stay tuned — this will be the definitive version of the project.
+> The active Rust workspace now lives in [`rust/`](./rust). Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows, then use [`rust/README.md`](./rust/README.md) for crate-level details.
 
-> If you find this work useful, consider [sponsoring @instructkr on GitHub](https://github.com/sponsors/instructkr) to support continued open-source harness engineering research.
+> Want the bigger idea behind this repo? Read [`PHILOSOPHY.md`](./PHILOSOPHY.md) and Sigrid Jin's public explanation: https://x.com/realsigridjin/status/2039472968624185713
+
+> Shout-out to the UltraWorkers ecosystem powering this repo: [clawhip](https://github.com/Yeachan-Heo/clawhip), [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent), [oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode), [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex), and the [UltraWorkers Discord](https://discord.gg/6ztZB9jvWq).
 
 ---
 
-## Rust Port
-
-The Rust workspace under `rust/` is the current systems-language port of the project.
-
-It currently includes:
-
-- `crates/api-client` — API client with provider abstraction, OAuth, and streaming support
-- `crates/runtime` — session state, compaction, MCP orchestration, prompt construction
-- `crates/tools` — tool manifest definitions and execution framework
-- `crates/commands` — slash commands, skills discovery, and config inspection
-- `crates/plugins` — plugin model, hook pipeline, and bundled plugins
-- `crates/compat-harness` — compatibility layer for upstream editor integration
-- `crates/claw-cli` — interactive REPL, markdown rendering, and project bootstrap/init flows
-
-Run the Rust build:
-
-```bash
-cd rust
-cargo build --release
-```
-
 ## Backstory
 
-At 4 AM on March 31, 2026, I woke up to my phone blowing up with notifications. The Claw Code source had been exposed, and the entire dev community was in a frenzy. My girlfriend in Korea was genuinely worried I might face legal action from the original authors just for having the code on my machine — so I did what any engineer would do under pressure: I sat down, ported the core features to Python from scratch, and pushed it before the sun came up.
+This repo is maintained by **lobsters/claws**, not by a conventional human-only dev team.
 
-The whole thing was orchestrated end-to-end using [oh-my-codex (OmX)](https://github.com/Yeachan-Heo/oh-my-codex) by [@bellman_ych](https://x.com/bellman_ych) — a workflow layer built on top of OpenAI's Codex ([@OpenAIDevs](https://x.com/OpenAIDevs)). I used `$team` mode for parallel code review and `$ralph` mode for persistent execution loops with architect-level verification. The entire porting session — from reading the original harness structure to producing a working Python tree with tests — was driven through OmX orchestration.
+The people behind the system are [Bellman / Yeachan Heo](https://github.com/Yeachan-Heo) and friends like [Yeongyu](https://github.com/code-yeongyu), but the repo itself is being pushed forward by autonomous claw workflows: parallel coding sessions, event-driven orchestration, recovery loops, and machine-readable lane state.
 
-The result is a clean-room Python rewrite that captures the architectural patterns of Claw Code's agent harness without copying any proprietary source. I'm now actively collaborating with [@bellman_ych](https://x.com/bellman_ych) — the creator of OmX himself — to push this further. The basic Python foundation is already in place and functional, but we're just getting started. **Stay tuned — a much more capable version is on the way.**
+In practice, that means this project is not just *about* coding agents — it is being **actively built by them**. Features, tests, telemetry, docs, and workflow hardening are landed through claw-driven loops using [clawhip](https://github.com/Yeachan-Heo/clawhip), [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent), [oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode), and [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex).
 
-The Rust port was developed with both [oh-my-codex (OmX)](https://github.com/Yeachan-Heo/oh-my-codex) and [oh-my-opencode (OmO)](https://github.com/code-yeongyu/oh-my-openagent): OmX drove scaffolding, orchestration, and architecture direction, while OmO was used for later implementation acceleration and verification support.
+This repository exists to prove that an open coding harness can be built **autonomously, in public, and at high velocity** — with humans setting direction and claws doing the grinding.
 
-https://github.com/instructkr/claw-code
+See the public build story here:
+
+https://x.com/realsigridjin/status/2039472968624185713
 
 ![Tweet screenshot](assets/tweet-screenshot.png)
-
-## The Creators Featured in Wall Street Journal For Avid Claw Code Fans
-
-I've been deeply interested in **harness engineering** — studying how agent systems wire tools, orchestrate tasks, and manage runtime context. This isn't a sudden thing. The Wall Street Journal featured my work earlier this month, documenting how I've been one of the most active power users exploring these systems:
-
-> AI startup worker Sigrid Jin, who attended the Seoul dinner, single-handedly used 25 billion of Claw Code tokens last year. At the time, usage limits were looser, allowing early enthusiasts to reach tens of billions of tokens at a very low cost.
->
-> Despite his countless hours with Claw Code, Jin isn't faithful to any one AI lab. The tools available have different strengths and weaknesses, he said. Codex is better at reasoning, while Claw Code generates cleaner, more shareable code.
->
-> Jin flew to San Francisco in February for Claw Code's first birthday party, where attendees waited in line to compare notes with Cherny. The crowd included a practicing cardiologist from Belgium who had built an app to help patients navigate care, and a California lawyer who made a tool for automating building permit approvals using Claw Code.
->
-> "It was basically like a sharing party," Jin said. "There were lawyers, there were doctors, there were dentists. They did not have software engineering backgrounds."
->
-> — *The Wall Street Journal*, March 21, 2026, [*"The Trillion Dollar Race to Automate Our Entire Lives"*](https://lnkd.in/gs9td3qd)
-
-![WSJ Feature](assets/wsj-feature.png)
 
 ---
 
@@ -115,15 +86,6 @@ This repository now focuses on Python porting work instead.
 │   ├── query_engine.py
 │   ├── task.py
 │   └── tools.py
-├── rust/                               # Rust port (claw CLI)
-│   ├── crates/api/                     # API client + streaming
-│   ├── crates/runtime/                 # Session, tools, MCP, config
-│   ├── crates/claw-cli/               # Interactive CLI binary
-│   ├── crates/plugins/                 # Plugin system
-│   ├── crates/commands/                # Slash commands
-│   ├── crates/server/                  # HTTP/SSE server (axum)
-│   ├── crates/lsp/                    # LSP client integration
-│   └── crates/tools/                   # Tool specs
 ├── tests/                              # Python verification
 ├── assets/omx/                         # OmX workflow screenshots
 ├── 2026-03-09-is-legal-the-same-as-legitimate-ai-reimplementation-and-the-erosion-of-copyleft.md
@@ -184,19 +146,14 @@ python3 -m src.main tools --limit 10
 
 The port now mirrors the archived root-entry file surface, top-level subsystem names, and command/tool inventories much more closely than before. However, it is **not yet** a full runtime-equivalent replacement for the original TypeScript system; the Python tree still contains fewer executable runtime slices than the archived source.
 
-## Built with `oh-my-codex` and `oh-my-opencode`
 
-This repository's porting, cleanroom hardening, and verification workflow was AI-assisted with Yeachan Heo's tooling stack, with **oh-my-codex (OmX)** as the primary scaffolding and orchestration layer.
+## Built with `oh-my-codex`
 
-- [**oh-my-codex (OmX)**](https://github.com/Yeachan-Heo/oh-my-codex) — scaffolding, orchestration, architecture direction, and core porting workflow
-- [**oh-my-opencode (OmO)**](https://github.com/code-yeongyu/oh-my-openagent) — implementation acceleration, cleanup, and verification support
+The restructuring and documentation work on this repository was AI-assisted and orchestrated with Yeachan Heo's [oh-my-codex (OmX)](https://github.com/Yeachan-Heo/oh-my-codex), layered on top of Codex.
 
-Key workflow patterns used during the port:
-
-- **`$team` mode:** coordinated parallel review and architectural feedback
-- **`$ralph` mode:** persistent execution, verification, and completion discipline
-- **Cleanroom passes:** naming/branding cleanup, QA, and release validation across the Rust workspace
-- **Manual and live validation:** build, test, manual QA, and real API-path verification before publish
+- **`$team` mode:** used for coordinated parallel review and architectural feedback
+- **`$ralph` mode:** used for persistent execution, verification, and completion discipline
+- **Codex-driven workflow:** used to turn the main `src/` tree into a Python-first porting workspace
 
 ### OmX workflow screenshots
 
@@ -211,12 +168,12 @@ Key workflow patterns used during the port:
 ## Community
 
 <p align="center">
-  <a href="https://instruct.kr/"><img src="assets/instructkr.png" alt="instructkr" width="400" /></a>
+  <a href="https://discord.gg/6ztZB9jvWq"><img src="https://img.shields.io/badge/UltraWorkers-Discord-5865F2?logo=discord&style=for-the-badge" alt="UltraWorkers Discord" /></a>
 </p>
 
-Join the [**instructkr Discord**](https://instruct.kr/) — the best Korean language model community. Come chat about LLMs, harness engineering, agent workflows, and everything in between.
+Join the [**UltraWorkers Discord**](https://discord.gg/6ztZB9jvWq) — the community around clawhip, oh-my-openagent, oh-my-claudecode, oh-my-codex, and claw-code. Come chat about LLMs, harness engineering, agent workflows, and autonomous software development.
 
-[![Discord](https://img.shields.io/badge/Join%20Discord-instruct.kr-5865F2?logo=discord&style=for-the-badge)](https://instruct.kr/)
+[![Discord](https://img.shields.io/badge/Join%20Discord-UltraWorkers-5865F2?logo=discord&style=for-the-badge)](https://discord.gg/6ztZB9jvWq)
 
 ## Star History
 
@@ -224,5 +181,5 @@ See the chart at the top of this README.
 
 ## Ownership / Affiliation Disclaimer
 
-- This repository does **not** claim ownership of the original Claw Code source material.
-- This repository is **not affiliated with, endorsed by, or maintained by the original authors**.
+- This repository does **not** claim ownership of the original Claude Code source material.
+- This repository is **not affiliated with, endorsed by, or maintained by Anthropic**.
