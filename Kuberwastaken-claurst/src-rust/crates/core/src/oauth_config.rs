@@ -340,12 +340,10 @@ pub fn clear_codex_tokens() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Returns true if the user has a valid Codex access token AND
-/// CLAURST_USE_OPENAI=1 is set.
+/// Returns true if the user has a valid Codex access token.
+/// Tokens are obtained via `/connect → OpenAI Codex` (browser OAuth flow)
+/// or by setting `CLAURST_USE_OPENAI=1` with a manually stored token.
 pub fn is_codex_subscriber() -> bool {
-    if std::env::var("CLAURST_USE_OPENAI").as_deref() != Ok("1") {
-        return false;
-    }
     get_codex_tokens()
         .map(|t| !t.access_token.is_empty())
         .unwrap_or(false)

@@ -377,16 +377,30 @@ pub fn copy_to_clipboard(text: &str) -> bool {
     // Windows
     #[cfg(target_os = "windows")]
     {
-        if let Ok(mut child) = std::process::Command::new("cmd")
-            .args(["/C", "clip"])
+        // Call clip.exe directly (not through cmd.exe) for reliability in raw terminal mode.
+        if let Ok(mut child) = std::process::Command::new("clip")
             .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
         {
             if let Some(mut stdin) = child.stdin.take() {
                 let _ = stdin.write_all(text.as_bytes());
-                drop(stdin);
+                drop(stdin); // close stdin so clip reads EOF
             }
             return child.wait().map(|s| s.success()).unwrap_or(false);
+        }
+        // Fallback: PowerShell Set-Clipboard (works in more environments)
+        {
+            let escaped = text.replace('\'', "''");
+            if let Ok(mut child) = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", &format!("Set-Clipboard '{}'", escaped)])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                return child.wait().map(|s| s.success()).unwrap_or(false);
+            }
         }
     }
 

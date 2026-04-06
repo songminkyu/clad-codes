@@ -543,14 +543,40 @@ impl LlmProvider for OpenAiCompatProvider {
                         None => continue,
                     };
 
-                    // Reasoning / thinking field (e.g. DeepSeek "reasoning_content")
-                    if let Some(ref field) = reasoning_field {
-                        if let Some(reasoning) = delta.get(field).and_then(|v| v.as_str()) {
-                            if !reasoning.is_empty() {
-                                yield Ok(StreamEvent::ReasoningDelta {
-                                    index: 0,
-                                    reasoning: reasoning.to_string(),
-                                });
+                    // Reasoning / thinking extraction.
+                    // Check the provider-specific field first (e.g. DeepSeek's
+                    // "reasoning_content"), then fall back to common field names
+                    // used by other providers (Copilot "reasoning_text", generic
+                    // "reasoning", etc.).  This allows reasoning traces to show
+                    // for any provider that emits them without needing explicit
+                    // per-provider configuration.
+                    {
+                        const COMMON_REASONING_FIELDS: &[&str] = &[
+                            "reasoning_content",  // DeepSeek
+                            "reasoning_text",     // GitHub Copilot
+                            "reasoning",          // Generic / future
+                        ];
+                        let fields_to_check: Vec<&str> = if let Some(ref f) = reasoning_field {
+                            // Provider-specific field first, then common ones
+                            let mut v = vec![f.as_str()];
+                            for common in COMMON_REASONING_FIELDS {
+                                if *common != f.as_str() {
+                                    v.push(common);
+                                }
+                            }
+                            v
+                        } else {
+                            COMMON_REASONING_FIELDS.to_vec()
+                        };
+                        for field in &fields_to_check {
+                            if let Some(reasoning) = delta.get(*field).and_then(|v| v.as_str()) {
+                                if !reasoning.is_empty() {
+                                    yield Ok(StreamEvent::ReasoningDelta {
+                                        index: 0,
+                                        reasoning: reasoning.to_string(),
+                                    });
+                                    break;
+                                }
                             }
                         }
                     }

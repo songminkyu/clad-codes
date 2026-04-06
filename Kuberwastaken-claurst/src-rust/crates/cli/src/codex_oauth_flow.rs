@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
 use claurst_core::oauth_config::CodexTokens;
-use claurst_core::codex_oauth::{CODEX_CLIENT_ID, CODEX_AUTHORIZE_URL, CODEX_REDIRECT_URI, CODEX_SCOPES, CODEX_TOKEN_URL};
+use claurst_core::codex_oauth::{CODEX_CLIENT_ID, CODEX_AUTHORIZE_URL, CODEX_OAUTH_PORT, CODEX_REDIRECT_URI, CODEX_SCOPES, CODEX_TOKEN_URL};
 
 /// Generate a PKCE code verifier (random 64-byte base64url string).
 pub fn generate_code_verifier() -> String {
@@ -46,7 +46,7 @@ pub fn generate_state() -> String {
 /// Build the OpenAI authorization URL for Codex OAuth.
 pub fn build_auth_url(code_challenge: &str, state: &str) -> String {
     format!(
-        "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&code_challenge={}&code_challenge_method=S256&state={}",
+        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=claurst",
         CODEX_AUTHORIZE_URL,
         CODEX_CLIENT_ID,
         urlencoding::encode(CODEX_REDIRECT_URI),
@@ -59,15 +59,44 @@ pub fn build_auth_url(code_challenge: &str, state: &str) -> String {
 /// Start local HTTP server on port 1455, open browser, wait for callback,
 /// exchange code for tokens, return CodexTokens.
 pub async fn run_oauth_flow() -> anyhow::Result<CodexTokens> {
-    anyhow::bail!(
-        "OpenAI Codex OAuth requires a registered application.\n\
-         Use an OpenAI API key instead: set OPENAI_API_KEY or use /connect → OpenAI."
-    );
+    let verifier = generate_code_verifier();
+    let challenge = compute_code_challenge(&verifier);
+    let state = generate_state();
+
+    // Bind local server for callback
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", CODEX_OAUTH_PORT))
+        .await
+        .map_err(|e| anyhow!("Failed to bind port {}: {}", CODEX_OAUTH_PORT, e))?;
+
+    let auth_url = build_auth_url(&challenge, &state);
+
+    // Try to open browser
+    eprintln!("\nOpening browser for OpenAI Codex login...");
+    eprintln!("If your browser doesn't open, visit:\n{}\n", auth_url);
+    let _ = open::that(&auth_url);
+
+    // Wait for OAuth callback
+    let (code, callback_state) = wait_for_callback(listener).await?;
+
+    if callback_state != state {
+        bail!("OAuth state mismatch — possible CSRF attack");
+    }
+
+    // Exchange code for tokens
+    let tokens = exchange_code_for_tokens(&code, &verifier).await?;
+
+    // Persist tokens
+    claurst_core::oauth_config::save_codex_tokens(&tokens)?;
+
+    eprintln!("Codex login successful!");
+    Ok(tokens)
 }
 
 /// Wait for OAuth callback on local server, extract code and state.
 async fn wait_for_callback(listener: TcpListener) -> anyhow::Result<(String, String)> {
-    let (socket, _) = tokio::time::timeout(
+    use tokio::io::AsyncWriteExt;
+
+    let (mut socket, _) = tokio::time::timeout(
         std::time::Duration::from_secs(300), // 5 minute timeout
         listener.accept(),
     )
@@ -75,11 +104,11 @@ async fn wait_for_callback(listener: TcpListener) -> anyhow::Result<(String, Str
     .map_err(|_| anyhow!("OAuth callback timeout (5 minutes)"))?
     .map_err(|e| anyhow!("Failed to accept connection: {}", e))?;
 
-    let mut reader = BufReader::new(socket);
+    let mut reader = BufReader::new(&mut socket);
     let mut request_line = String::new();
     reader.read_line(&mut request_line).await?;
 
-    // Parse "GET /?code=...&state=... HTTP/1.1"
+    // Parse "GET /auth/callback?code=...&state=... HTTP/1.1"
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
         bail!("Invalid HTTP request");
@@ -91,16 +120,42 @@ async fn wait_for_callback(listener: TcpListener) -> anyhow::Result<(String, Str
 
     let mut code = String::new();
     let mut state = String::new();
+    let mut error = String::new();
 
     for param in query.split('&') {
-        let kv: Vec<&str> = param.split('=').collect();
+        let kv: Vec<&str> = param.splitn(2, '=').collect();
         if kv.len() == 2 {
             match kv[0] {
                 "code" => code = urlencoding::decode(kv[1])?.to_string(),
                 "state" => state = urlencoding::decode(kv[1])?.to_string(),
+                "error" => error = urlencoding::decode(kv[1])?.to_string(),
+                "error_description" => error = urlencoding::decode(kv[1])?.to_string(),
                 _ => {}
             }
         }
+    }
+
+    // Send HTML response to browser before processing
+    let html = if error.is_empty() {
+        "<html><body style='background:#131010;color:#f1ecec;display:flex;justify-content:center;align-items:center;height:100vh;font-family:system-ui'>\
+         <div style='text-align:center'><h1>Authorization Successful</h1><p>You can close this window and return to Claurst.</p></div>\
+         <script>setTimeout(()=>window.close(),2000)</script></body></html>"
+    } else {
+        "<html><body style='background:#131010;color:#f1ecec;display:flex;justify-content:center;align-items:center;height:100vh;font-family:system-ui'>\
+         <div style='text-align:center'><h1 style='color:#fc533a'>Authorization Failed</h1><p>Check the terminal for details.</p></div></body></html>"
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        html.len(),
+        html
+    );
+    // Drop the BufReader so we can write back on the socket
+    drop(reader);
+    let _ = socket.write_all(response.as_bytes()).await;
+    let _ = socket.shutdown().await;
+
+    if !error.is_empty() {
+        bail!("OAuth error: {}", error);
     }
 
     if code.is_empty() || state.is_empty() {

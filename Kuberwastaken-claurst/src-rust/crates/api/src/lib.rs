@@ -452,6 +452,14 @@ pub mod client {
     }
 
     impl AnthropicClient {
+        /// Returns `true` when the client was constructed without an API key.
+        ///
+        /// The query loop checks this to know whether it should fall back to
+        /// a runtime-built provider (e.g. from keys stored via `/connect`).
+        pub fn api_key_is_empty(&self) -> bool {
+            self.config.api_key.is_empty()
+        }
+
         /// Build a new client.  Panics if `config.api_key` is empty.
         pub fn new(config: ClientConfig) -> anyhow::Result<Self> {
             // Allow empty key at construction — validation is deferred to

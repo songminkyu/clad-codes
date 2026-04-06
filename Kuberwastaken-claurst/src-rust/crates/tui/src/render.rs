@@ -6,7 +6,7 @@ use crate::agents_view::render_agents_menu;
 use crate::context_viz::render_context_viz;
 use crate::export_dialog::render_export_dialog;
 use crate::app::{App, ContextMenuKind, SystemAnnotation, SystemMessageStyle, ToolStatus};
-use crate::rustle::{rustle_lines, RustlePose};
+use crate::rustle::rustle_lines;
 use crate::diff_viewer::render_diff_dialog;
 use crate::model_picker::render_model_picker;
 use crate::session_browser::render_session_browser;
@@ -29,7 +29,11 @@ use crate::figures;
 use crate::hooks_config_menu::render_hooks_config_menu;
 use crate::mcp_view::render_mcp_view;
 use crate::memory_file_selector::render_memory_file_selector;
-use crate::messages::{RenderContext, render_markdown, render_message};
+use crate::messages::{
+    render_transcript_assistant_message,
+    render_transcript_assistant_meta, render_transcript_live_text, render_transcript_user_message,
+    RenderContext,
+};
 use crate::notifications::render_notification_banner;
 use crate::overlays::{
     render_global_search, render_help_overlay, render_history_search_overlay, render_rewind_flow,
@@ -41,8 +45,10 @@ use crate::prompt_input::{InputMode, TypeaheadSource, VimMode, input_height, ren
 use crate::settings_screen::render_settings_screen;
 use crate::stats_dialog::render_stats_dialog;
 use crate::theme_screen::render_theme_screen;
+use crate::transcript_turn::{build_transcript_turns, TranscriptTurn};
 use crate::virtual_list::{VirtualItem, VirtualList};
 use claurst_core::constants::APP_VERSION;
+use claurst_core::types::Role;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -329,6 +335,7 @@ fn flatten_line_text(line: &Line<'_>) -> String {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct MessageLinesCacheKey {
     width: u16,
+    transcript_version: u64,
     messages_ptr: usize,
     messages_len: usize,
     annotations_ptr: usize,
@@ -346,6 +353,7 @@ struct MessageLinesCache {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct CompletedMsgCacheKey {
     width: u16,
+    transcript_version: u64,
     messages_len: usize,
     annotations_len: usize,
     thinking_expanded_len: usize,
@@ -856,7 +864,11 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
         if let Some(na) = notices_area {
             render_startup_notices(frame, app, na);
         }
-    } else if app.messages.is_empty() && app.streaming_text.is_empty() {
+    } else if app.messages.is_empty()
+        && app.streaming_text.is_empty()
+        && app.streaming_thinking.is_empty()
+        && app.tool_use_blocks.is_empty()
+    {
         app.last_msg_area.set(Rect::default());
         app.message_row_map.borrow_mut().clear();
         render_welcome_box(frame, app, content_area);
@@ -941,7 +953,7 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
             .viewport_content_length(visible_height as usize);
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .thumb_style(Style::default().fg(Color::Rgb(233, 30, 99)))  // pink thumb
+            .thumb_style(Style::default().fg(app.accent_color))  // accent thumb
             .track_style(Style::default().fg(Color::Rgb(40, 40, 50)));  // dark track
 
         frame.render_stateful_widget(scrollbar, msg_area, &mut scrollbar_state);
@@ -976,14 +988,147 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn push_rendered_items(
+    items: &mut Vec<RenderedLineItem>,
+    lines: Vec<Line<'static>>,
+    message_index: Option<usize>,
+    mark_first_header: bool,
+) {
+    for (index, line) in lines.into_iter().enumerate() {
+        items.push(RenderedLineItem {
+            search_text: flatten_line_text(&line),
+            is_header: mark_first_header && index == 0,
+            message_index,
+            line,
+        });
+    }
+}
+
+fn push_blank_item(items: &mut Vec<RenderedLineItem>) {
+    push_rendered_items(items, vec![Line::from("")], None, false);
+}
+
+fn render_live_thinking_line(turn: &TranscriptTurn<'_>, frame_count: u64) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    spans.extend(shimmer_spans("Thinking", frame_count));
+    if let Some(heading) = turn.reasoning_heading() {
+        spans.push(Span::styled(
+            format!(": {}", heading),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn append_turn_items(
+    items: &mut Vec<RenderedLineItem>,
+    turn: &TranscriptTurn<'_>,
+    width: u16,
+    tool_names: &std::collections::HashMap<String, String>,
+    expanded_thinking: &std::collections::HashSet<u64>,
+    frame_count: u64,
+    accent: Color,
+) {
+    push_rendered_items(
+        items,
+        render_transcript_user_message(turn.user_message, turn.metadata, width),
+        Some(turn.user_index),
+        true,
+    );
+
+    let mut sections: Vec<(Vec<Line<'static>>, Option<usize>)> = Vec::new();
+    for (message_index, message) in &turn.assistant_messages {
+        let lines = render_transcript_assistant_message(
+            message,
+            &RenderContext {
+                width,
+                highlight: true,
+                show_thinking: false,
+                tool_names: tool_names.clone(),
+                expanded_thinking: expanded_thinking.clone(),
+            },
+        );
+        if !lines.is_empty() {
+            sections.push((lines, Some(*message_index)));
+        }
+    }
+
+    for block in &turn.tool_blocks {
+        let mut lines = Vec::new();
+        render_tool_block_lines(&mut lines, block, frame_count);
+        if !lines.is_empty() {
+            sections.push((lines, Some(turn.primary_message_index())));
+        }
+    }
+
+    if turn.active && turn.live_thinking.is_some() {
+        sections.push((
+            vec![render_live_thinking_line(turn, frame_count)],
+            Some(turn.primary_message_index()),
+        ));
+    }
+
+    // Show a "Thinking" shimmer when the turn is active but no text or
+    // thinking content has arrived yet — gives visual feedback that the
+    // model is working (especially for providers without thinking support).
+    if turn.active
+        && turn.live_text.is_none()
+        && turn.live_thinking.is_none()
+        && turn.tool_blocks.iter().all(|b| b.status != ToolStatus::Running)
+    {
+        let mut spans = vec![Span::raw("  ")];
+        spans.extend(shimmer_spans("Thinking", frame_count));
+        sections.push((
+            vec![Line::from(spans)],
+            Some(turn.primary_message_index()),
+        ));
+    }
+
+    if let Some(text) = turn.live_text {
+        let lines = render_transcript_live_text(text, width);
+        if !lines.is_empty() {
+            sections.push((lines, Some(turn.primary_message_index())));
+        }
+    }
+
+    if !turn.active {
+        if let Some(meta_line) = render_transcript_assistant_meta(turn.metadata, accent) {
+            if turn.has_visible_assistant_content() {
+                sections.push((vec![meta_line], Some(turn.primary_message_index())));
+            }
+        }
+    }
+
+    if !sections.is_empty() {
+        push_blank_item(items);
+        let total_sections = sections.len();
+        for (index, (lines, message_index)) in sections.into_iter().enumerate() {
+            push_rendered_items(items, lines, message_index, false);
+            if index + 1 < total_sections {
+                push_blank_item(items);
+            }
+        }
+    }
+
+    push_blank_item(items);
+}
+
 fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
-    let streaming = !app.streaming_text.is_empty();
-    let has_tool_blocks = !app.tool_use_blocks.is_empty();
-    let cacheable = !streaming && !has_tool_blocks;
+    let streaming = app.is_streaming
+        || !app.streaming_text.is_empty()
+        || !app.streaming_thinking.is_empty();
+    let has_running_tool_blocks = app
+        .tool_use_blocks
+        .iter()
+        .any(|block| block.status == ToolStatus::Running);
+    let cacheable = !streaming && !has_running_tool_blocks;
 
     // Fast path: nothing live — use the full-result cache (ptr-stable check).
     let full_key = MessageLinesCacheKey {
         width,
+        transcript_version: app.transcript_version.get(),
         messages_ptr: app.messages.as_ptr() as usize,
         messages_len: app.messages.len(),
         annotations_ptr: app.system_annotations.as_ptr() as usize,
@@ -1002,17 +1147,79 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         }
     }
 
-    // Build or retrieve the completed-messages portion.
-    // This cache is always valid while messages_len and annotations_len are unchanged,
-    // even during active streaming — so we only re-render committed messages when a
-    // new message is actually added, not on every streaming frame.
     let completed_key = CompletedMsgCacheKey {
         width,
+        transcript_version: app.transcript_version.get(),
         messages_len: app.messages.len(),
         annotations_len: app.system_annotations.len(),
         thinking_expanded_len: app.thinking_expanded.len(),
     };
-    let completed_lines: Vec<RenderedLineItem> =
+    let build_items = || {
+        let tool_names = build_tool_names(&app.messages);
+        let turns = build_transcript_turns(app);
+        let mut turn_map = std::collections::HashMap::new();
+        for turn in &turns {
+            turn_map.insert(turn.user_index, turn);
+        }
+
+        let mut items = Vec::new();
+        let total = app.messages.len();
+        let mut index = 0usize;
+        while index <= total {
+            for ann in app.system_annotations.iter().filter(|ann| ann.after_index == index) {
+                let mut lines = Vec::new();
+                render_system_annotation_lines(&mut lines, ann, width as usize);
+                push_rendered_items(&mut items, lines, None, false);
+            }
+
+            if index >= total {
+                break;
+            }
+
+            let message = &app.messages[index];
+            if message.role == Role::User {
+                if let Some(&turn) = turn_map.get(&index) {
+                    append_turn_items(
+                        &mut items,
+                        turn,
+                        width,
+                        &tool_names,
+                        &app.thinking_expanded,
+                        app.frame_count,
+                        app.accent_color,
+                    );
+                    index = turn.end_message_index + 1;
+                    continue;
+                }
+            }
+
+            let lines = render_transcript_assistant_message(
+                message,
+                &RenderContext {
+                    width,
+                    highlight: true,
+                    show_thinking: false,
+                    tool_names: tool_names.clone(),
+                    expanded_thinking: app.thinking_expanded.clone(),
+                },
+            );
+            push_rendered_items(&mut items, lines, Some(index), true);
+            push_blank_item(&mut items);
+            index += 1;
+        }
+
+        if total == 0 && !app.tool_use_blocks.is_empty() {
+            for block in &app.tool_use_blocks {
+                let mut lines = Vec::new();
+                render_tool_block_lines(&mut lines, block, app.frame_count);
+                push_rendered_items(&mut items, lines, None, false);
+                push_blank_item(&mut items);
+            }
+        }
+
+        items
+    };
+    let completed_lines: Vec<RenderedLineItem> = if cacheable {
         if let Some(lines) = COMPLETED_MSG_CACHE.with(|cache| {
             cache
                 .borrow()
@@ -1022,41 +1229,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         }) {
             lines
         } else {
-            let tool_names = build_tool_names(&app.messages);
-            let mut raw: Vec<Line> = Vec::new();
-            let mut message_indices: Vec<Option<usize>> = Vec::new();
-            let mut header_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
-            let total = app.messages.len();
-            for i in 0..=total {
-                for ann in app.system_annotations.iter().filter(|a| a.after_index == i) {
-                    let ann_start = raw.len();
-                    render_system_annotation_lines(&mut raw, ann, width as usize);
-                    message_indices.extend(
-                        std::iter::repeat(None).take(raw.len().saturating_sub(ann_start)),
-                    );
-                }
-                if i < total {
-                    // Mark the first line of each message as a section header
-                    let msg_start = raw.len();
-                    render_message_lines(&mut raw, &app.messages[i], width as usize, &tool_names, &app.thinking_expanded);
-                    if raw.len() > msg_start {
-                        header_indices.insert(msg_start);
-                    }
-                    message_indices.extend(
-                        std::iter::repeat(Some(i)).take(raw.len().saturating_sub(msg_start)),
-                    );
-                }
-            }
-            let items: Vec<RenderedLineItem> = raw
-                .into_iter()
-                .enumerate()
-                .map(|(idx, line)| RenderedLineItem {
-                    search_text: flatten_line_text(&line),
-                    is_header: header_indices.contains(&idx),
-                    message_index: message_indices.get(idx).copied().flatten(),
-                    line,
-                })
-                .collect();
+            let items = build_items();
             COMPLETED_MSG_CACHE.with(|cache| {
                 *cache.borrow_mut() = Some(CompletedMsgCache {
                     key: completed_key,
@@ -1064,7 +1237,10 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
                 });
             });
             items
-        };
+        }
+    } else {
+        build_items()
+    };
 
     // If there is no live content, store in the full cache and return.
     if cacheable {
@@ -1077,40 +1253,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         return completed_lines;
     }
 
-    // Append live tool blocks and streaming text (cheap — small and transient).
-    let mut items = completed_lines;
-    let mut live: Vec<Line> = Vec::new();
-
-    for block in &app.tool_use_blocks {
-        render_tool_block_lines(&mut live, block, app.frame_count);
-    }
-
-    if streaming {
-        let rendered = render_markdown(&app.streaming_text, width);
-        let mut first = true;
-        for line in rendered {
-            let mut spans = line.spans;
-            if first {
-                let mut prefixed = Vec::with_capacity(spans.len() + 1);
-                prefixed.push(Span::styled(
-                    "\u{2022} ",
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                ));
-                prefixed.extend(spans);
-                spans = prefixed;
-                first = false;
-            }
-            live.push(Line::from(spans));
-        }
-    }
-
-    items.extend(live.into_iter().map(|line| RenderedLineItem {
-        search_text: flatten_line_text(&line),
-        is_header: false,
-        message_index: None,
-        line,
-    }));
-    items
+    completed_lines
 }
 
 // â”€â”€ Welcome / startup screen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1150,12 +1293,13 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     let box_area = Rect { x: area.x, y: area.y, width: box_width, height: box_height };
 
     // Outer border with title "Claurst vX.Y"
+    let accent = app.accent_color;
     let outer_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(CLAUDE_ORANGE))
+        .border_style(Style::default().fg(accent))
         .title(Line::from(vec![
-            Span::styled(" Claurst ", Style::default().fg(CLAUDE_ORANGE).add_modifier(Modifier::BOLD)),
+            Span::styled(" Claurst ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
             Span::styled(format!("v{} ", APP_VERSION), Style::default().fg(Color::DarkGray)),
         ]));
     frame.render_widget(outer_block, box_area);
@@ -1181,9 +1325,9 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
         ])
         .split(inner);
 
-    // Draw orange vertical divider
+    // Draw vertical divider in accent color
     let divider_lines: Vec<Line> = (0..inner.height)
-        .map(|_| Line::from(Span::styled("\u{2502}", Style::default().fg(CLAUDE_ORANGE))))
+        .map(|_| Line::from(Span::styled("\u{2502}", Style::default().fg(accent))))
         .collect();
     frame.render_widget(Paragraph::new(divider_lines), h_chunks[1]);
 
@@ -1197,7 +1341,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         "Welcome back!".to_string()
     };
-    let rustle = rustle_lines(&RustlePose::Default);
+    let rustle = rustle_lines(&app.rustle_current_pose);
     let mut left_lines: Vec<Line> = Vec::new();
     left_lines.push(Line::from(Span::styled(
         welcome_msg,
@@ -1244,7 +1388,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     let mut right_lines: Vec<Line> = Vec::new();
     right_lines.push(Line::from(Span::styled(
         "Tips for getting started",
-        Style::default().fg(CLAUDE_ORANGE).add_modifier(Modifier::BOLD),
+        Style::default().fg(accent).add_modifier(Modifier::BOLD),
     )));
     // Word-wrap the tip text into the right column width
     let right_w_usize = right_w.saturating_sub(1) as usize;
@@ -1254,7 +1398,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     right_lines.push(Line::from(""));
     right_lines.push(Line::from(Span::styled(
         "Recent activity",
-        Style::default().fg(CLAUDE_ORANGE).add_modifier(Modifier::BOLD),
+        Style::default().fg(accent).add_modifier(Modifier::BOLD),
     )));
     right_lines.push(Line::from(Span::styled(
         "No recent activity",
@@ -1278,42 +1422,6 @@ fn build_tool_names(messages: &[claurst_core::types::Message]) -> std::collectio
         }
     }
     map
-}
-
-fn render_message_lines(
-    lines: &mut Vec<Line<'static>>,
-    msg: &claurst_core::types::Message,
-    width: usize,
-    tool_names: &std::collections::HashMap<String, String>,
-    expanded_thinking: &std::collections::HashSet<u64>,
-) {
-    let rendered = render_message(
-        msg,
-        &RenderContext {
-            width: width as u16,
-            highlight: true,
-            show_thinking: false,
-            tool_names: tool_names.clone(),
-            expanded_thinking: expanded_thinking.clone(),
-        },
-    );
-
-    // Truncate very long outputs with a "â€¦ N more lines" notice
-    const MAX_LINES_PER_MSG: usize = 200;
-    if rendered.len() > MAX_LINES_PER_MSG {
-        lines.extend(rendered[..MAX_LINES_PER_MSG].iter().cloned());
-        lines.push(Line::from(vec![Span::styled(
-            format!(
-                "  \u{2026} {} more lines (scroll up to read all)",
-                rendered.len() - MAX_LINES_PER_MSG
-            ),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        )]));
-    } else {
-        lines.extend(rendered);
-    }
 }
 
 // â”€â”€ System annotation (compact boundary, info notices) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1375,40 +1483,64 @@ fn render_system_annotation_lines(
 // â”€â”€ Tool use block â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 fn render_tool_block_lines(lines: &mut Vec<Line<'static>>, block: &crate::app::ToolUseBlock, frame_count: u64) {
-    // ● icon: blinks Yellow↔DarkGray when running, solid Green/Red when done/error
-    let (icon_color, name_color) = match block.status {
-        ToolStatus::Running => {
-            let blink_on = (frame_count / 4) % 2 == 0;
-            let c = if blink_on { Color::Yellow } else { Color::DarkGray };
-            (c, Color::White)
-        }
-        ToolStatus::Done => (Color::Green, Color::White),
-        ToolStatus::Error => (Color::Red, Color::Red),
-    };
-
-    // Extract summary from input_json for header
     let input_val: serde_json::Value =
         serde_json::from_str(&block.input_json).unwrap_or(serde_json::Value::Null);
-    let summary = crate::messages::extract_tool_summary(&block.name, &input_val);
+    let normalized = block.name.to_ascii_lowercase();
+    let running = block.status == ToolStatus::Running;
+    let mut summary = crate::messages::extract_tool_summary(&block.name, &input_val);
+    let title = if normalized == "task" || normalized == "agent" {
+        if let Some(description) = input_val.get("description").and_then(|value| value.as_str()) {
+            summary = description.to_string();
+        }
+        crate::messages::subagent_title(&input_val)
+    } else {
+        match (normalized.as_str(), running) {
+            ("bash" | "powershell", true) => "Running command".to_string(),
+            ("bash" | "powershell", false) => "Ran command".to_string(),
+            ("read", true) => "Reading file".to_string(),
+            ("read", false) => "Read file".to_string(),
+            ("write" | "apply_patch", true) => "Writing file".to_string(),
+            ("write" | "apply_patch", false) => "Wrote file".to_string(),
+            ("edit", true) => "Editing file".to_string(),
+            ("edit", false) => "Edited file".to_string(),
+            ("glob" | "list", true) => "Listing files".to_string(),
+            ("glob" | "list", false) => "Listed files".to_string(),
+            ("grep" | "codesearch", true) => "Searching code".to_string(),
+            ("grep" | "codesearch", false) => "Searched code".to_string(),
+            ("webfetch", true) => "Fetching page".to_string(),
+            ("webfetch", false) => "Fetched page".to_string(),
+            ("websearch", true) => "Searching web".to_string(),
+            ("websearch", false) => "Searched web".to_string(),
+            _ => block.name.clone(),
+        }
+    };
 
-    // Header: ● ToolName (summary)
-    let mut header_spans = vec![
-        Span::styled("  \u{25cf} ".to_string(), Style::default().fg(icon_color)),
-        Span::styled(
-            block.name.clone(),
-            Style::default().fg(name_color).add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if !summary.is_empty() {
+    let accent = if block.status == ToolStatus::Error {
+        Color::Rgb(255, 140, 0)
+    } else {
+        CLAUDE_ORANGE
+    };
+    let mut header_spans = vec![Span::styled("   ~ ".to_string(), Style::default().fg(accent))];
+    if running {
+        header_spans.extend(shimmer_spans(&title, frame_count));
+    } else {
         header_spans.push(Span::styled(
-            format!(" ({})", summary),
-            Style::default().fg(Color::DarkGray),
+            title,
+            Style::default()
+                .fg(if block.status == ToolStatus::Error { accent } else { Color::White })
+                .add_modifier(Modifier::BOLD),
         ));
     }
     lines.push(Line::from(header_spans));
 
-    // Bash/PowerShell: show `$ command` body
-    if block.name == "Bash" || block.name == "PowerShell" {
+    if !summary.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw("     "),
+            Span::styled(summary, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    if normalized == "bash" || normalized == "powershell" {
         let command = input_val
             .get("command")
             .and_then(|v| v.as_str())
@@ -1424,13 +1556,10 @@ fn render_tool_block_lines(lines: &mut Vec<Line<'static>>, block: &crate::app::T
                 display
             };
             lines.push(Line::from(vec![
-                Span::styled(
-                    "    $ ".to_string(),
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-                ),
+                Span::styled("     $ ".to_string(), Style::default().fg(Color::Green)),
                 Span::styled(
                     display,
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::White),
                 ),
             ]));
         }
@@ -1439,13 +1568,13 @@ fn render_tool_block_lines(lines: &mut Vec<Line<'static>>, block: &crate::app::T
     // Output preview (done/error state)
     if let Some(ref preview) = block.output_preview {
         let preview_style = match block.status {
-            ToolStatus::Error => Style::default().fg(Color::Red),
+            ToolStatus::Error => Style::default().fg(Color::Rgb(255, 140, 0)),
             _ => Style::default().fg(Color::DarkGray),
         };
         for line_text in preview.lines() {
             if line_text.starts_with('\u{2026}') {
                 lines.push(Line::from(vec![
-                    Span::raw("    "),
+                    Span::raw("     "),
                     Span::styled(
                         line_text.to_string(),
                         Style::default()
@@ -1455,20 +1584,12 @@ fn render_tool_block_lines(lines: &mut Vec<Line<'static>>, block: &crate::app::T
                 ]));
             } else {
                 lines.push(Line::from(vec![
-                    Span::raw("    "),
+                    Span::raw("     "),
                     Span::styled(line_text.to_string(), preview_style),
                 ]));
             }
         }
     }
-
-    // (ctrl+o to expand) hint
-    lines.push(Line::from(vec![Span::styled(
-        "  (ctrl+o to expand)".to_string(),
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-    )]));
 }
 
 // -----------------------------------------------------------------------
@@ -1496,33 +1617,75 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
             _ => "build",
         };
 
-        let pink = Color::Rgb(233, 30, 99);
-        let dim = Color::Rgb(80, 80, 80);
+        let pink = app.accent_color;
+        let dim = Color::Rgb(110, 110, 124);
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(status_area.width.min(36))])
+            .split(status_area);
 
-        let status_line = if app.has_credentials {
-            // Show model (strip provider prefix for compact display).
-            let model_short = if let Some((_, model)) = app.model_name.split_once('/') {
-                model
+        let left_line = if app.has_credentials {
+            let (provider, model_short) = if let Some((provider, model)) = app.model_name.split_once('/') {
+                (provider.to_string(), model.to_string())
             } else {
-                &app.model_name
+                ("local".to_string(), app.model_name.clone())
             };
-            Line::from(vec![
-                Span::styled(format!(" {} ", model_short), Style::default().fg(Color::White)),
-                Span::styled("\u{00b7}", Style::default().fg(dim)),
-                Span::styled(format!(" {} ", agent_mode), Style::default().fg(pink)),
-                Span::styled("\u{00b7}", Style::default().fg(dim)),
-                Span::styled(" Ctrl+A: model  Ctrl+K: commands", Style::default().fg(dim)),
-            ])
+            let mut spans = vec![
+                Span::styled(
+                    format!(" {} ", agent_mode.to_uppercase()),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(pink)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    model_short,
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            spans.push(Span::styled(
+                format!(" · {}", provider),
+                Style::default().fg(dim),
+            ));
+            if let Some(ref badge) = app.agent_type_badge {
+                spans.push(Span::styled(
+                    format!(" · {}", badge),
+                    Style::default().fg(dim),
+                ));
+            }
+            Line::from(spans)
         } else {
-            // No credentials — show hint instead of a stale model name
             Line::from(vec![
-                Span::styled(" /connect", Style::default().fg(pink)),
-                Span::styled(" to set up a provider", Style::default().fg(dim)),
-                Span::styled("  \u{00b7}  ", Style::default().fg(dim)),
-                Span::styled("Ctrl+K: commands", Style::default().fg(dim)),
+                Span::styled(
+                    " /connect ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(pink)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" connect a provider", Style::default().fg(dim)),
             ])
         };
-        frame.render_widget(Paragraph::new(vec![status_line]), status_area);
+
+        let right_hint = if app.has_credentials {
+            let mut hint = vec![Span::styled("Ctrl+A model", Style::default().fg(dim))];
+            hint.push(Span::styled(" · ", Style::default().fg(dim)));
+            hint.push(Span::styled("Ctrl+K commands", Style::default().fg(dim)));
+            if !app.is_streaming && app.prompt_input.text.is_empty() {
+                hint.push(Span::styled(" · ", Style::default().fg(dim)));
+                hint.push(Span::styled("? shortcuts", Style::default().fg(dim)));
+            }
+            Line::from(hint)
+        } else {
+            Line::from(vec![Span::styled("Ctrl+K commands", Style::default().fg(dim))])
+        };
+
+        frame.render_widget(Paragraph::new(vec![left_line]), chunks[0]);
+        frame.render_widget(
+            Paragraph::new(vec![right_hint]).alignment(Alignment::Right),
+            chunks[1],
+        );
     }
 
     render_prompt_input(
@@ -1537,14 +1700,26 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
         } else {
             InputMode::Default
         },
+        app.accent_color,
     );
 }
 
 fn should_render_status_row(app: &App) -> bool {
+    let interesting_stream_status = app
+        .status_message
+        .as_deref()
+        .map(|status| {
+            let trimmed = status.trim();
+            !trimmed.is_empty()
+                && !trimmed.eq_ignore_ascii_case("thinking")
+                && !trimmed.eq_ignore_ascii_case("thinking…")
+        })
+        .unwrap_or(false);
+
     app.voice_recording
-        || app.is_streaming
         || app.last_turn_elapsed.is_some()
         || (!app.is_streaming && app.status_message.is_some())
+        || (app.is_streaming && interesting_stream_status)
 }
 
 fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
@@ -1558,16 +1733,23 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )]
     } else if app.is_streaming {
-        // Spinner glyph (turns red on stall)
+        // Pick a label: use the status message if it has real content,
+        // otherwise show a default "Thinking" shimmer so the user always
+        // sees that the model is working.
+        let raw_label = app.status_message.as_deref()
+            .filter(|s| {
+                let t = s.trim();
+                !t.is_empty()
+                    && !t.eq_ignore_ascii_case("thinking")
+                    && !t.eq_ignore_ascii_case("thinking…")
+            })
+            .or_else(|| app.spinner_verb.as_deref())
+            .unwrap_or("Thinking");
+
         let mut s = vec![Span::styled(
             spinner_char(app.frame_count).to_string(),
             Style::default().fg(spinner_color(app)).add_modifier(Modifier::BOLD),
         )];
-
-        // Label: explicit tool status takes priority over the thinking verb
-        let raw_label = app.status_message.as_deref()
-            .or(app.spinner_verb.as_deref())
-            .unwrap_or("Thinking");
         let label = format!("{}…", raw_label.trim_end_matches('…'));
 
         s.push(Span::raw(" "));
@@ -1779,12 +1961,12 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         if spans.is_empty() {
             if app.is_streaming {
                 spans.push(Span::styled(
-                    "esc to interrupt",
+                    "esc interrupt",
                     Style::default().fg(Color::DarkGray),
                 ));
             } else if app.prompt_input.text.is_empty() {
                 spans.push(Span::styled(
-                    "? for shortcuts",
+                    "? shortcuts",
                     Style::default().fg(Color::DarkGray),
                 ));
             }

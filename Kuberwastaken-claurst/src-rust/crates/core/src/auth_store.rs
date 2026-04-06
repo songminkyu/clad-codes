@@ -128,3 +128,39 @@ impl AuthStore {
         std::env::var(env_var).ok().filter(|k| !k.is_empty())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{AuthStore, StoredCredential};
+
+    #[test]
+    fn github_copilot_oauth_prefers_refresh_token() {
+        let mut store = AuthStore::default();
+        store.credentials.insert(
+            "github-copilot".to_string(),
+            StoredCredential::OAuthToken {
+                access: "access-token".to_string(),
+                refresh: "refresh-token".to_string(),
+                expires: 0,
+            },
+        );
+
+        assert_eq!(
+            store.api_key_for("github-copilot").as_deref(),
+            Some("refresh-token")
+        );
+    }
+
+    #[test]
+    fn api_key_for_regular_provider_uses_stored_key() {
+        let mut store = AuthStore::default();
+        store.credentials.insert(
+            "openrouter".to_string(),
+            StoredCredential::ApiKey {
+                key: "or-key".to_string(),
+            },
+        );
+
+        assert_eq!(store.api_key_for("openrouter").as_deref(), Some("or-key"));
+    }
+}

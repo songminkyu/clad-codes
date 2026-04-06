@@ -357,11 +357,7 @@ async fn main() -> anyhow::Result<()> {
     if raw_args.get(1).map(|s| s.as_str()) == Some("models") {
         let mut registry = claurst_api::ModelRegistry::new();
         // Load cached models.dev data if available so the list is comprehensive.
-        let cache_path = dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("claurst")
-            .join("models.json");
-        registry.load_cache(&cache_path);
+        registry.load_cache(&models_cache_path());
         let mut entries = registry.list_all();
         // Sort by provider then model id for stable output.
         entries.sort_by(|a, b| {
@@ -709,15 +705,7 @@ async fn main() -> anyhow::Result<()> {
     // Build model registry for dynamic model/provider resolution.
     // The registry is pre-populated with a hardcoded snapshot and enriched
     // from the models.dev cache if available.
-    let model_registry = {
-        let mut reg = claurst_api::ModelRegistry::new();
-        let cache_path = dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("claurst")
-            .join("models.json");
-        reg.load_cache(&cache_path);
-        Arc::new(reg)
-    };
+    let model_registry = load_cached_model_registry();
 
     // Build query config
     let mut query_config = claurst_query::QueryConfig::from_config_with_registry(&config, &model_registry);
@@ -844,6 +832,138 @@ fn build_tools_with_mcp(
     }
 
     Arc::new(v)
+}
+
+fn model_cache_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("claurst")
+}
+
+fn models_cache_path() -> PathBuf {
+    model_cache_dir().join("models.json")
+}
+
+fn models_dev_cache_path() -> PathBuf {
+    model_cache_dir().join("models_dev.json")
+}
+
+fn load_cached_model_registry() -> Arc<claurst_api::ModelRegistry> {
+    let mut reg = claurst_api::ModelRegistry::new();
+    reg.load_cache(&models_cache_path());
+    Arc::new(reg)
+}
+
+fn spawn_models_cache_refresh() {
+    let cache_paths = vec![models_cache_path(), models_dev_cache_path()];
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let url = std::env::var("MODELS_DEV_URL")
+            .unwrap_or_else(|_| "https://models.dev/api.json".to_string());
+        if let Ok(resp) = client
+            .get(&url)
+            .header("User-Agent", "Claurst/0.0.8")
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(text) = resp.text().await {
+                    if let Some(parent) = cache_paths[0].parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    for path in &cache_paths {
+                        let _ = std::fs::write(path, &text);
+                    }
+                    tracing::info!("Models cache refreshed from models.dev");
+                }
+            }
+        }
+    });
+}
+
+async fn remove_file_if_exists(path: &std::path::Path) -> anyhow::Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+struct RefreshedProviderRuntime {
+    config: Config,
+    client: Arc<claurst_api::AnthropicClient>,
+    provider_registry: Arc<claurst_api::ProviderRegistry>,
+    model_registry: Arc<claurst_api::ModelRegistry>,
+    auth_store: claurst_core::AuthStore,
+}
+
+async fn refresh_provider_runtime_state(
+    current_config: &Config,
+) -> anyhow::Result<RefreshedProviderRuntime> {
+    remove_file_if_exists(&claurst_core::AuthStore::path())
+        .await
+        .context("Failed to clear auth store")?;
+    remove_file_if_exists(&claurst_core::oauth::OAuthTokens::token_file_path())
+        .await
+        .context("Failed to clear OAuth token cache")?;
+    remove_file_if_exists(&models_cache_path())
+        .await
+        .context("Failed to clear model cache")?;
+    remove_file_if_exists(&models_dev_cache_path())
+        .await
+        .context("Failed to clear legacy model cache")?;
+
+    let mut settings = Settings::load()
+        .await
+        .context("Failed to load settings for /refresh")?;
+    settings.provider = None;
+    settings.config.provider = None;
+    settings.config.model = None;
+    settings.config.api_key = None;
+    settings
+        .save()
+        .await
+        .context("Failed to save refreshed settings")?;
+
+    let mut config = current_config.clone();
+    config.api_key = None;
+    config.provider = None;
+    config.model = None;
+
+    let (api_key, use_bearer_auth) = config
+        .resolve_auth_async()
+        .await
+        .unwrap_or((String::new(), false));
+    let client_config = claurst_api::client::ClientConfig {
+        api_key,
+        api_base: config.resolve_api_base(),
+        use_bearer_auth,
+        ..Default::default()
+    };
+    let client = Arc::new(
+        claurst_api::AnthropicClient::new(client_config.clone())
+            .context("Failed to rebuild Anthropic client")?,
+    );
+    let provider_registry = Arc::new(
+        claurst_api::ProviderRegistry::from_environment_with_auth_store(client_config),
+    );
+    let model_registry = load_cached_model_registry();
+
+    spawn_models_cache_refresh();
+
+    Ok(RefreshedProviderRuntime {
+        config,
+        client,
+        provider_registry,
+        model_registry,
+        auth_store: claurst_core::AuthStore::default(),
+    })
 }
 
 /// Filter the tool list based on the agent's access level.
@@ -1166,6 +1286,8 @@ async fn run_interactive(
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
+    let mut client = client;
+    let mut model_registry = model_registry;
     let mut tool_ctx = tool_ctx;
     let mut session = if let Some(ref id) = resume_id {
         match claurst_core::history::load_session(id).await {
@@ -1201,7 +1323,7 @@ async fn run_interactive(
         session
     };
     let initial_messages = session.messages.clone();
-    let base_query_config = query_config;
+    let mut base_query_config = query_config;
     let mut live_config = config.clone();
     if !session.model.is_empty() {
         live_config.model = Some(session.model.clone());
@@ -1222,42 +1344,14 @@ async fn run_interactive(
         };
     }
     app.provider_registry = base_query_config.provider_registry.clone();
+    app.refresh_context_window_size();
+    app.auto_compact_enabled = live_config.auto_compact;
 
     // Background: refresh the model registry from models.dev.
     // The fetched JSON is saved as a cache file; the App will reload it from
     // disk whenever the /model picker opens.
     {
-        let cache_path = dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("claurst")
-            .join("models.json");
-        tokio::spawn(async move {
-            let client = match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-            {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-            let url = std::env::var("MODELS_DEV_URL")
-                .unwrap_or_else(|_| "https://models.dev/api.json".to_string());
-            if let Ok(resp) = client
-                .get(&url)
-                .header("User-Agent", "Claurst/0.0.7")
-                .send()
-                .await
-            {
-                if resp.status().is_success() {
-                    if let Ok(text) = resp.text().await {
-                        let _ = std::fs::create_dir_all(
-                            cache_path.parent().unwrap_or(std::path::Path::new(".")),
-                        );
-                        let _ = std::fs::write(&cache_path, &text);
-                        tracing::info!("Models cache refreshed from models.dev");
-                    }
-                }
-            }
-        });
+        spawn_models_cache_refresh();
     }
 
     app.config.project_dir = Some(tool_ctx.working_dir.clone());
@@ -1292,10 +1386,18 @@ async fn run_interactive(
     }
 
     // Show onboarding: status hint if no credentials, welcome tour if first run.
+    // Skip the welcome tour entirely if the user already has credentials — they've
+    // clearly set things up (via /connect or env vars) and don't need onboarding.
     if !has_credentials {
-        app.status_message = Some("No provider configured. Run /connect to set one up.".to_string());
+        if !settings.has_completed_onboarding {
+            app.onboarding_dialog.show();
+        } else {
+            app.status_message = Some("No provider configured. Run /connect to set one up.".to_string());
+        }
     } else if !settings.has_completed_onboarding {
-        app.onboarding_dialog.show();
+        // User has credentials but hasn't formally completed onboarding — mark it done
+        // silently so they never see it.
+        let _ = claurst_tui::App::persist_onboarding_complete_pub();
     }
 
     // Mirror TS BypassPermissionsModeDialog.tsx startup gate
@@ -1422,6 +1524,9 @@ async fn run_interactive(
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
+    // Keep the full unfiltered tool set so agent-mode switching can re-filter.
+    let all_tools_arc: Arc<Vec<Box<dyn claurst_tools::Tool>>> =
+        Arc::new(claurst_tools::all_tools());
     let mut tools_arc = tools;
 
     // Current cancel token (replaced each turn)
@@ -1447,6 +1552,7 @@ async fn run_interactive(
 
     'main: loop {
         app.frame_count = app.frame_count.wrapping_add(1);
+        app.tick_rustle_pose();
 
         // Draw the UI
         terminal.draw(|f| render_app(f, &app))?;
@@ -1672,6 +1778,9 @@ async fn run_interactive(
                                         tool_ctx.file_history.clone(),
                                         tool_ctx.current_turn.clone(),
                                     );
+                                    claurst_tui::update_terminal_title(
+                                        session.title.as_deref(),
+                                    );
                                     app.status_message = Some(format!(
                                         "Resumed session {}.",
                                         &session.id[..8]
@@ -1683,10 +1792,62 @@ async fn run_interactive(
                                     cmd_ctx.session_title = session.title.clone();
                                     let _ =
                                         claurst_core::history::save_session(&session).await;
+                                    claurst_tui::update_terminal_title(Some(&title));
                                     app.status_message = Some(format!(
                                         "Session renamed to \"{}\".",
                                         title
                                     ));
+                                }
+                                Some(CommandResult::RefreshProviderState) => {
+                                    if app.is_streaming || current_query.is_some() {
+                                        app.status_message = Some(
+                                            "Wait for the current response to finish before running /refresh."
+                                                .to_string(),
+                                        );
+                                    } else {
+                                        match refresh_provider_runtime_state(&cmd_ctx.config).await {
+                                            Ok(refreshed) => {
+                                                cmd_ctx.config = refreshed.config.clone();
+                                                tool_ctx.config = refreshed.config.clone();
+                                                base_query_config.provider_registry =
+                                                    Some(refreshed.provider_registry.clone());
+                                                base_query_config.model_registry =
+                                                    Some(refreshed.model_registry.clone());
+                                                base_query_config.model =
+                                                    claurst_api::effective_model_for_config(
+                                                        &cmd_ctx.config,
+                                                        refreshed.model_registry.as_ref(),
+                                                    );
+                                                client = refreshed.client;
+                                                model_registry = refreshed.model_registry;
+                                                session.model =
+                                                    claurst_api::effective_model_for_config(
+                                                        &cmd_ctx.config,
+                                                        model_registry.as_ref(),
+                                                    );
+                                                session.updated_at = chrono::Utc::now();
+                                                app.apply_provider_refresh(
+                                                    refreshed.config,
+                                                    Some(refreshed.provider_registry),
+                                                    refreshed.auth_store,
+                                                    false,
+                                                    "Saved provider state cleared. Run /connect to reconnect."
+                                                        .to_string(),
+                                                );
+                                            }
+                                            Err(err) => {
+                                                app.status_message = Some(format!(
+                                                    "Error: {}",
+                                                    err
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                Some(CommandResult::SpeechMode { mode, level }) => {
+                                    app.set_speech_mode(mode.as_deref(), &level);
+                                    cmd_ctx.config = app.config.clone();
+                                    tool_ctx.config = app.config.clone();
                                 }
                                 Some(CommandResult::Message(msg)) => {
                                     // Suppress text output when TUI already opened an
@@ -1867,6 +2028,15 @@ async fn run_interactive(
                         session.messages = messages.clone();
                         session.updated_at = chrono::Utc::now();
 
+                        // Update terminal title from session title or first message
+                        if session.title.is_some() {
+                            claurst_tui::update_terminal_title(session.title.as_deref());
+                        } else {
+                            // Use a truncated version of the first user message
+                            let topic: String = input.chars().take(60).collect();
+                            claurst_tui::update_terminal_title(Some(&topic));
+                        }
+
                         // Start async query
                         app.is_streaming = true;
                         app.streaming_text.clear();
@@ -1926,6 +2096,26 @@ async fn run_interactive(
                     tool_ctx.config = app.config.clone();
                     if !app.model_name.is_empty() {
                         session.model = app.model_name.clone();
+                    }
+                    // Handle agent mode change (Tab key cycles build→plan→explore)
+                    if app.agent_mode_changed {
+                        app.agent_mode_changed = false;
+                        let mode = app.agent_mode.as_deref().unwrap_or("build");
+                        let mut all_agents = claurst_core::default_agents();
+                        all_agents.extend(cmd_ctx.config.agents.clone());
+                        if let Some(def) = all_agents.get(mode) {
+                            base_query_config.agent_name = Some(mode.to_string());
+                            base_query_config.agent_definition = Some(def.clone());
+                            if let Some(turns) = def.max_turns {
+                                base_query_config.max_turns = turns;
+                            }
+                            tools_arc = filter_tools_for_agent(all_tools_arc.clone(), &def.access);
+                        } else {
+                            // "build" with no explicit definition = full access, no agent
+                            base_query_config.agent_name = None;
+                            base_query_config.agent_definition = None;
+                            tools_arc = all_tools_arc.clone();
+                        }
                     }
                     if !app.is_streaming && app.messages.len() < messages.len() {
                         messages = app.messages.clone();
@@ -2020,6 +2210,67 @@ async fn run_interactive(
                 }
             }
             app.handle_query_event(evt);
+        }
+
+        // Auto-compact: when context usage hits 99% and no query is running,
+        // automatically submit a compact request.
+        if app.context_window_size > 0
+            && !app.is_streaming
+            && current_query.is_none()
+            && !app.auto_compact_running
+        {
+            let used_pct = (app.context_used_tokens as f64 / app.context_window_size as f64 * 100.0) as u64;
+            if used_pct >= 99 {
+                app.auto_compact_running = true;
+                let msg_count = messages.len();
+                let compact_msg = format!(
+                    "[Auto-compact triggered ({} messages, {}% context used). \
+                     Provide a detailed summary of our conversation so far, \
+                     preserving all key technical details, decisions made, \
+                     file paths mentioned, and current task status.]",
+                    msg_count, used_pct
+                );
+                app.status_message = Some("Context 99% full — auto-compacting…".to_string());
+                let user_msg = claurst_core::types::Message::user(compact_msg);
+                messages.push(user_msg.clone());
+                app.push_message(user_msg);
+                session.messages = messages.clone();
+                session.updated_at = chrono::Utc::now();
+
+                // Dispatch the compact query immediately.
+                let ct = CancellationToken::new();
+                cancel = Some(ct.clone());
+                let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
+                let msgs_arc_clone = msgs_arc.clone();
+                let tools_arc_clone = tools_arc.clone();
+                let ctx_clone = tool_ctx.clone();
+                let mut qcfg = base_query_config.clone();
+                qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
+                qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                let tracker = cost_tracker.clone();
+                let tx = event_tx.clone();
+                let client_clone = client.clone();
+                app.is_streaming = true;
+
+                let handle = tokio::spawn(async move {
+                    let mut msgs = msgs_arc_clone.lock().await.clone();
+                    let outcome = claurst_query::run_query_loop(
+                        client_clone.as_ref(),
+                        &mut msgs,
+                        tools_arc_clone.as_slice(),
+                        &ctx_clone,
+                        &qcfg,
+                        tracker,
+                        Some(tx),
+                        ct,
+                        None,
+                    )
+                    .await;
+                    *msgs_arc_clone.lock().await = msgs;
+                    outcome
+                });
+                current_query = Some((handle, msgs_arc));
+            }
         }
 
         // Drain TUI-facing bridge events.
@@ -2308,9 +2559,11 @@ async fn run_interactive(
             match provider_id.as_str() {
                 "github-copilot" => {
                     let tx2 = device_auth_tx.clone();
-                    // Use Claurst's GitHub Copilot device flow app so the returned
-                    // token stays bound to Claurst's own OAuth registration.
-                    const COPILOT_CLIENT_ID: &str = "Iv23li4E44oPZR1huPU9";
+                    // Use the OpenCode Copilot OAuth app (Ov23li8tweQw6odWQebz)
+                    // which is registered and authorised for the Copilot API.
+                    // Tokens from an unregistered app get "model not supported"
+                    // on every model.
+                    const COPILOT_CLIENT_ID: &str = "Ov23li8tweQw6odWQebz";
                     tokio::spawn(async move {
                         // Step 1: Request device code
                         match claurst_core::device_code::request_device_code(
@@ -2357,6 +2610,29 @@ async fn run_interactive(
                             "Anthropic OAuth requires a registered application.\n\
                              Use an API key instead: console.anthropic.com/settings/keys".to_string()
                         )).await;
+                    });
+                }
+                "openai-codex" => {
+                    let tx2 = device_auth_tx.clone();
+                    app.device_auth_dialog.set_code(
+                        "".to_string(),
+                        "Opening browser for OpenAI login...".to_string(),
+                        "".to_string(),
+                        0,
+                    );
+                    tokio::spawn(async move {
+                        match crate::codex_oauth_flow::run_oauth_flow().await {
+                            Ok(tokens) => {
+                                let _ = tx2.send(DeviceAuthEvent::TokenReceived(
+                                    tokens.access_token,
+                                )).await;
+                            }
+                            Err(e) => {
+                                let _ = tx2.send(DeviceAuthEvent::Error(
+                                    format!("Codex OAuth failed: {}", e),
+                                )).await;
+                            }
+                        }
                     });
                 }
                 _ => {
@@ -2418,6 +2694,12 @@ async fn run_interactive(
                 session.working_dir = Some(tool_ctx.working_dir.display().to_string());
                 app.is_streaming = false;
                 app.status_message = None;
+                if app.auto_compact_running {
+                    app.auto_compact_running = false;
+                    // After auto-compact the context was summarised — reset usage.
+                    app.context_used_tokens = 0;
+                    app.status_message = Some("Auto-compact complete.".to_string());
+                }
 
                 // Save session to JSONL (primary storage)
                 let _ = claurst_core::history::save_session(&session).await;

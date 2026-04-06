@@ -23,6 +23,57 @@ pub struct ProviderRegistry {
     default_provider_id: ProviderId,
 }
 
+fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvider>> {
+    use crate::providers::openai_compat_providers as p;
+
+    match provider_id {
+        "anthropic" => Some(Arc::new(AnthropicProvider::from_config(
+            ClientConfig { api_key: key, ..Default::default() },
+        ))),
+        "openai" => Some(Arc::new(OpenAiProvider::new(key))),
+        "google" => Some(Arc::new(GoogleProvider::new(key))),
+        "github-copilot" => Some(Arc::new(CopilotProvider::new(key))),
+        "cohere" => Some(Arc::new(CohereProvider::new(key))),
+        "groq" => Some(Arc::new(p::groq().with_api_key(key))),
+        "mistral" => Some(Arc::new(p::mistral().with_api_key(key))),
+        "deepseek" => Some(Arc::new(p::deepseek().with_api_key(key))),
+        "xai" => Some(Arc::new(p::xai().with_api_key(key))),
+        "openrouter" => Some(Arc::new(p::openrouter().with_api_key(key))),
+        "togetherai" | "together-ai" => Some(Arc::new(p::together_ai().with_api_key(key))),
+        "perplexity" => Some(Arc::new(p::perplexity().with_api_key(key))),
+        "cerebras" => Some(Arc::new(p::cerebras().with_api_key(key))),
+        "deepinfra" => Some(Arc::new(p::deepinfra().with_api_key(key))),
+        "venice" => Some(Arc::new(p::venice().with_api_key(key))),
+        "huggingface" => Some(Arc::new(p::huggingface().with_api_key(key))),
+        "nvidia" => Some(Arc::new(p::nvidia().with_api_key(key))),
+        "siliconflow" => Some(Arc::new(p::siliconflow().with_api_key(key))),
+        "sambanova" => Some(Arc::new(p::sambanova().with_api_key(key))),
+        "moonshot" => Some(Arc::new(p::moonshot().with_api_key(key))),
+        "zhipu" => Some(Arc::new(p::zhipu().with_api_key(key))),
+        "qwen" => Some(Arc::new(p::qwen().with_api_key(key))),
+        "nebius" => Some(Arc::new(p::nebius().with_api_key(key))),
+        "novita" => Some(Arc::new(p::novita().with_api_key(key))),
+        "ovhcloud" => Some(Arc::new(p::ovhcloud().with_api_key(key))),
+        "scaleway" => Some(Arc::new(p::scaleway().with_api_key(key))),
+        "vultr" | "vultr-ai" => Some(Arc::new(p::vultr_ai().with_api_key(key))),
+        "baseten" => Some(Arc::new(p::baseten().with_api_key(key))),
+        "friendli" => Some(Arc::new(p::friendli().with_api_key(key))),
+        "upstage" => Some(Arc::new(p::upstage().with_api_key(key))),
+        "stepfun" => Some(Arc::new(p::stepfun().with_api_key(key))),
+        "fireworks" => Some(Arc::new(p::fireworks().with_api_key(key))),
+        _ => None,
+    }
+}
+
+pub fn runtime_provider_for(provider_id: &str) -> Option<Arc<dyn LlmProvider>> {
+    let auth_store = claurst_core::AuthStore::load();
+    let key = auth_store.api_key_for(provider_id)?;
+    if key.is_empty() {
+        return None;
+    }
+    provider_from_key(provider_id, key)
+}
+
 impl ProviderRegistry {
     /// Create an empty registry with Anthropic as the default provider ID.
     pub fn new() -> Self {
@@ -206,41 +257,7 @@ impl ProviderRegistry {
                 if key.is_empty() {
                     continue;
                 }
-                use crate::providers::openai_compat_providers as p;
-                let provider: Option<Arc<dyn LlmProvider>> = match provider_id.as_str() {
-                    "openai" => Some(Arc::new(OpenAiProvider::new(key))),
-                    "google" => Some(Arc::new(GoogleProvider::new(key))),
-                    "github-copilot" => Some(Arc::new(CopilotProvider::new(key))),
-                    "cohere" => Some(Arc::new(CohereProvider::new(key))),
-                    "groq" => Some(Arc::new(p::groq().with_api_key(key))),
-                    "mistral" => Some(Arc::new(p::mistral().with_api_key(key))),
-                    "deepseek" => Some(Arc::new(p::deepseek().with_api_key(key))),
-                    "xai" => Some(Arc::new(p::xai().with_api_key(key))),
-                    "openrouter" => Some(Arc::new(p::openrouter().with_api_key(key))),
-                    "togetherai" | "together-ai" => Some(Arc::new(p::together_ai().with_api_key(key))),
-                    "perplexity" => Some(Arc::new(p::perplexity().with_api_key(key))),
-                    "cerebras" => Some(Arc::new(p::cerebras().with_api_key(key))),
-                    "deepinfra" => Some(Arc::new(p::deepinfra().with_api_key(key))),
-                    "venice" => Some(Arc::new(p::venice().with_api_key(key))),
-                    "huggingface" => Some(Arc::new(p::huggingface().with_api_key(key))),
-                    "nvidia" => Some(Arc::new(p::nvidia().with_api_key(key))),
-                    "siliconflow" => Some(Arc::new(p::siliconflow().with_api_key(key))),
-                    "sambanova" => Some(Arc::new(p::sambanova().with_api_key(key))),
-                    "moonshot" => Some(Arc::new(p::moonshot().with_api_key(key))),
-                    "zhipu" => Some(Arc::new(p::zhipu().with_api_key(key))),
-                    "qwen" => Some(Arc::new(p::qwen().with_api_key(key))),
-                    "nebius" => Some(Arc::new(p::nebius().with_api_key(key))),
-                    "novita" => Some(Arc::new(p::novita().with_api_key(key))),
-                    "ovhcloud" => Some(Arc::new(p::ovhcloud().with_api_key(key))),
-                    "scaleway" => Some(Arc::new(p::scaleway().with_api_key(key))),
-                    "vultr" | "vultr-ai" => Some(Arc::new(p::vultr_ai().with_api_key(key))),
-                    "baseten" => Some(Arc::new(p::baseten().with_api_key(key))),
-                    "friendli" => Some(Arc::new(p::friendli().with_api_key(key))),
-                    "upstage" => Some(Arc::new(p::upstage().with_api_key(key))),
-                    "stepfun" => Some(Arc::new(p::stepfun().with_api_key(key))),
-                    "fireworks" => Some(Arc::new(p::fireworks().with_api_key(key))),
-                    _ => None,
-                };
+                let provider = provider_from_key(provider_id, key);
                 if let Some(p) = provider {
                     registry.register(p);
                 }

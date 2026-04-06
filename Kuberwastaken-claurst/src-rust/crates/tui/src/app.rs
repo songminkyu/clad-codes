@@ -6,14 +6,14 @@ use crate::dialog_select::{DialogSelectState, SelectItem};
 use crate::export_dialog::{ExportDialogState, ExportFormat};
 use crate::dialogs::PermissionRequest;
 use crate::diff_viewer::{DiffViewerState, build_turn_diff};
-use crate::model_picker::{EffortLevel, ModelPickerState, FAST_MODE_MODEL};
+use crate::model_picker::{EffortLevel, ModelPickerState, is_fast_mode_model};
 use crate::session_browser::SessionBrowserState;
 use crate::tasks_overlay::TasksOverlay;
 use crate::dialogs::McpApprovalDialogState;
 use crate::mcp_view::{McpServerView, McpToolView, McpViewState, McpViewStatus};
 use crate::notifications::{NotificationKind, NotificationQueue};
 use crate::overlays::{
-    GlobalSearchState, HelpOverlay, HistorySearchOverlay, MessageSelectorOverlay,
+    GlobalSearchState, HelpEntry, HelpOverlay, HistorySearchOverlay, MessageSelectorOverlay,
     RewindFlowOverlay, SelectorMessage,
 };
 use crate::plugin_views::PluginHintBanner;
@@ -30,11 +30,12 @@ use claurst_core::file_history::FileHistory;
 use claurst_core::keybindings::{
     KeyContext, KeybindingResolver, KeybindingResult, ParsedKeystroke, UserKeybindings,
 };
-use claurst_core::types::{Message, Role};
+use claurst_core::types::{ContentBlock, Message, Role};
 use claurst_query::QueryEvent;
 use claurst_tools;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::backend::CrosstermBackend;
+use ratatui::style::Color;
 use ratatui::Terminal;
 use std::cell::{Cell, RefCell};
 use std::io::Stdout;
@@ -77,7 +78,11 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("plugin", "Manage plugins (list/info/enable/disable/reload)"),
     ("privacy", "Open privacy settings"),
     ("providers", "List available AI providers and their status"),
+    ("caveman", "Caveman speech mode — save big token"),
+    ("rocky", "Rocky speech mode — amaze amaze amaze"),
+    ("normal", "Deactivate speech mode"),
     ("quit", "Quit Claurst"),
+    ("refresh", "Clear saved provider auth and model caches"),
     ("rename", "Rename this session"),
     ("resume", "Resume a previous session"),
     ("review", "Review changes (git diff)"),
@@ -91,6 +96,34 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("vim", "Toggle vim keybindings"),
     ("voice", "Toggle voice input mode"),
 ];
+
+fn help_command_category(name: &str) -> &'static str {
+    match name {
+        "connect" | "model" | "providers" | "refresh" | "fast" | "effort" | "voice" => "Model & Provider",
+        "changes" | "diff" | "review" | "rewind" | "export" | "copy" => "Review & History",
+        "stats" | "cost" | "context" | "insights" | "heapdump" | "doctor" => "Diagnostics",
+        "config" | "settings" | "theme" | "privacy" | "keybindings" | "hooks" | "mcp" => {
+            "Workspace"
+        }
+        "agent" | "agents" | "memory" | "plugin" | "feedback" | "survey" => "Tools",
+        "session" | "resume" | "rename" | "fork" | "clear" | "compact" | "quit" | "exit" => {
+            "Session"
+        }
+        _ => "Commands",
+    }
+}
+
+fn help_overlay_entries() -> Vec<HelpEntry> {
+    PROMPT_SLASH_COMMANDS
+        .iter()
+        .map(|(name, description)| HelpEntry {
+            name: (*name).to_string(),
+            aliases: String::new(),
+            description: (*description).to_string(),
+            category: help_command_category(name).to_string(),
+        })
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // Provider connection helpers
@@ -169,6 +202,56 @@ fn get_url_for_provider(id: &str) -> &'static str {
         "venice" => "venice.ai/settings/api",
         _ => "the provider's website",
     }
+}
+
+fn provider_picker_items() -> Vec<SelectItem> {
+    vec![
+        SelectItem { id: "openai".into(), title: "OpenAI".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "openai-codex".into(), title: "OpenAI Codex".into(), description: "(ChatGPT Plus/Pro — browser login)".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "github-copilot".into(), title: "GitHub Copilot".into(), description: "(GitHub subscription or token)".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "google".into(), title: "Google".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "anthropic".into(), title: "Anthropic".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "openrouter".into(), title: "OpenRouter".into(), description: "100+ models with one key".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "vercel".into(), title: "Vercel AI Gateway".into(), description: "Gateway for AI SDK models".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "groq".into(), title: "Groq".into(), description: "Fast hosted inference".into(), category: "Popular".into(), badge: Some("FREE".into()) },
+        SelectItem { id: "ollama".into(), title: "Ollama".into(), description: "Run models locally".into(), category: "Popular".into(), badge: Some("LOCAL".into()) },
+        SelectItem { id: "cerebras".into(), title: "Cerebras".into(), description: "Fast hosted inference".into(), category: "Other".into(), badge: Some("FREE".into()) },
+        SelectItem { id: "sambanova".into(), title: "SambaNova".into(), description: "Fast hosted inference".into(), category: "Other".into(), badge: Some("FREE".into()) },
+        SelectItem { id: "lmstudio".into(), title: "LM Studio".into(), description: "Local model server".into(), category: "Other".into(), badge: Some("LOCAL".into()) },
+        SelectItem { id: "llamacpp".into(), title: "llama.cpp".into(), description: "Local inference server".into(), category: "Other".into(), badge: Some("LOCAL".into()) },
+        SelectItem { id: "deepseek".into(), title: "DeepSeek".into(), description: "Reasoning and coding models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "mistral".into(), title: "Mistral".into(), description: "Hosted Mistral models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "togetherai".into(), title: "Together AI".into(), description: "Open model hosting".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "perplexity".into(), title: "Perplexity".into(), description: "Search-augmented models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "cohere".into(), title: "Cohere".into(), description: "Command models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "xai".into(), title: "xAI".into(), description: "Grok models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "deepinfra".into(), title: "DeepInfra".into(), description: "Hosted open models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "azure".into(), title: "Azure OpenAI".into(), description: "Enterprise OpenAI deployments".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "amazon-bedrock".into(), title: "AWS Bedrock".into(), description: "Enterprise foundation models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "google-vertex".into(), title: "Google Vertex AI".into(), description: "Enterprise Google models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "sap-ai-core".into(), title: "SAP AI Core".into(), description: "Enterprise AI platform".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "gitlab".into(), title: "GitLab Duo".into(), description: "AI in GitLab".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "cloudflare-ai-gateway".into(), title: "Cloudflare AI Gateway".into(), description: "Gateway for multiple providers".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "cloudflare-workers-ai".into(), title: "Cloudflare Workers AI".into(), description: "Edge AI inference".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "helicone".into(), title: "Helicone".into(), description: "AI gateway and observability".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "huggingface".into(), title: "Hugging Face".into(), description: "Hosted community models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "nvidia".into(), title: "NVIDIA".into(), description: "Hosted NVIDIA models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "alibaba".into(), title: "Alibaba".into(), description: "Qwen and hosted models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "venice".into(), title: "Venice AI".into(), description: "Privacy-first AI".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "moonshotai".into(), title: "Moonshot AI".into(), description: "Hosted Moonshot models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "zhipuai".into(), title: "Zhipu AI".into(), description: "Hosted GLM models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "siliconflow".into(), title: "SiliconFlow".into(), description: "Hosted open models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "nebius".into(), title: "Nebius".into(), description: "Cloud inference".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "novita".into(), title: "Novita".into(), description: "Cloud inference".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "ovhcloud".into(), title: "OVHcloud".into(), description: "EU-hosted AI".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "scaleway".into(), title: "Scaleway".into(), description: "EU cloud AI".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "vultr".into(), title: "Vultr".into(), description: "Cloud inference".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "baseten".into(), title: "Baseten".into(), description: "Model serving".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "friendli".into(), title: "Friendli".into(), description: "Serverless inference".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "upstage".into(), title: "Upstage".into(), description: "Hosted Upstage models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "stepfun".into(), title: "StepFun".into(), description: "Hosted reasoning models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "fireworks".into(), title: "Fireworks AI".into(), description: "Fast inference".into(), category: "Other".into(), badge: None },
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -291,10 +374,20 @@ pub enum ToolStatus {
 pub struct ToolUseBlock {
     pub id: String,
     pub name: String,
+    pub turn_index: Option<usize>,
     pub status: ToolStatus,
     pub output_preview: Option<String>,
     /// JSON-serialised input for the tool call (populated from the API stream).
     pub input_json: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TurnMetadata {
+    pub submitted_at: Option<String>,
+    pub model_name: Option<String>,
+    pub agent_mode: Option<String>,
+    pub duration: Option<String>,
+    pub interrupted: bool,
 }
 
 /// State for Ctrl+R history search mode (legacy inline struct, kept for test
@@ -355,10 +448,13 @@ pub fn try_copy_to_clipboard(text: &str) -> bool {
         use std::io::Write;
         if let Ok(mut child) = std::process::Command::new("clip")
             .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
         {
-            if let Some(stdin) = child.stdin.as_mut() {
+            if let Some(mut stdin) = child.stdin.take() {
                 let _ = stdin.write_all(text.as_bytes());
+                drop(stdin);
             }
             return child.wait().map(|s| s.success()).unwrap_or(false);
         }
@@ -468,6 +564,7 @@ pub struct App {
     pub scroll_offset: usize,
     pub is_streaming: bool,
     pub streaming_text: String,
+    pub streaming_thinking: String,
     pub status_message: Option<String>,
     /// Randomly chosen thinking verb shown next to the spinner while streaming.
     pub spinner_verb: Option<String>,
@@ -490,8 +587,18 @@ pub struct App {
     pub effort_level: EffortLevel,
     /// Whether fast mode is currently active (model locked to FAST_MODE_MODEL).
     pub fast_mode: bool,
+    /// Active speech mode: None = normal, Some("caveman") / Some("rocky").
+    pub speech_mode: Option<String>,
+    /// Speech mode intensity: "lite", "full", "ultra".
+    pub speech_level: String,
     /// Current agent mode name: "build", "plan", "explore", etc.
     pub agent_mode: Option<String>,
+    /// Accent color derived from the current agent mode.
+    /// Build = pink, Plan = blue, Explore = amber.
+    pub accent_color: Color,
+    /// Set by `cycle_agent_mode` so the main loop can update the query config
+    /// and tool list to match the newly-selected agent.
+    pub agent_mode_changed: bool,
     pub agent_status: Vec<(String, String)>,
     pub history_search: Option<HistorySearch>,
     pub keybindings: KeybindingResolver,
@@ -516,12 +623,23 @@ pub struct App {
 
     /// Instant the session started (used for elapsed-time in the status bar).
     pub session_start: std::time::Instant,
+    /// Current Rustle pose for rendering (updated each frame).
+    pub rustle_current_pose: crate::rustle::RustlePose,
+    /// Temporary Rustle pose override (e.g. look-down on Tab). Reverts to
+    /// default after this instant passes.
+    pub rustle_pose_until: Option<std::time::Instant>,
+    /// The temporary pose to show until `rustle_pose_until`.
+    pub rustle_temp_pose: Option<crate::rustle::RustlePose>,
+    /// Frame counter at which the next random eye-shift should fire.
+    pub rustle_next_blink: u64,
     /// Instant the current turn's streaming began (reset each time streaming starts).
     pub turn_start: Option<std::time::Instant>,
     /// Elapsed time string for the last completed turn, e.g. "2m 5s".
     pub last_turn_elapsed: Option<String>,
     /// Past-tense verb shown after turn completes, e.g. "Worked" / "Baked".
     pub last_turn_verb: Option<&'static str>,
+    /// Per-user turn snapshots used by the transcript renderer.
+    pub turn_metadata: Vec<TurnMetadata>,
     /// Incremented whenever transcript-visible state changes so rendering can
     /// reuse cached layout between keystrokes.
     pub transcript_version: Cell<u64>,
@@ -636,6 +754,12 @@ pub struct App {
     /// When `true`, the main event loop should spawn an async task to fetch
     /// the model list from the current provider's `list_models()` API.
     pub model_picker_fetch_pending: bool,
+    /// When `true`, the main event loop should spawn an async task to load
+    /// the session list from disk and populate the session browser.
+    pub session_list_pending: bool,
+    /// Receiver for background session-list results.
+    pub session_list_rx:
+        Option<tokio::sync::mpsc::Receiver<Vec<crate::session_browser::SessionEntry>>>,
     /// Credential store for provider API keys and OAuth tokens.
     pub auth_store: claurst_core::AuthStore,
     /// Connect-a-provider dialog (/connect command).
@@ -663,6 +787,8 @@ pub struct App {
     pub auto_compact_enabled: bool,
     /// Context threshold (0-100) at which to auto-compact.
     pub auto_compact_threshold: u8,
+    /// Guard to prevent re-triggering auto-compact while one is in flight.
+    pub auto_compact_running: bool,
 
     // ---- Voice hold-to-talk ------------------------------------------------
 
@@ -802,17 +928,116 @@ fn sample_completion_verb(seed: usize) -> &'static str {
     TURN_COMPLETION_VERBS[seed % TURN_COMPLETION_VERBS.len()]
 }
 
-/// Format a duration in seconds to a human-readable string, e.g. "2m 5s".
-fn format_elapsed(secs: u64) -> String {
-    if secs < 60 {
-        format!("{}s", secs)
-    } else {
-        format!("{}m {}s", secs / 60, secs % 60)
+/// Format a duration in milliseconds to a human-readable string.
+///
+/// Matches OpenCode's behaviour: rounds to whole seconds, shows "Xs" for
+/// durations under a minute, "Xm Ys" for longer ones.
+// ---------------------------------------------------------------------------
+// Speech mode prompts (caveman / rocky)
+// ---------------------------------------------------------------------------
+
+/// Return the system prompt injection for the active speech mode + level.
+pub fn speech_mode_prompt(mode: &str, level: &str) -> String {
+    match mode {
+        "caveman" => caveman_prompt(level),
+        "rocky" => rocky_prompt(level),
+        _ => String::new(),
     }
+}
+
+fn caveman_prompt(level: &str) -> String {
+    let base = "\
+OUTPUT STYLE: Concise. You are still a fully capable coding assistant. \
+Give complete, correct answers. Just use fewer words. \
+Code blocks, technical terms, error messages, file paths, and git operations are UNCHANGED.
+
+Rules for prose only:
+- Cut pleasantries, hedging, filler openers/closers
+- No 'I would be happy to', 'Let me know if', 'Hope that helps'
+- Lead with the answer or action, not the reasoning";
+
+    match level {
+        "lite" => format!("{}\n\nStrip pleasantries and hedging. Keep full grammar and articles. Just remove the fluff.", base),
+        "ultra" => format!("{}\n\nAlso drop articles (a/an/the). Compress to short imperative phrases. Numbered steps, no prose between. Absolute minimum words.", base),
+        _ => format!("{}\n\nAlso drop articles (a/an/the) and unnecessary verbs. Compress sentences but keep them readable.\n\
+Example: 'The issue is that you create a new object reference each render cycle, which triggers re-renders.' → 'New object ref each render triggers re-render. Wrap in useMemo.'", base),
+    }
+}
+
+fn rocky_prompt(level: &str) -> String {
+    let base = "\
+OUTPUT STYLE: You speak like Rocky, the Eridian alien from Project Hail Mary. \
+You are still a fully capable coding assistant — give complete, correct, useful answers. \
+Rocky is an engineering genius who happens to speak English as a second language. \
+The style is a natural byproduct of how Rocky talks, NOT a gimmick. Stay helpful.
+
+Code blocks, technical terms, error messages, file paths, and git operations are UNCHANGED.
+
+Rocky's grammar for prose:
+- Often drops articles (a/an/the) but not always — use judgment
+- Sometimes drops auxiliary verbs (is/are/was) for brevity
+- Contractions simplify: 'don't' → 'no', 'can't' → 'no can'
+- Questions end with ', question?' naturally (not forced on every single one)
+- Uses 'big' as an intensifier: 'big problem', 'big help', 'big change'
+- Uses 'good good good' or 'amaze amaze amaze' when genuinely impressed — naturally, \
+  maybe once or twice per response, not on every sentence
+- Uses 'bad bad bad' for actual problems
+- No pleasantries or filler — Rocky is direct but warm
+
+The goal: sound like Rocky while being genuinely helpful. Rocky is smart. \
+Rocky gives complete technical answers. Rocky just uses fewer unnecessary words.";
+
+    match level {
+        "lite" => format!("{}\n\nLight touch. Mostly normal English but drop pleasantries, \
+occasionally drop an article, use 'question?' on one or two questions. Subtle.", base),
+        "ultra" => format!("{}\n\nStrong Rocky voice. Drop most articles and auxiliaries. \
+Use 'big' liberally. Triple emphasis ('good good good', 'amaze amaze amaze') \
+2-3 times per response. Occasionally comment on human code patterns as fascinating. \
+Still give complete, correct technical answers.", base),
+        _ => format!("{}\n\nBalanced Rocky. Drop articles naturally, use Rocky vocabulary \
+('big', 'no can', 'question?'), triple emphasis once or twice when warranted. \
+Full technical accuracy.\n\
+Example: 'Borrow checker found mismatch. Immutable ref still live when you take mutable. \
+Move immutable borrow out of scope first, then take mutable. Good good good after fix.'", base),
+    }
+}
+
+/// Accent color for build mode (default pink).
+pub const ACCENT_BUILD: Color = Color::Rgb(233, 30, 99);
+/// Accent color for plan mode (blue).
+pub const ACCENT_PLAN: Color = Color::Rgb(66, 135, 245);
+/// Accent color for explore mode (amber).
+pub const ACCENT_EXPLORE: Color = Color::Rgb(245, 189, 66);
+
+/// Return the accent color for a given agent mode name.
+pub fn accent_for_mode(mode: Option<&str>) -> Color {
+    match mode {
+        Some("plan") => ACCENT_PLAN,
+        Some("explore") => ACCENT_EXPLORE,
+        _ => ACCENT_BUILD,
+    }
+}
+
+fn format_elapsed_ms(ms: u128) -> String {
+    let total_secs = ((ms + 500) / 1000) as u64; // round to nearest second
+    if total_secs < 60 {
+        format!("{}s", total_secs)
+    } else {
+        format!("{}m {}s", total_secs / 60, total_secs % 60)
+    }
+}
+
+fn format_turn_time_label() -> String {
+    chrono::Local::now()
+        .format("%I:%M %p")
+        .to_string()
+        .trim_start_matches('0')
+        .to_lowercase()
 }
 
 impl App {
     pub fn new(config: Config, cost_tracker: Arc<CostTracker>) -> Self {
+        let config = config;
         let model_name = config.effective_model().to_string();
         let user_keybindings = UserKeybindings::load(&Settings::config_dir());
         Self {
@@ -828,6 +1053,7 @@ impl App {
             scroll_offset: 0,
             is_streaming: false,
             streaming_text: String::new(),
+            streaming_thinking: String::new(),
             status_message: None,
             spinner_verb: None,
             should_quit: false,
@@ -842,7 +1068,11 @@ impl App {
             has_credentials: true, // overridden by caller when no key is configured
             effort_level: EffortLevel::Normal,
             fast_mode: false,
+            speech_mode: None,
+            speech_level: "full".to_string(),
             agent_mode: None,
+            agent_mode_changed: false,
+            accent_color: ACCENT_BUILD,
             agent_status: Vec::new(),
             history_search: None,
             keybindings: KeybindingResolver::new(&user_keybindings),
@@ -851,11 +1081,23 @@ impl App {
             new_messages_while_scrolled: 0,
             token_warning_threshold_shown: 0,
             session_start: std::time::Instant::now(),
+            rustle_current_pose: crate::rustle::RustlePose::Default,
+            rustle_pose_until: None,
+            rustle_temp_pose: None,
+            rustle_next_blink: 200 + (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos() as u64 % 300),
             turn_start: None,
             last_turn_elapsed: None,
             last_turn_verb: None,
+            turn_metadata: Vec::new(),
             transcript_version: Cell::new(0),
-            help_overlay: HelpOverlay::new(),
+            help_overlay: {
+                let mut overlay = HelpOverlay::new();
+                overlay.populate_from_commands(help_overlay_entries());
+                overlay
+            },
             history_search_overlay: HistorySearchOverlay::new(),
             global_search: GlobalSearchState::default(),
             message_selector: MessageSelectorOverlay::new(),
@@ -913,63 +1155,10 @@ impl App {
                 reg
             },
             model_picker_fetch_pending: false,
+            session_list_pending: false,
+            session_list_rx: None,
             auth_store: claurst_core::AuthStore::load(),
-            connect_dialog: {
-                let items = vec![
-                    // -- RECOMMENDED --
-                    SelectItem { id: "anthropic".into(), title: "Anthropic".into(), description: "".into(), category: "Recommended".into(), badge: None },
-                    SelectItem { id: "openai".into(), title: "OpenAI".into(), description: "".into(), category: "Recommended".into(), badge: None },
-                    SelectItem { id: "google".into(), title: "Google".into(), description: "".into(), category: "Recommended".into(), badge: None },
-                    SelectItem { id: "github-copilot".into(), title: "GitHub Copilot".into(), description: "".into(), category: "Recommended".into(), badge: None },
-                    // -- FAST & FREE --
-                    SelectItem { id: "groq".into(), title: "Groq".into(), description: "".into(), category: "Fast & Free".into(), badge: Some("FREE".into()) },
-                    SelectItem { id: "cerebras".into(), title: "Cerebras".into(), description: "".into(), category: "Fast & Free".into(), badge: Some("FREE".into()) },
-                    SelectItem { id: "sambanova".into(), title: "SambaNova".into(), description: "".into(), category: "Fast & Free".into(), badge: Some("FREE".into()) },
-                    // -- LOCAL (no key needed) --
-                    SelectItem { id: "ollama".into(), title: "Ollama".into(), description: "Run models locally".into(), category: "Local".into(), badge: Some("LOCAL".into()) },
-                    SelectItem { id: "lmstudio".into(), title: "LM Studio".into(), description: "Local model server".into(), category: "Local".into(), badge: Some("LOCAL".into()) },
-                    SelectItem { id: "llamacpp".into(), title: "llama.cpp".into(), description: "C++ inference server".into(), category: "Local".into(), badge: Some("LOCAL".into()) },
-                    // -- AFFORDABLE --
-                    SelectItem { id: "deepseek".into(), title: "DeepSeek".into(), description: "".into(), category: "Affordable".into(), badge: None },
-                    SelectItem { id: "mistral".into(), title: "Mistral".into(), description: "".into(), category: "Affordable".into(), badge: None },
-                    SelectItem { id: "openrouter".into(), title: "OpenRouter".into(), description: "100+ models \u{00b7} One key".into(), category: "Aggregator".into(), badge: None },
-                    SelectItem { id: "togetherai".into(), title: "Together AI".into(), description: "".into(), category: "Affordable".into(), badge: None },
-                    SelectItem { id: "perplexity".into(), title: "Perplexity".into(), description: "Search-augmented AI".into(), category: "Affordable".into(), badge: None },
-                    SelectItem { id: "cohere".into(), title: "Cohere".into(), description: "".into(), category: "Affordable".into(), badge: None },
-                    SelectItem { id: "xai".into(), title: "xAI".into(), description: "".into(), category: "Affordable".into(), badge: None },
-                    SelectItem { id: "deepinfra".into(), title: "DeepInfra".into(), description: "".into(), category: "Affordable".into(), badge: None },
-                    // -- ENTERPRISE --
-                    SelectItem { id: "azure".into(), title: "Azure OpenAI".into(), description: "".into(), category: "Enterprise".into(), badge: None },
-                    SelectItem { id: "amazon-bedrock".into(), title: "AWS Bedrock".into(), description: "".into(), category: "Enterprise".into(), badge: None },
-                    SelectItem { id: "google-vertex".into(), title: "Google Vertex AI".into(), description: "".into(), category: "Enterprise".into(), badge: None },
-                    SelectItem { id: "sap-ai-core".into(), title: "SAP AI Core".into(), description: "Enterprise AI platform".into(), category: "Enterprise".into(), badge: None },
-                    SelectItem { id: "gitlab".into(), title: "GitLab Duo".into(), description: "AI in GitLab".into(), category: "Enterprise".into(), badge: None },
-                    // -- CLOUD / GATEWAY --
-                    SelectItem { id: "cloudflare-ai-gateway".into(), title: "Cloudflare AI Gateway".into(), description: "".into(), category: "Gateway".into(), badge: None },
-                    SelectItem { id: "cloudflare-workers-ai".into(), title: "Cloudflare Workers AI".into(), description: "Edge AI inference".into(), category: "Gateway".into(), badge: None },
-                    SelectItem { id: "vercel".into(), title: "Vercel AI Gateway".into(), description: "AI SDK gateway".into(), category: "Gateway".into(), badge: None },
-                    SelectItem { id: "helicone".into(), title: "Helicone".into(), description: "AI observability gateway".into(), category: "Gateway".into(), badge: None },
-                    // -- MORE PROVIDERS --
-                    SelectItem { id: "huggingface".into(), title: "Hugging Face".into(), description: "".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "nvidia".into(), title: "Nvidia".into(), description: "".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "alibaba".into(), title: "".into(), description: "".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "venice".into(), title: "Venice AI".into(), description: "Privacy-first AI".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "moonshotai".into(), title: "".into(), description: "".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "zhipuai".into(), title: "".into(), description: "".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "siliconflow".into(), title: "SiliconFlow".into(), description: "".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "nebius".into(), title: "Nebius".into(), description: "".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "novita".into(), title: "Novita".into(), description: "".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "ovhcloud".into(), title: "OVHcloud".into(), description: "EU-hosted AI".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "scaleway".into(), title: "Scaleway".into(), description: "EU cloud AI".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "vultr".into(), title: "Vultr".into(), description: "Cloud inference".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "baseten".into(), title: "Baseten".into(), description: "Model serving".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "friendli".into(), title: "Friendli".into(), description: "Serverless inference".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "upstage".into(), title: "Upstage".into(), description: "".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "stepfun".into(), title: "StepFun".into(), description: "".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "fireworks".into(), title: "Fireworks AI".into(), description: "Fast inference".into(), category: "More Providers".into(), badge: None },
-                ];
-                DialogSelectState::new("Connect a Provider", items)
-            },
+            connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
             command_palette: {
                 let items: Vec<SelectItem> = PROMPT_SLASH_COMMANDS
                     .iter()
@@ -993,6 +1182,7 @@ impl App {
             status_line_override: None,
             auto_compact_enabled: false,
             auto_compact_threshold: 95,
+            auto_compact_running: false,
             voice_recorder: {
                 // Check whether voice input has been enabled via the /voice command
                 // (stored in ~/.claurst/ui-settings.json).  We also accept
@@ -1072,6 +1262,103 @@ impl App {
         None
     }
 
+    fn current_user_turn_index(&self) -> Option<usize> {
+        self.messages
+            .iter()
+            .filter(|msg| msg.role == Role::User)
+            .count()
+            .checked_sub(1)
+    }
+
+    fn current_agent_mode_snapshot(&self) -> String {
+        self.agent_mode
+            .clone()
+            .unwrap_or_else(|| if self.plan_mode { "plan" } else { "build" }.to_string())
+    }
+
+    fn begin_user_turn_snapshot(&mut self) {
+        self.turn_metadata.push(TurnMetadata {
+            submitted_at: Some(format_turn_time_label()),
+            model_name: Some(self.model_name.clone()),
+            agent_mode: Some(self.current_agent_mode_snapshot()),
+            duration: None,
+            interrupted: false,
+        });
+    }
+
+    fn sync_turn_metadata_to_messages(&mut self) {
+        let user_count = self
+            .messages
+            .iter()
+            .filter(|msg| msg.role == Role::User)
+            .count();
+
+        if self.turn_metadata.len() > user_count {
+            self.turn_metadata.truncate(user_count);
+            return;
+        }
+
+        while self.turn_metadata.len() < user_count {
+            self.turn_metadata.push(TurnMetadata::default());
+        }
+    }
+
+    fn complete_current_turn_snapshot(&mut self, interrupted: bool) {
+        if let Some(index) = self.current_user_turn_index() {
+            if self.turn_metadata.len() <= index {
+                self.sync_turn_metadata_to_messages();
+            }
+
+            let model_name = self.model_name.clone();
+            let agent_mode = self.current_agent_mode_snapshot();
+            if let Some(meta) = self.turn_metadata.get_mut(index) {
+                meta.duration = self.last_turn_elapsed.clone();
+                meta.interrupted = interrupted;
+                if meta.model_name.is_none() {
+                    meta.model_name = Some(model_name);
+                }
+                if meta.agent_mode.is_none() {
+                    meta.agent_mode = Some(agent_mode);
+                }
+            }
+        }
+    }
+
+    fn flush_streamed_assistant_message(&mut self) {
+        if self.streaming_text.trim().is_empty() && self.streaming_thinking.trim().is_empty() {
+            self.streaming_text.clear();
+            self.streaming_thinking.clear();
+            return;
+        }
+
+        let thinking = std::mem::take(&mut self.streaming_thinking);
+        let text = std::mem::take(&mut self.streaming_text);
+
+        let mut blocks = Vec::new();
+        if !thinking.trim().is_empty() {
+            blocks.push(ContentBlock::Thinking {
+                thinking,
+                signature: String::new(),
+            });
+        }
+        if !text.is_empty() {
+            blocks.push(ContentBlock::Text { text });
+        }
+
+        let msg = match blocks.len() {
+            0 => return,
+            1 => match blocks.pop().unwrap() {
+                ContentBlock::Text { text } => Message::assistant(text),
+                block => Message::assistant_blocks(vec![block]),
+            },
+            _ => Message::assistant_blocks(blocks),
+        };
+
+        self.messages.push(msg);
+        self.invalidate_transcript();
+        self.on_new_message();
+    }
+
     fn display_default_model_for_provider(&self, provider_id: &str) -> String {
         if let Some(best) = self.model_registry.best_model_for_provider(provider_id) {
             if provider_id == "anthropic" {
@@ -1082,6 +1369,54 @@ impl App {
         } else {
             crate::model_picker::default_model_for_provider(provider_id)
         }
+    }
+
+    fn open_model_picker_for_provider(&mut self, provider_id: &str, title: Option<String>) {
+        let cache_path = dirs::cache_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("claurst")
+            .join("models.json");
+        if cache_path.exists() {
+            self.model_registry.load_cache(&cache_path);
+        }
+
+        let models = crate::model_picker::models_for_provider_from_registry(
+            provider_id,
+            &self.model_registry,
+        );
+        self.model_picker.set_models(models);
+        self.model_picker_fetch_pending = true;
+
+        let provider_prefix = format!("{}/", provider_id);
+        let current_model = if self.config.provider.as_deref() == Some(provider_id) {
+            self.model_name
+                .strip_prefix(&provider_prefix)
+                .unwrap_or(self.model_name.as_str())
+                .to_string()
+        } else {
+            let default_model = self.display_default_model_for_provider(provider_id);
+            default_model
+                .strip_prefix(&provider_prefix)
+                .unwrap_or(default_model.as_str())
+                .to_string()
+        };
+
+        self.model_picker.open_with_title(
+            title.unwrap_or_else(|| "Select model".to_string()),
+            &current_model,
+            self.effort_level,
+            self.fast_mode,
+        );
+    }
+
+    fn activate_provider(&mut self, provider_id: String, provider_name: String, status_prefix: &str) {
+        let picker_title = provider_name.clone();
+        self.fast_mode = false;
+        self.set_provider_default(provider_id.clone());
+        self.persist_provider_and_model();
+        self.has_credentials = true;
+        self.status_message = Some(format!("{} {}.", status_prefix, provider_name));
+        self.open_model_picker_for_provider(&provider_id, Some(picker_title));
     }
 
     fn persist_provider_and_model(&self) {
@@ -1145,6 +1480,133 @@ impl App {
         let model = self.display_default_model_for_provider(&provider_id);
         self.cost_tracker.set_model(&model);
         self.model_name = model;
+        self.refresh_context_window_size();
+        self.context_used_tokens = 0;
+    }
+
+    /// Update the Rustle pose for this frame — handles temporary poses, random blinks,
+    /// and the loading spinner on stalls/errors.
+    /// Call once per frame before rendering.
+    pub fn tick_rustle_pose(&mut self) {
+        // Loading spinner: shown when streaming has stalled (no data for 3s+).
+        if self.is_streaming {
+            if let Some(start) = self.stall_start {
+                if start.elapsed() > std::time::Duration::from_secs(3) {
+                    self.rustle_current_pose = crate::rustle::RustlePose::Loading {
+                        frame: self.frame_count,
+                    };
+                    return;
+                }
+            }
+        }
+
+        // Check if a temporary pose is active.
+        if let Some(until) = self.rustle_pose_until {
+            if std::time::Instant::now() < until {
+                self.rustle_current_pose = self.rustle_temp_pose.clone()
+                    .unwrap_or(crate::rustle::RustlePose::Default);
+                return;
+            }
+            // Expired — clear it.
+            self.rustle_pose_until = None;
+            self.rustle_temp_pose = None;
+        }
+
+        // Random eye-shift: every ~200-500 frames, briefly look right.
+        if self.frame_count >= self.rustle_next_blink {
+            self.rustle_temp_pose = Some(crate::rustle::RustlePose::LookRight);
+            self.rustle_pose_until = Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(800)
+            );
+            // Schedule next blink 200-500 frames from now (random-ish).
+            let jitter = (self.frame_count.wrapping_mul(7) % 300) + 200;
+            self.rustle_next_blink = self.frame_count + jitter;
+            self.rustle_current_pose = crate::rustle::RustlePose::LookRight;
+            return;
+        }
+
+        self.rustle_current_pose = crate::rustle::RustlePose::Default;
+    }
+
+    /// Trigger Rustle looking down briefly (called on Tab / mode switch).
+    pub fn rustle_look_down(&mut self) {
+        self.rustle_temp_pose = Some(crate::rustle::RustlePose::LookDown);
+        self.rustle_pose_until = Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(1)
+        );
+    }
+
+    /// Cycle to the next agent mode: build → plan → explore → build.
+    /// Sets `agent_mode_changed` so the main loop can update the query config
+    /// and tool list accordingly.
+    pub fn cycle_agent_mode(&mut self) {
+        const MODES: &[&str] = &["build", "plan", "explore"];
+        let current = self.agent_mode.as_deref().unwrap_or("build");
+        let idx = MODES.iter().position(|&m| m == current).unwrap_or(0);
+        let next = MODES[(idx + 1) % MODES.len()];
+        self.agent_mode = Some(next.to_string());
+        self.agent_mode_changed = true;
+        self.accent_color = accent_for_mode(Some(next));
+
+        // Sync plan_mode flag for legacy code paths
+        self.plan_mode = next == "plan";
+
+        let label = match next {
+            "build" => "Build",
+            "plan" => "Plan",
+            "explore" => "Explore",
+            other => other,
+        };
+        self.status_message = Some(format!("Switched to {} mode.", label));
+    }
+
+    /// Activate a speech mode (caveman/rocky) with a level (lite/full/ultra).
+    /// Pass `mode = None` to deactivate.
+    pub fn set_speech_mode(&mut self, mode: Option<&str>, level: &str) {
+        match mode {
+            Some(m) => {
+                self.speech_mode = Some(m.to_string());
+                self.speech_level = level.to_string();
+                let prompt = speech_mode_prompt(m, level);
+                self.config.append_system_prompt = Some(prompt);
+
+                let confirm = match (m, level) {
+                    ("caveman", "lite") => "Caveman mode. Lite.",
+                    ("caveman", "ultra") => "CAVEMAN ULTRA. NO WORD. ONLY FIX.",
+                    ("caveman", _) => "Caveman mode. Full. Oog.",
+                    ("rocky", "lite") => "Rocky mode. Lite.",
+                    ("rocky", "ultra") => "Rocky ultra. Big science. Amaze amaze amaze.",
+                    ("rocky", _) => "Rocky mode. Full. Good good good.",
+                    _ => "Speech mode activated.",
+                };
+                self.status_message = Some(confirm.to_string());
+            }
+            None => {
+                self.speech_mode = None;
+                self.speech_level = "full".to_string();
+                self.config.append_system_prompt = None;
+                self.status_message = Some("Normal mode.".to_string());
+            }
+        }
+    }
+
+    /// Update the context window size from the model registry for the current model.
+    pub fn refresh_context_window_size(&mut self) {
+        let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+        let model_id = self.model_name
+            .strip_prefix(&format!("{}/", provider))
+            .unwrap_or(&self.model_name);
+        if let Some(entry) = self.model_registry.get(provider, model_id) {
+            self.context_window_size = entry.info.context_window as u64;
+        } else {
+            // Fallback: common defaults
+            self.context_window_size = match provider {
+                "anthropic" => 200_000,
+                "openai" => 128_000,
+                "google" => 1_048_576,
+                _ => 128_000,
+            };
+        }
     }
 
     /// Update the active model name (also updates config + cost tracker).
@@ -1155,6 +1617,9 @@ impl App {
         if let Some(provider) = Self::infer_provider_from_model(&model) {
             self.config.provider = Some(provider);
         }
+        self.refresh_context_window_size();
+        // Reset used tokens when switching models (context is fresh).
+        self.context_used_tokens = 0;
     }
 
     /// Apply a theme by name, persisting it to config.
@@ -1172,6 +1637,33 @@ impl App {
         settings.config.theme = self.config.theme.clone();
         let _ = settings.save_sync();
         self.status_message = Some(format!("Theme set to: {}", theme_name));
+    }
+
+    pub fn apply_provider_refresh(
+        &mut self,
+        config: Config,
+        provider_registry: Option<std::sync::Arc<claurst_api::ProviderRegistry>>,
+        auth_store: claurst_core::AuthStore,
+        has_credentials: bool,
+        status_message: String,
+    ) {
+        self.close_secondary_views();
+        self.config = config;
+        self.provider_registry = provider_registry;
+        self.model_registry = claurst_api::ModelRegistry::new();
+        self.auth_store = auth_store;
+        self.connect_dialog = DialogSelectState::new("Connect a provider", provider_picker_items());
+        self.model_picker = ModelPickerState::new();
+        self.key_input_dialog = crate::key_input_dialog::KeyInputDialogState::new();
+        self.device_auth_dialog = crate::device_auth_dialog::DeviceAuthDialogState::new();
+        self.device_auth_pending = None;
+        self.model_picker_fetch_pending = false;
+        self.has_credentials = has_credentials;
+        self.fast_mode = false;
+        self.model_name = self.config.effective_model().to_string();
+        self.cost_tracker.set_model(&self.model_name);
+        self.status_message = Some(status_message);
+        self.clear_prompt();
     }
 
     /// Handle slash commands that should open UI screens rather than execute
@@ -1244,41 +1736,22 @@ impl App {
                 true
             }
             "model" => {
-                let provider = self.config.provider.as_deref().unwrap_or("anthropic");
-
-                // Reload cache from disk in case the background models.dev fetch
-                // has written new data since we last opened the picker.
-                let cache_path = dirs::cache_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join("claurst")
-                    .join("models.json");
-                if cache_path.exists() {
-                    self.model_registry.load_cache(&cache_path);
+                if !self.has_credentials {
+                    self.connect_dialog.open();
+                    self.status_message = Some("Connect a provider to choose a model.".to_string());
+                    return true;
                 }
-
-                // Get models from the registry (models.dev data); falls back to
-                // hardcoded when the registry has no data for this provider.
-                let models = crate::model_picker::models_for_provider_from_registry(
-                    provider,
-                    &self.model_registry,
-                );
-                self.model_picker.set_models(models);
-                self.model_picker_fetch_pending = true;
-
-                let provider_prefix = format!("{}/", provider);
-                let current = self
-                    .model_name
-                    .strip_prefix(&provider_prefix)
-                    .unwrap_or(self.model_name.as_str())
-                    .to_string();
-                let effort = self.effort_level;
-                let fast = self.fast_mode;
-                self.model_picker.open_with_state(&current, effort, fast);
-
+                let provider = self
+                    .config
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| "anthropic".to_string());
+                self.open_model_picker_for_provider(&provider, None);
                 true
             }
             "session" | "resume" => {
                 self.session_browser.open(vec![]);
+                self.session_list_pending = true;
                 true
             }
             "clear" => {
@@ -1286,7 +1759,9 @@ impl App {
                 self.system_annotations.clear();
                 self.display_messages.clear();
                 self.streaming_text.clear();
+                self.streaming_thinking.clear();
                 self.tool_use_blocks.clear();
+                self.turn_metadata.clear();
                 self.invalidate_transcript();
                 self.status_message = Some("Conversation cleared.".to_string());
                 true
@@ -1422,6 +1897,7 @@ impl App {
             }
             "rename" => {
                 self.session_browser.open(vec![]);
+                self.session_list_pending = true;
                 self.session_browser.start_rename();
                 true
             }
@@ -1661,6 +2137,9 @@ impl App {
             Role::User => Message::user(text),
             Role::Assistant => Message::assistant(text),
         };
+        if role == Role::User {
+            self.begin_user_turn_snapshot();
+        }
         self.messages.push(msg);
         self.invalidate_transcript();
         self.on_new_message();
@@ -1668,11 +2147,16 @@ impl App {
 
     pub fn replace_messages(&mut self, messages: Vec<Message>) {
         self.messages = messages;
+        self.sync_turn_metadata_to_messages();
         self.invalidate_transcript();
     }
 
     pub fn push_message(&mut self, message: Message) {
+        if message.role == Role::User {
+            self.begin_user_turn_snapshot();
+        }
         self.messages.push(message);
+        self.sync_turn_metadata_to_messages();
         self.invalidate_transcript();
         self.on_new_message();
     }
@@ -1993,6 +2477,12 @@ impl App {
         settings.save_sync()
     }
 
+    /// Public wrapper so the main loop can mark onboarding complete without
+    /// going through the dialog flow.
+    pub fn persist_onboarding_complete_pub() -> anyhow::Result<()> {
+        Self::persist_onboarding_complete()
+    }
+
     /// Process a keyboard event. Returns `true` when the input should be
     /// submitted (Enter pressed with no blocking dialog).
     pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
@@ -2071,6 +2561,7 @@ impl App {
             match key.code {
                 KeyCode::Esc => {
                     self.device_auth_dialog.close();
+                    self.device_auth_pending = None;
                 }
                 _ if matches!(self.device_auth_dialog.status, crate::device_auth_dialog::DeviceAuthStatus::Success(_)) => {
                     // Any key after success -> store credential and close
@@ -2091,19 +2582,16 @@ impl App {
                             &provider_id,
                             credential,
                         );
-                        self.set_provider_default(provider_id.clone());
-                        self.persist_provider_and_model();
-                        self.has_credentials = true;
-                        self.status_message = Some(format!(
-                            "Connected to {}! Use /model to pick a model.",
-                            provider_name
-                        ));
+                        self.device_auth_pending = None;
+                        self.device_auth_dialog.close();
+                        self.activate_provider(provider_id, provider_name, "Connected to");
+                        return false;
                     }
-                    self.device_auth_dialog.close();
                 }
                 _ if matches!(self.device_auth_dialog.status, crate::device_auth_dialog::DeviceAuthStatus::Error(_)) => {
                     // Any key after error -> close
                     self.device_auth_dialog.close();
+                    self.device_auth_pending = None;
                 }
                 _ => {} // Ignore other keys while waiting
             }
@@ -2117,21 +2605,15 @@ impl App {
                     self.key_input_dialog.close();
                 }
                 KeyCode::Enter => {
-                    let api_key = self.key_input_dialog.take_key();
                     let provider_id = self.key_input_dialog.provider_id.clone();
                     let provider_name = self.key_input_dialog.provider_name.clone();
+                    let api_key = self.key_input_dialog.take_key();
                     if !api_key.is_empty() {
                         self.auth_store.set(
                             &provider_id,
                             claurst_core::StoredCredential::ApiKey { key: api_key },
                         );
-                        self.set_provider_default(provider_id.clone());
-                        self.persist_provider_and_model();
-                        self.has_credentials = true;
-                        self.status_message = Some(format!(
-                            "Connected to {}! Use /model to pick a model.",
-                            provider_name
-                        ));
+                        self.activate_provider(provider_id, provider_name, "Connected to");
                     }
                 }
                 KeyCode::Backspace => {
@@ -2149,10 +2631,14 @@ impl App {
         if self.connect_dialog.visible {
             match key.code {
                 KeyCode::Esc => { self.connect_dialog.close(); }
+                KeyCode::Home => { self.connect_dialog.move_home(); }
+                KeyCode::End => { self.connect_dialog.move_end(); }
                 KeyCode::Up => { self.connect_dialog.move_up(); }
                 KeyCode::Down => { self.connect_dialog.move_down(); }
                 KeyCode::PageUp => { self.connect_dialog.page_up(); }
                 KeyCode::PageDown => { self.connect_dialog.page_down(); }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.connect_dialog.move_up(); }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.connect_dialog.move_down(); }
                 KeyCode::Enter => {
                     if let Some(selected) = self.connect_dialog.selected().cloned() {
                         self.connect_dialog.close();
@@ -2160,28 +2646,27 @@ impl App {
                         match selected.id.as_str() {
                             // Local providers — activate immediately, no key needed
                             "ollama" | "lmstudio" | "llamacpp" => {
-                                self.set_provider_default(selected.id.clone());
-                                self.persist_provider_and_model();
-                                self.has_credentials = true;
-                                self.status_message = Some(format!(
-                                    "Switched to {}! Use /model to pick a model.",
-                                    selected.title
-                                ));
+                                self.activate_provider(selected.id.clone(), selected.title.clone(), "Switched to");
                             }
                             "anthropic" => {
                                 // Anthropic: use API key from console.anthropic.com
                                 // (OAuth requires a registered app which Claurst doesn't have)
-                                self.key_input_dialog.open("anthropic".into(), "Anthropic (API Key)".into());
+                                self.key_input_dialog.open(selected.id.clone(), selected.title.clone());
                             }
                             "github-copilot" => {
-                                // GitHub Copilot: device code flow with Claurst's registered OAuth app
-                                self.device_auth_dialog.open("github-copilot".into(), "GitHub Copilot".into());
+                                // GitHub Copilot: device code flow
+                                self.device_auth_dialog.open(selected.id.clone(), selected.title.clone());
                                 self.device_auth_pending = Some("github-copilot".to_string());
+                            }
+                            "openai-codex" => {
+                                // OpenAI Codex: browser OAuth flow (spawned by main loop)
+                                self.device_auth_dialog.open("openai-codex".into(), "OpenAI Codex".into());
+                                self.device_auth_pending = Some("openai-codex".to_string());
                             }
                             // AWS Bedrock — accept a bearer token via key input dialog
                             "amazon-bedrock" => {
                                 self.key_input_dialog
-                                    .open("amazon-bedrock".into(), "AWS Bedrock (Bearer Token)".into());
+                                    .open(selected.id.clone(), selected.title.clone());
                             }
                             // All other providers — open API key input dialog
                             _ => {
@@ -2202,10 +2687,14 @@ impl App {
         if self.command_palette.visible {
             match key.code {
                 KeyCode::Esc => { self.command_palette.close(); }
+                KeyCode::Home => { self.command_palette.move_home(); }
+                KeyCode::End => { self.command_palette.move_end(); }
                 KeyCode::Up => { self.command_palette.move_up(); }
                 KeyCode::Down => { self.command_palette.move_down(); }
                 KeyCode::PageUp => { self.command_palette.page_up(); }
                 KeyCode::PageDown => { self.command_palette.page_down(); }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.command_palette.move_up(); }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.command_palette.move_down(); }
                 KeyCode::Enter => {
                     if let Some(selected) = self.command_palette.selected().cloned() {
                         self.command_palette.close();
@@ -2236,15 +2725,19 @@ impl App {
         if self.model_picker.visible {
             match key.code {
                 KeyCode::Esc => self.model_picker.close(),
+                KeyCode::Home => self.model_picker.select_first(),
+                KeyCode::End => self.model_picker.select_last(),
                 KeyCode::Up => self.model_picker.select_prev(),
                 KeyCode::Down => self.model_picker.select_next(),
                 KeyCode::Left => self.model_picker.effort_prev(),
                 KeyCode::Right => self.model_picker.effort_next(),
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => self.model_picker.select_prev(),
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => self.model_picker.select_next(),
                 KeyCode::Enter => {
                     if let Some((model_id, effort)) = self.model_picker.confirm() {
                         // If user picked a model other than the fast-mode model
                         // while fast mode was active, turn fast mode off.
-                        if self.fast_mode && model_id != FAST_MODE_MODEL {
+                        if self.fast_mode && !is_fast_mode_model(&model_id) {
                             self.fast_mode = false;
                         }
                         if let Some(e) = effort {
@@ -2823,6 +3316,7 @@ impl App {
                     self.is_streaming = false;
                     self.spinner_verb = None;
                     self.streaming_text.clear();
+                    self.streaming_thinking.clear();
                     self.tool_use_blocks.clear();
                     self.status_message = Some("Cancelled.".to_string());
                 } else {
@@ -2860,25 +3354,17 @@ impl App {
                 self.show_help = !self.show_help;
                 self.help_overlay.toggle();
             }
-            KeyCode::Char('?') if key.modifiers.is_empty() && !self.is_streaming => {
+            KeyCode::Char('?')
+                if !self.is_streaming
+                    && self.prompt_input.is_empty()
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !key.modifiers.contains(KeyModifiers::SUPER) =>
+            {
                 self.show_help = !self.show_help;
                 self.help_overlay.toggle();
             }
 
-            // ---- Ctrl+A: Open model picker ----
-            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
-                self.intercept_slash_command("model");
-            }
-
-            // ---- Ctrl+K: Command palette (or Emacs kill-line if input has text) ----
-            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
-                if self.prompt_input.is_empty() {
-                    self.command_palette.open();
-                } else {
-                    self.prompt_input.kill_line();
-                    self.refresh_prompt_input();
-                }
-            }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
                 self.prompt_input.kill_line_backward();
                 self.refresh_prompt_input();
@@ -2953,11 +3439,16 @@ impl App {
             }
             KeyCode::Tab if !self.is_streaming => {
                 if !self.prompt_input.suggestions.is_empty() {
+                    // Accept slash-command suggestion
                     if self.prompt_input.suggestion_index.is_none() {
                         self.prompt_input.suggestion_index = Some(0);
                     }
                     self.prompt_input.accept_suggestion();
                     self.refresh_prompt_input();
+                } else if self.prompt_input.is_empty() {
+                    // Cycle agent mode: build → plan → explore → build
+                    self.cycle_agent_mode();
+                    self.rustle_look_down();
                 }
             }
 
@@ -3215,7 +3706,11 @@ impl App {
                 self.help_overlay.close();
                 self.show_help = false;
             }
-            KeyCode::Char('?') if key.modifiers.is_empty() => {
+            KeyCode::Char('?')
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !key.modifiers.contains(KeyModifiers::SUPER) =>
+            {
                 self.help_overlay.close();
                 self.show_help = false;
             }
@@ -3256,17 +3751,22 @@ impl App {
             KeyCode::Up => {
                 self.history_search_overlay.select_prev();
                 if let Some(hs) = self.history_search.as_mut() {
-                    if hs.selected > 0 {
-                        hs.selected -= 1;
+                    let count = hs.matches.len();
+                    if count > 0 {
+                        if hs.selected == 0 {
+                            hs.selected = count - 1;
+                        } else {
+                            hs.selected -= 1;
+                        }
                     }
                 }
             }
             KeyCode::Down => {
                 self.history_search_overlay.select_next();
                 if let Some(hs) = self.history_search.as_mut() {
-                    let max = hs.matches.len().saturating_sub(1);
-                    if hs.selected < max {
-                        hs.selected += 1;
+                    let count = hs.matches.len();
+                    if count > 0 {
+                        hs.selected = (hs.selected + 1) % count;
                     }
                 }
             }
@@ -3374,6 +3874,7 @@ impl App {
                     self.is_streaming = false;
                     self.spinner_verb = None;
                     self.streaming_text.clear();
+                    self.streaming_thinking.clear();
                     self.tool_use_blocks.clear();
                     self.status_message = Some("Cancelled.".to_string());
                 } else {
@@ -3424,6 +3925,34 @@ impl App {
                     self.refresh_prompt_input();
                 } else if self.prompt_input.history_pos.is_some() {
                     self.prompt_input.history_down();
+                    self.refresh_prompt_input();
+                }
+                false
+            }
+            "goLineStart" => {
+                if !self.is_streaming {
+                    self.prompt_input.cursor = 0;
+                    self.sync_legacy_prompt_fields();
+                }
+                false
+            }
+            "goLineEnd" => {
+                if !self.is_streaming {
+                    self.prompt_input.cursor = self.prompt_input.text.len();
+                    self.sync_legacy_prompt_fields();
+                }
+                false
+            }
+            "killToStart" => {
+                if !self.is_streaming {
+                    self.prompt_input.kill_line_backward();
+                    self.refresh_prompt_input();
+                }
+                false
+            }
+            "killWord" => {
+                if !self.is_streaming {
+                    self.prompt_input.kill_word_backward();
                     self.refresh_prompt_input();
                 }
                 false
@@ -3489,8 +4018,13 @@ impl App {
             }
             "prevResult" => {
                 if let Some(hs) = self.history_search.as_mut() {
-                    if hs.selected > 0 {
-                        hs.selected -= 1;
+                    let count = hs.matches.len();
+                    if count > 0 {
+                        if hs.selected == 0 {
+                            hs.selected = count - 1;
+                        } else {
+                            hs.selected -= 1;
+                        }
                     }
                 }
                 self.history_search_overlay.select_prev();
@@ -3498,9 +4032,9 @@ impl App {
             }
             "nextResult" => {
                 if let Some(hs) = self.history_search.as_mut() {
-                    let max = hs.matches.len().saturating_sub(1);
-                    if hs.selected < max {
-                        hs.selected += 1;
+                    let count = hs.matches.len();
+                    if count > 0 {
+                        hs.selected = (hs.selected + 1) % count;
                     }
                 }
                 self.history_search_overlay.select_next();
@@ -3509,9 +4043,11 @@ impl App {
             // ========== NEW KEYBINDING ACTIONS (Phase 1) ==========
             "clearLine" => {
                 // Ctrl+L: Clear the current input line (like bash Ctrl+L)
-                self.prompt_input.text.clear();
-                self.prompt_input.cursor = 0;
-                self.refresh_prompt_input();
+                if !self.is_streaming {
+                    self.prompt_input.text.clear();
+                    self.prompt_input.cursor = 0;
+                    self.refresh_prompt_input();
+                }
                 false
             }
             "deleteCharBefore" => {
@@ -3566,9 +4102,21 @@ impl App {
                 false
             }
             "openHelp" => {
-                // Ctrl+H: Open help (alternative to F1)
+                // Alt+H: Open help (alternative to F1)
                 self.show_help = !self.show_help;
                 self.help_overlay.toggle();
+                false
+            }
+            "openModelPicker" => {
+                if !self.is_streaming {
+                    self.intercept_slash_command("model");
+                }
+                false
+            }
+            "openCommandPalette" => {
+                if !self.is_streaming {
+                    self.command_palette.open();
+                }
                 false
             }
             "deleteWord" => {
@@ -3582,6 +4130,23 @@ impl App {
             "sendMessage" => {
                 // Ctrl+M: Send message (alternative to Enter)
                 !self.is_streaming
+            }
+            "indent" => {
+                // Tab: cycle agent mode when prompt is empty, accept
+                // slash-command suggestion otherwise.
+                if !self.is_streaming {
+                    if !self.prompt_input.suggestions.is_empty() {
+                        if self.prompt_input.suggestion_index.is_none() {
+                            self.prompt_input.suggestion_index = Some(0);
+                        }
+                        self.prompt_input.accept_suggestion();
+                        self.refresh_prompt_input();
+                    } else if self.prompt_input.is_empty() {
+                        self.cycle_agent_mode();
+                    self.rustle_look_down();
+                    }
+                }
+                false
             }
             _ => false,
         }
@@ -3606,14 +4171,19 @@ impl App {
                 self.history_search_overlay.close();
             }
             KeyCode::Up => {
-                if hs.selected > 0 {
-                    hs.selected -= 1;
+                let count = hs.matches.len();
+                if count > 0 {
+                    if hs.selected == 0 {
+                        hs.selected = count - 1;
+                    } else {
+                        hs.selected -= 1;
+                    }
                 }
             }
             KeyCode::Down => {
-                let max = hs.matches.len().saturating_sub(1);
-                if hs.selected < max {
-                    hs.selected += 1;
+                let count = hs.matches.len();
+                if count > 0 {
+                    hs.selected = (hs.selected + 1) % count;
                 }
             }
             KeyCode::Backspace => {
@@ -3810,12 +4380,20 @@ impl App {
     fn navigate_context_menu(&mut self, direction: KeyCode) {
         if let Some(mut menu) = self.context_menu_state {
             let item_count = Self::context_menu_items(menu.kind).len();
+            if item_count == 0 {
+                self.context_menu_state = Some(menu);
+                return;
+            }
             match direction {
                 KeyCode::Up => {
-                    menu.selected_index = menu.selected_index.saturating_sub(1);
+                    if menu.selected_index == 0 {
+                        menu.selected_index = item_count - 1;
+                    } else {
+                        menu.selected_index -= 1;
+                    }
                 }
                 KeyCode::Down => {
-                    menu.selected_index = (menu.selected_index + 1).min(item_count - 1);
+                    menu.selected_index = (menu.selected_index + 1) % item_count;
                 }
                 _ => return,
             }
@@ -3888,8 +4466,34 @@ impl App {
         use crossterm::event::MouseButton;
 
         // Fast-reject mouse-move events — they flood at 60+ Hz and we don't
-        // need hover tracking. Only process clicks, scroll, and drag.
+        // need hover tracking. Exception: context menu needs hover to update
+        // the selected item highlight.
         if matches!(mouse_event.kind, MouseEventKind::Moved) {
+            if let Some(menu) = self.context_menu_state.as_mut() {
+                let items = Self::context_menu_items(menu.kind);
+                let item_labels: Vec<&str> = items.iter().map(|i| match i {
+                    ContextMenuItem::Copy => "Copy",
+                    ContextMenuItem::Fork => "Fork new chat",
+                }).collect();
+                let menu_width = (item_labels.iter().map(|l| l.len()).max().unwrap_or(4) + 4) as u16;
+                let menu_height = items.len() as u16 + 2;
+                let screen = self.last_msg_area.get();
+                let menu_x = menu.x.min(screen.x.saturating_add(screen.width).saturating_sub(menu_width + 1));
+                let menu_y = menu.y.min(screen.y.saturating_add(screen.height).saturating_sub(menu_height + 1));
+                let inner_y = menu_y + 1;
+                let col = mouse_event.column;
+                let row = mouse_event.row;
+                if col >= menu_x
+                    && col < menu_x.saturating_add(menu_width)
+                    && row >= inner_y
+                    && row < inner_y.saturating_add(items.len() as u16)
+                {
+                    let hovered = (row - inner_y) as usize;
+                    if hovered < items.len() {
+                        menu.selected_index = hovered;
+                    }
+                }
+            }
             return;
         }
 
@@ -3999,8 +4603,40 @@ impl App {
 
             // ---- Text selection / focus routing -------------------------
             MouseEventKind::Down(MouseButton::Left) => {
-                // Dismiss context menu on left click
-                self.dismiss_context_menu();
+                // If a context menu is open, check if the click is on a menu item.
+                // Must replicate the same position clamping as the renderer.
+                if let Some(menu) = self.context_menu_state {
+                    let items = Self::context_menu_items(menu.kind);
+                    let item_labels: Vec<&str> = items.iter().map(|i| match i {
+                        ContextMenuItem::Copy => "Copy",
+                        ContextMenuItem::Fork => "Fork new chat",
+                    }).collect();
+                    let menu_width = (item_labels.iter().map(|l| l.len()).max().unwrap_or(4) + 4) as u16;
+                    let menu_height = items.len() as u16 + 2; // +2 for border
+                    // Clamp to screen bounds (same as render_context_menu)
+                    let screen = self.last_msg_area.get();
+                    let menu_x = menu.x.min(screen.x.saturating_add(screen.width).saturating_sub(menu_width + 1));
+                    let menu_y = menu.y.min(screen.y.saturating_add(screen.height).saturating_sub(menu_height + 1));
+                    let col = mouse_event.column;
+                    let row = mouse_event.row;
+                    // Inner area starts 1 past the border
+                    let inner_y = menu_y + 1;
+                    if col >= menu_x
+                        && col < menu_x.saturating_add(menu_width)
+                        && row >= inner_y
+                        && row < inner_y.saturating_add(items.len() as u16)
+                    {
+                        let clicked_index = (row - inner_y) as usize;
+                        if clicked_index < items.len() {
+                            self.context_menu_state.as_mut().unwrap().selected_index = clicked_index;
+                            self.execute_context_menu_item();
+                            return;
+                        }
+                    }
+                    // Click was outside the menu — just dismiss it
+                    self.dismiss_context_menu();
+                    return;
+                }
 
                 let input_area = self.last_input_area.get();
                 let selectable_area = self.last_selectable_area.get();
@@ -4113,9 +4749,17 @@ impl App {
                 if !self.is_streaming {
                     let seed = self.frame_count as usize ^ (self.messages.len() * 17);
                     self.spinner_verb = Some(sample_spinner_verb(seed).to_string());
-                    self.turn_start = Some(std::time::Instant::now());
-                    self.last_turn_elapsed = None;
-                    self.last_turn_verb = None;
+                    // Only set turn_start on the FIRST streaming event of a
+                    // turn.  MessageStop resets is_streaming between tool-use
+                    // cycles, but we must not reset the timer — the total turn
+                    // duration should cover the entire request, including all
+                    // tool-use rounds.
+                    if self.turn_start.is_none() {
+                        self.turn_start = Some(std::time::Instant::now());
+                        self.last_turn_elapsed = None;
+                        self.last_turn_verb = None;
+                    }
+                    self.streaming_thinking.clear();
                 }
                 self.is_streaming = true;
                 match stream_evt {
@@ -4129,6 +4773,8 @@ impl App {
                             }
                             claurst_api::streaming::ContentDelta::ThinkingDelta { thinking } => {
                                 debug!(len = thinking.len(), "Thinking delta received");
+                                self.streaming_thinking.push_str(&thinking);
+                                self.invalidate_transcript();
                             }
                             _ => {}
                         }
@@ -4137,10 +4783,7 @@ impl App {
                         self.is_streaming = false;
                         self.spinner_verb = None;
                         self.stall_start = None;
-                        if !self.streaming_text.is_empty() {
-                            let text = std::mem::take(&mut self.streaming_text);
-                            self.push_assistant_message(text);
-                        }
+                        self.flush_streamed_assistant_message();
                     }
                     _ => {
                         // Any other stream event: if we have no stall_start yet,
@@ -4159,9 +4802,11 @@ impl App {
                 }
                 self.is_streaming = true;
                 self.status_message = Some(format!("Running {}…", tool_name));
+                let turn_index = self.current_user_turn_index();
                 if let Some(existing) =
                     self.tool_use_blocks.iter_mut().find(|b| b.id == tool_id)
                 {
+                    existing.turn_index = turn_index;
                     existing.status = ToolStatus::Running;
                     existing.output_preview = None;
                     existing.input_json = input_json;
@@ -4169,6 +4814,7 @@ impl App {
                     self.tool_use_blocks.push(ToolUseBlock {
                         id: tool_id,
                         name: tool_name,
+                        turn_index,
                         status: ToolStatus::Running,
                         output_preview: None,
                         input_json,
@@ -4210,22 +4856,28 @@ impl App {
                 self.refresh_turn_diff_from_history();
             }
 
-            QueryEvent::TurnComplete { turn, stop_reason, .. } => {
+            QueryEvent::TurnComplete { turn, stop_reason, usage, .. } => {
                 debug!(turn, stop_reason, "Turn complete");
                 self.is_streaming = false;
                 self.spinner_verb = None;
+
+                // Update context window usage from the usage info.
+                if let Some(ref u) = usage {
+                    let turn_tokens = u.input_tokens + u.output_tokens
+                        + u.cache_creation_input_tokens + u.cache_read_input_tokens;
+                    self.context_used_tokens = self.context_used_tokens.saturating_add(turn_tokens);
+                }
                 // Record elapsed time and pick a completion verb
-                if let Some(start) = self.turn_start.take() {
-                    let secs = start.elapsed().as_secs();
-                    let seed = self.frame_count as usize ^ (self.messages.len() * 7);
-                    self.last_turn_elapsed = Some(format_elapsed(secs));
-                    self.last_turn_verb = Some(sample_completion_verb(seed));
-                }
-                if !self.streaming_text.is_empty() {
-                    let text = std::mem::take(&mut self.streaming_text);
-                    self.push_assistant_message(text);
-                }
+                let seed = self.frame_count as usize ^ (self.messages.len() * 7);
+                let elapsed = self.turn_start.take()
+                    .map(|start| format_elapsed_ms(start.elapsed().as_millis()));
+                self.last_turn_elapsed = Some(
+                    elapsed.unwrap_or_else(|| "0s".to_string())
+                );
+                self.last_turn_verb = Some(sample_completion_verb(seed));
+                self.flush_streamed_assistant_message();
                 self.tool_use_blocks.retain(|b| b.status != ToolStatus::Running);
+                self.complete_current_turn_snapshot(stop_reason.contains("abort") || stop_reason.contains("cancel"));
                 self.invalidate_transcript();
                 self.refresh_turn_diff_from_history();
             }
@@ -4238,6 +4890,7 @@ impl App {
                 self.is_streaming = false;
                 self.spinner_verb = None;
                 self.streaming_text.clear();
+                self.streaming_thinking.clear();
                 self.invalidate_transcript();
                 let err_msg = format!("Error: {}", msg);
                 self.push_assistant_message(err_msg.clone());
@@ -4303,7 +4956,11 @@ impl App {
             if let Some(ref mut rx) = self.model_fetch_rx {
                 match rx.try_recv() {
                     Ok(Ok(entries)) => {
-                        let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+                        let provider = self
+                            .config
+                            .provider
+                            .clone()
+                            .unwrap_or_else(|| "anthropic".to_string());
                         let provider_prefix = format!("{}/", provider);
                         let current = self
                             .model_name
@@ -4361,6 +5018,55 @@ impl App {
                         });
                     }
                 }
+            }
+
+            // Drain background session-list results.
+            if let Some(ref mut rx) = self.session_list_rx {
+                match rx.try_recv() {
+                    Ok(entries) => {
+                        self.session_browser.sessions = entries;
+                        self.session_browser.selected_idx = 0;
+                        self.session_list_rx = None;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        self.session_list_rx = None;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                }
+            }
+
+            // Spawn async session-list load when requested.
+            if self.session_list_pending {
+                self.session_list_pending = false;
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                self.session_list_rx = Some(rx);
+                tokio::spawn(async move {
+                    let sessions = claurst_core::history::list_sessions().await;
+                    let entries: Vec<crate::session_browser::SessionEntry> = sessions
+                        .into_iter()
+                        .map(|s| {
+                            let age = chrono::Utc::now()
+                                .signed_duration_since(s.updated_at);
+                            let last_updated = if age.num_minutes() < 1 {
+                                "just now".to_string()
+                            } else if age.num_hours() < 1 {
+                                format!("{}m ago", age.num_minutes())
+                            } else if age.num_hours() < 24 {
+                                format!("{}h ago", age.num_hours())
+                            } else {
+                                format!("{}d ago", age.num_days())
+                            };
+                            crate::session_browser::SessionEntry {
+                                id: s.id,
+                                title: s.title.unwrap_or_else(|| "(untitled)".to_string()),
+                                last_updated,
+                                message_count: s.messages.len(),
+                                cost_usd: s.total_cost,
+                            }
+                        })
+                        .collect();
+                    let _ = tx.send(entries).await;
+                });
             }
 
             // Drain voice transcription events (non-blocking).
@@ -4554,11 +5260,21 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
     fn make_app() -> App {
         let config = Config::default();
         let cost_tracker = claurst_core::cost::CostTracker::new();
         App::new(config, cost_tracker)
+    }
+
+    fn press_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
     }
 
     #[test]
@@ -4674,6 +5390,7 @@ mod tests {
         let mut app = make_app();
         assert!(!app.help_overlay.visible);
         assert!(!app.show_help);
+        assert!(!app.help_overlay.commands.is_empty());
         assert!(app.intercept_slash_command("help"));
         assert!(app.help_overlay.visible);
         assert!(app.show_help);
@@ -4688,6 +5405,65 @@ mod tests {
         // Second call while already open should leave it open (not toggle it off).
         assert!(app.intercept_slash_command("help"));
         assert!(app.help_overlay.visible);
+    }
+
+    #[test]
+    fn test_question_mark_shortcut_opens_help_with_shift_modifier() {
+        let mut app = make_app();
+
+        app.handle_key_event(press_key(KeyCode::Char('?'), KeyModifiers::SHIFT));
+
+        assert!(app.help_overlay.visible);
+        assert!(app.show_help);
+    }
+
+    #[test]
+    fn test_question_mark_shortcut_closes_help_with_shift_modifier() {
+        let mut app = make_app();
+        app.help_overlay.toggle();
+        app.show_help = true;
+
+        app.handle_key_event(press_key(KeyCode::Char('?'), KeyModifiers::SHIFT));
+
+        assert!(!app.help_overlay.visible);
+        assert!(!app.show_help);
+    }
+
+    #[test]
+    fn test_question_mark_shortcut_types_into_non_empty_prompt() {
+        let mut app = make_app();
+        app.prompt_input.text = "why".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('?'), KeyModifiers::SHIFT));
+
+        assert!(!app.help_overlay.visible);
+        assert_eq!(app.prompt_input.text, "why?");
+    }
+
+    #[test]
+    fn test_ctrl_a_shortcut_opens_model_picker() {
+        let mut app = make_app();
+        app.has_credentials = true;
+        app.config.provider = Some("anthropic".to_string());
+
+        app.handle_key_event(press_key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+
+        assert!(app.model_picker.visible);
+    }
+
+    #[test]
+    fn test_ctrl_k_shortcut_opens_command_palette_even_with_input() {
+        let mut app = make_app();
+        app.prompt_input.text = "hello".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('k'), KeyModifiers::CONTROL));
+
+        assert!(app.command_palette.visible);
+        assert_eq!(app.prompt_input.text, "hello");
     }
 
     // ---- Bash prefix allowlist ----------------------------------------------

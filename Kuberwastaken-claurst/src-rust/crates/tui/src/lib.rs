@@ -67,6 +67,8 @@ pub mod diff_viewer;
 pub mod virtual_list;
 /// Message type renderers (assistant, user, tool use, etc.).
 pub mod messages;
+/// Turn-aware transcript grouping and metadata helpers.
+pub mod transcript_turn;
 /// Agent definitions list and coordinator progress view.
 pub mod agents_view;
 /// Stats dialog with token usage and cost charts.
@@ -182,6 +184,7 @@ pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    set_terminal_title("\u{1f980} Claurst");
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
     Ok(terminal)
@@ -190,9 +193,28 @@ pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 /// Restore the terminal to its original state.
 pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     disable_raw_mode()?;
+    // Restore the original title by clearing it (terminals fall back to default).
+    let _ = execute!(
+        terminal.backend_mut(),
+        crossterm::terminal::SetTitle(""),
+    );
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+/// Set the terminal window title via OSC escape sequence.
+pub fn set_terminal_title(title: &str) {
+    let _ = execute!(io::stdout(), crossterm::terminal::SetTitle(title));
+}
+
+/// Update the terminal title to reflect the current session context.
+/// Format: "🦀 | <topic>" or just "🦀 Claurst" when no topic is set.
+pub fn update_terminal_title(topic: Option<&str>) {
+    match topic {
+        Some(t) if !t.is_empty() => set_terminal_title(&format!("\u{1f980} | {}", t)),
+        _ => set_terminal_title("\u{1f980} Claurst"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -656,7 +678,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
 
-        assert!(!rendered.contains("? for shortcuts"));
+        assert!(!rendered.contains("? shortcuts"));
     }
 
     #[test]
@@ -773,7 +795,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<Vec<_>>()
             .join("");
-        assert!(rendered.contains("No turn changes available yet."));
+        assert!(rendered.contains("No changes were captured for this turn."));
     }
 
     #[test]
@@ -958,6 +980,7 @@ mod tests {
             input_json: r#"{"command":"ls -la"}"#.to_string(),
         });
         assert_eq!(app.tool_use_blocks.len(), 1);
+        assert_eq!(app.tool_use_blocks[0].turn_index, None);
         assert_eq!(app.tool_use_blocks[0].status, ToolStatus::Running);
 
         app.handle_query_event(claurst_query::QueryEvent::ToolEnd {
@@ -975,6 +998,7 @@ mod tests {
         app.tool_use_blocks.push(ToolUseBlock {
             id: "t2".to_string(),
             name: "Read".to_string(),
+            turn_index: None,
             status: ToolStatus::Running,
             output_preview: None,
             input_json: r#"{"file_path":"foo.rs"}"#.to_string(),
@@ -1003,6 +1027,49 @@ mod tests {
         assert!(app.streaming_text.is_empty());
         assert_eq!(app.messages.len(), 1);
         assert_eq!(app.messages[0].get_all_text(), "partial response");
+    }
+
+    #[test]
+    fn test_turn_complete_flushes_streaming_thinking_into_blocks() {
+        let mut app = make_app();
+        app.is_streaming = true;
+        app.streaming_thinking = "outline the fix".to_string();
+        app.handle_query_event(claurst_query::QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "end_turn".to_string(),
+            usage: None,
+        });
+
+        let blocks = app.messages[0].content_blocks();
+        assert!(matches!(
+            blocks.first(),
+            Some(ContentBlock::Thinking { thinking, .. }) if thinking == "outline the fix"
+        ));
+    }
+
+    #[test]
+    fn test_render_app_transcript_uses_turn_metadata_without_legacy_glyph() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = make_app();
+        app.push_message(claurst_core::types::Message::user("hello".to_string()));
+        app.push_message(claurst_core::types::Message::assistant("hi there".to_string()));
+
+        terminal
+            .draw(|frame| crate::render::render_app(frame, &app))
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(!rendered.contains("◆"));
+        assert!(rendered.contains("▣"));
     }
 
     // ---- HistorySearch --------------------------------------------------

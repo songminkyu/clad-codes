@@ -554,7 +554,7 @@ impl Default for ModelRegistry {
 /// **Resolution order** (mirrors OpenCode's approach):
 ///  1. If the user explicitly set `config.model`, use it verbatim.
 ///  2. Consult the model registry for the configured provider's best model
-///     (scored by flagship priority → "latest" preference → ID desc).
+///     (scored by flagship priority -> "latest" preference -> ID desc).
 ///  3. Fall back to the hardcoded table in [`Config::effective_model()`].
 pub fn effective_model_for_config(
     config: &claurst_core::Config,

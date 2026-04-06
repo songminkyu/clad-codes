@@ -345,10 +345,20 @@ fn build_env_info_section(working_dir: Option<&str>) -> String {
     let os_version = {
         #[cfg(target_os = "windows")]
         {
-            // On Windows, use WINDIR env var existence as a proxy; actual version
-            // would require winapi calls, so fall back to a readable label.
-            std::env::var("OS")
-                .unwrap_or_else(|_| "Windows".to_string())
+            // Read ProductName from the registry via `ver` or env vars.
+            // Also include architecture for clarity.
+            let ver = std::process::Command::new("cmd")
+                .args(["/c", "ver"])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let arch = std::env::var("PROCESSOR_ARCHITECTURE").unwrap_or_default();
+            match ver {
+                Some(v) => format!("{} ({})", v, arch),
+                None => format!("Windows ({})", arch),
+            }
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -413,13 +423,35 @@ fn build_env_info_section(working_dir: Option<&str>) -> String {
         .map(|d| format!("\nWorking directory: {}", d))
         .unwrap_or_default();
 
+    // Platform-specific guidance so the model uses the right commands.
+    let os_note = if cfg!(target_os = "windows") {
+        format!(
+            "\nIMPORTANT: The user is on Windows ({}). Use Windows-compatible commands \
+             (e.g., `dir` not `ls`, `type` not `cat`, backslashes in native paths). \
+             When the shell is bash/git-bash, Unix syntax is acceptable.",
+            os_version
+        )
+    } else if cfg!(target_os = "macos") {
+        format!(
+            "\nThe user is on macOS ({}). Use macOS-compatible commands. \
+             BSD variants of tools apply (e.g., `sed -i ''` not `sed -i`).",
+            os_version
+        )
+    } else {
+        format!(
+            "\nThe user is on Linux ({}). Use Linux-compatible commands.",
+            os_version
+        )
+    };
+
     format!(
-        "\n<env>{}\nIs directory a git repo: {}\nPlatform: {}\nOS Version: {}\n{}\n</env>",
+        "\n<env>{}\nIs directory a git repo: {}\nPlatform: {}\nOS Version: {}\n{}{}\n</env>",
         cwd_line,
         if is_git { "Yes" } else { "No" },
         platform,
         os_version,
         shell_line,
+        os_note,
     )
 }
 

@@ -5,7 +5,8 @@
 // - Walks the user through a brief orientation: key bindings, model info, help.
 // - Dismissed by pressing Enter or Esc; sets has_completed_onboarding in settings.
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
+use ratatui::prelude::Stylize;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
@@ -223,160 +224,153 @@ fn render_provider_setup_page(frame: &mut Frame, area: Rect) {
 }
 
 fn render_welcome_page(frame: &mut Frame, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(vec![Span::styled(
-            " Welcome to Claurst ",
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-        )]))
-        .border_style(Style::default().fg(Color::Green));
+    use crate::overlays::{render_dark_overlay, render_dialog_bg, CLAURST_PANEL_BG};
 
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let pink = Color::Rgb(233, 30, 99);
+    let dim = Color::Rgb(90, 90, 90);
+    let text = Color::Rgb(210, 210, 215);
+
+    render_dark_overlay(frame, area);
+    render_dialog_bg(frame, area);
+
+    let inner = Rect {
+        x: area.x + 2,
+        y: area.y + 1,
+        width: area.width.saturating_sub(4),
+        height: area.height.saturating_sub(2),
+    };
+
+    let cmd_label = |slash: &str, desc: &str| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(
+                format!("  {:<12}", slash),
+                Style::default().fg(pink),
+            ),
+            Span::styled(
+                desc.to_string(),
+                Style::default().fg(text),
+            ),
+        ])
+    };
 
     let lines: Vec<Line<'static>> = vec![
+        Line::from(vec![
+            Span::styled(
+                " Welcome to Claurst",
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:>width$}", "1/2 ", width = inner.width.saturating_sub(21) as usize),
+                Style::default().fg(dim),
+            ),
+        ]),
         Line::from(""),
-        Line::from(vec![Span::styled(
+        Line::from(Span::styled(
             "  Claurst is an AI-powered coding assistant in your terminal.",
-            Style::default().fg(Color::White),
-        )]),
+            Style::default().fg(text),
+        )),
         Line::from(""),
-        Line::from(vec![Span::styled(
+        Line::from(Span::styled(
             "  How to use:",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(vec![Span::styled(
-            "    • Type your request and press Enter to send it.",
-            Style::default().fg(Color::White),
-        )]),
-        Line::from(vec![Span::styled(
-            "    • Claurst can read, edit, and create files in your project.",
-            Style::default().fg(Color::White),
-        )]),
-        Line::from(vec![Span::styled(
-            "    • Claurst can run bash commands, search the web, and more.",
-            Style::default().fg(Color::White),
-        )]),
+            Style::default().fg(pink).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled("  Type your request and press Enter to send it.", Style::default().fg(text))),
+        Line::from(Span::styled("  Claurst can read, edit, and create files in your project.", Style::default().fg(text))),
+        Line::from(Span::styled("  Claurst can run bash commands, search the web, and more.", Style::default().fg(text))),
         Line::from(""),
-        Line::from(vec![Span::styled(
+        Line::from(Span::styled(
             "  Slash commands:",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(vec![Span::styled(
-            "    /help       — show all commands",
-            Style::default().fg(Color::DarkGray),
-        )]),
-        Line::from(vec![Span::styled(
-            "    /model      — switch AI model",
-            Style::default().fg(Color::DarkGray),
-        )]),
-        Line::from(vec![Span::styled(
-            "    /compact    — summarise conversation to save context",
-            Style::default().fg(Color::DarkGray),
-        )]),
-        Line::from(vec![Span::styled(
-            "    /cost       — show token usage and cost",
-            Style::default().fg(Color::DarkGray),
-        )]),
+            Style::default().fg(pink).add_modifier(Modifier::BOLD),
+        )),
+        cmd_label("/help", "show all commands"),
+        cmd_label("/model", "switch AI model"),
+        cmd_label("/connect", "connect a provider"),
+        cmd_label("/compact", "summarise conversation to save context"),
+        cmd_label("/cost", "show token usage and cost"),
         Line::from(""),
-        Line::from(vec![Span::styled(
-            "  Page 1/2",
-            Style::default().fg(Color::DarkGray),
-        )]),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  → or Enter: next  ·  Esc: skip",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-        )]),
+        Line::from(vec![
+            Span::styled("  enter ", Style::default().fg(dim)),
+            Span::styled("next", Style::default().fg(dim)),
+            Span::styled("  ·  ", Style::default().fg(Color::Rgb(50, 50, 50))),
+            Span::styled("esc ", Style::default().fg(dim)),
+            Span::styled("skip", Style::default().fg(dim)),
+        ]),
     ];
 
-    Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .render(inner, frame.buffer_mut());
+    Paragraph::new(lines).bg(CLAURST_PANEL_BG).render(inner, frame.buffer_mut());
 }
 
 fn render_keybindings_page(frame: &mut Frame, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(vec![Span::styled(
-            " Keyboard Shortcuts ",
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-        )]))
-        .border_style(Style::default().fg(Color::Green));
+    use crate::overlays::{render_dark_overlay, render_dialog_bg, CLAURST_PANEL_BG};
 
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let pink = Color::Rgb(233, 30, 99);
+    let dim = Color::Rgb(90, 90, 90);
+    let text = Color::Rgb(210, 210, 215);
 
-    // Split inner into two columns
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(inner);
+    render_dark_overlay(frame, area);
+    render_dialog_bg(frame, area);
 
-    let left_lines: Vec<Line<'static>> = vec![
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  Input",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(vec![Span::styled("  Enter        send message", Style::default().fg(Color::White))]),
-        Line::from(vec![Span::styled("  Shift+Enter  newline", Style::default().fg(Color::White))]),
-        Line::from(vec![Span::styled("  Ctrl+C       interrupt/cancel", Style::default().fg(Color::White))]),
-        Line::from(vec![Span::styled("  Ctrl+L       clear screen", Style::default().fg(Color::White))]),
-        Line::from(vec![Span::styled("  ↑↓           history", Style::default().fg(Color::White))]),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  Navigation",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(vec![Span::styled("  PgUp/PgDn    scroll transcript", Style::default().fg(Color::White))]),
-        Line::from(vec![Span::styled("  Ctrl+K       clear input", Style::default().fg(Color::White))]),
-    ];
-
-    let right_lines: Vec<Line<'static>> = vec![
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  Permissions",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(vec![Span::styled("  y  allow tool once", Style::default().fg(Color::White))]),
-        Line::from(vec![Span::styled("  Y  allow all this session", Style::default().fg(Color::White))]),
-        Line::from(vec![Span::styled("  n  deny tool", Style::default().fg(Color::White))]),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  Other",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(vec![Span::styled("  /help   all slash commands", Style::default().fg(Color::White))]),
-        Line::from(vec![Span::styled("  Ctrl+R  session browser", Style::default().fg(Color::White))]),
-    ];
-
-    Paragraph::new(left_lines)
-        .wrap(Wrap { trim: false })
-        .render(cols[0], frame.buffer_mut());
-
-    Paragraph::new(right_lines)
-        .wrap(Wrap { trim: false })
-        .render(cols[1], frame.buffer_mut());
-
-    // Footer at the bottom of the inner area
-    let footer_area = Rect {
-        x: inner.x,
-        y: inner.y + inner.height.saturating_sub(2),
-        width: inner.width,
-        height: 2,
+    let inner = Rect {
+        x: area.x + 2,
+        y: area.y + 1,
+        width: area.width.saturating_sub(4),
+        height: area.height.saturating_sub(2),
     };
-    let footer = Paragraph::new(vec![
-        Line::from(vec![Span::styled(
-            "  Page 2/2",
-            Style::default().fg(Color::DarkGray),
-        )]),
-        Line::from(vec![Span::styled(
-            "  Enter: done  ·  ← : back  ·  Esc: close",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-        )]),
-    ]);
-    footer.render(footer_area, frame.buffer_mut());
+
+    let kb = |key: &str, desc: &str| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(format!("  {:<15}", key), Style::default().fg(pink)),
+            Span::styled(desc.to_string(), Style::default().fg(text)),
+        ])
+    };
+
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(vec![
+            Span::styled(
+                " Keyboard Shortcuts",
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:>width$}", "2/2 ", width = inner.width.saturating_sub(21) as usize),
+                Style::default().fg(dim),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("  Input", Style::default().fg(pink).add_modifier(Modifier::BOLD))),
+        kb("Enter", "send message"),
+        kb("Shift+Enter", "newline"),
+        kb("Ctrl+C", "interrupt / cancel"),
+        kb("Tab", "cycle mode (build/plan/explore)"),
+        kb("\u{2191}\u{2193}", "history"),
+        Line::from(""),
+        Line::from(Span::styled("  Navigation", Style::default().fg(pink).add_modifier(Modifier::BOLD))),
+        kb("PgUp/PgDn", "scroll transcript"),
+        kb("Ctrl+K", "command palette"),
+        kb("Ctrl+A", "model picker"),
+        Line::from(""),
+        Line::from(Span::styled("  Permissions", Style::default().fg(pink).add_modifier(Modifier::BOLD))),
+        kb("y", "allow tool once"),
+        kb("Y", "allow all this session"),
+        kb("n", "deny tool"),
+    ];
+
+    // Footer at bottom
+    let footer_y = inner.height.saturating_sub(1) as usize;
+    while lines.len() < footer_y {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("  enter ", Style::default().fg(dim)),
+        Span::styled("done", Style::default().fg(dim)),
+        Span::styled("  ·  ", Style::default().fg(Color::Rgb(50, 50, 50))),
+        Span::styled("\u{2190} ", Style::default().fg(dim)),
+        Span::styled("back", Style::default().fg(dim)),
+        Span::styled("  ·  ", Style::default().fg(Color::Rgb(50, 50, 50))),
+        Span::styled("esc ", Style::default().fg(dim)),
+        Span::styled("close", Style::default().fg(dim)),
+    ]));
+
+    Paragraph::new(lines).bg(CLAURST_PANEL_BG).render(inner, frame.buffer_mut());
 }
 
 // ---------------------------------------------------------------------------

@@ -2416,6 +2416,7 @@ pub fn render_prompt_input(
     buf: &mut Buffer,
     focused: bool,
     mode: InputMode,
+    accent_override: Color,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -2448,9 +2449,8 @@ pub fn render_prompt_input(
     }
 
     let accent = match mode {
-        InputMode::Readonly => CLAUDE_ORANGE,   // orange = locked while Claurst responds
-        InputMode::Plan => Color::Yellow,
-        InputMode::Default => CLAUDE_ORANGE,    // always orange regardless of focus
+        InputMode::Readonly => CLAUDE_ORANGE,   // locked while streaming — always pink
+        _ => accent_override,                   // use mode-aware accent color
     };
     let prompt_prefix = format!("{PROMPT_POINTER} ");
     let prefix_width = prompt_prefix.chars().count() as u16;
