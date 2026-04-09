@@ -30,4 +30,10 @@ leaked-claude-code
 * https://github.com/Heipiao/leaked-claude-code
 
 Gitlawb
+
 * https://github.com/Gitlawb/openclaude.git
+
+1270011
+
+* https://github.com/1270011/claude-buddy
+

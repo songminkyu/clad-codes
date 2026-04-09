@@ -35,8 +35,8 @@ use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
     handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
     handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
-    resume_supported_slash_commands, slash_command_specs, validate_slash_command_input,
-    SkillSlashDispatch, SlashCommand,
+    render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
+    slash_command_specs, validate_slash_command_input, SkillSlashDispatch, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -110,7 +110,22 @@ type RuntimePluginStateBuildOutput = (
 fn main() {
     if let Err(error) = run() {
         let message = error.to_string();
-        if message.contains("`claw --help`") {
+        // When --output-format json is active, emit errors as JSON so downstream
+        // tools can parse failures the same way they parse successes (ROADMAP #42).
+        let argv: Vec<String> = std::env::args().collect();
+        let json_output = argv
+            .windows(2)
+            .any(|w| w[0] == "--output-format" && w[1] == "json")
+            || argv.iter().any(|a| a == "--output-format=json");
+        if json_output {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "type": "error",
+                    "error": message,
+                })
+            );
+        } else if message.contains("`claw --help`") {
             eprintln!("error: {message}");
         } else {
             eprintln!(
@@ -209,6 +224,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode,
             compact,
             base_commit,
+            reasoning_effort,
         } => {
             run_stale_base_preflight(base_commit.as_deref());
             // Only consume piped stdin as prompt context when the permission
@@ -222,11 +238,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            LiveCli::new(model, true, allowed_tools, permission_mode)?.run_turn_with_output(
-                &effective_prompt,
-                output_format,
-                compact,
-            )?;
+            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+            cli.set_reasoning_effort(reasoning_effort);
+            cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
         CliAction::Login { output_format } => run_login(output_format)?,
         CliAction::Logout { output_format } => run_logout(output_format)?,
@@ -243,7 +257,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             allowed_tools,
             permission_mode,
             base_commit,
-        } => run_repl(model, allowed_tools, permission_mode, base_commit)?,
+            reasoning_effort,
+        } => run_repl(
+            model,
+            allowed_tools,
+            permission_mode,
+            base_commit,
+            reasoning_effort,
+        )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -304,6 +325,7 @@ enum CliAction {
         permission_mode: PermissionMode,
         compact: bool,
         base_commit: Option<String>,
+        reasoning_effort: Option<String>,
     },
     Login {
         output_format: CliOutputFormat,
@@ -330,6 +352,7 @@ enum CliAction {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
         base_commit: Option<String>,
+        reasoning_effort: Option<String>,
     },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
@@ -373,12 +396,38 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut allowed_tool_values = Vec::new();
     let mut compact = false;
     let mut base_commit: Option<String> = None;
-    let mut rest = Vec::new();
+    let mut reasoning_effort: Option<String> = None;
+    let mut rest: Vec<String> = Vec::new();
     let mut index = 0;
 
     while index < args.len() {
         match args[index].as_str() {
             "--help" | "-h" if rest.is_empty() => {
+                wants_help = true;
+                index += 1;
+            }
+            "--help" | "-h"
+                if !rest.is_empty()
+                    && matches!(
+                        rest[0].as_str(),
+                        "prompt"
+                            | "login"
+                            | "logout"
+                            | "version"
+                            | "state"
+                            | "init"
+                            | "export"
+                            | "commit"
+                            | "pr"
+                            | "issue"
+                    ) =>
+            {
+                // `--help` following a subcommand that would otherwise forward
+                // the arg to the API (e.g. `claw prompt --help`) should show
+                // top-level help instead. Subcommands that consume their own
+                // args (agents, mcp, plugins, skills) and local help-topic
+                // subcommands (status, sandbox, doctor) must NOT be intercepted
+                // here — they handle --help in their own dispatch paths.
                 wants_help = true;
                 index += 1;
             }
@@ -438,6 +487,28 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 base_commit = Some(flag[14..].to_string());
                 index += 1;
             }
+            "--reasoning-effort" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --reasoning-effort".to_string())?;
+                if !matches!(value.as_str(), "low" | "medium" | "high") {
+                    return Err(format!(
+                        "invalid value for --reasoning-effort: '{value}'; must be low, medium, or high"
+                    ));
+                }
+                reasoning_effort = Some(value.clone());
+                index += 2;
+            }
+            flag if flag.starts_with("--reasoning-effort=") => {
+                let value = &flag[19..];
+                if !matches!(value, "low" | "medium" | "high") {
+                    return Err(format!(
+                        "invalid value for --reasoning-effort: '{value}'; must be low, medium, or high"
+                    ));
+                }
+                reasoning_effort = Some(value.to_string());
+                index += 1;
+            }
             "-p" => {
                 // Claw Code compat: -p "prompt" = one-shot prompt
                 let prompt = args[index + 1..].join(" ");
@@ -453,6 +524,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                         .unwrap_or_else(default_permission_mode),
                     compact,
                     base_commit: base_commit.clone(),
+                    reasoning_effort: reasoning_effort.clone(),
                 });
             }
             "--print" => {
@@ -511,6 +583,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             allowed_tools,
             permission_mode,
             base_commit,
+            reasoning_effort: reasoning_effort.clone(),
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
@@ -549,6 +622,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     permission_mode,
                     compact,
                     base_commit,
+                    reasoning_effort: reasoning_effort.clone(),
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -574,6 +648,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode,
                 compact,
                 base_commit: base_commit.clone(),
+                reasoning_effort: reasoning_effort.clone(),
             })
         }
         other if other.starts_with('/') => parse_direct_slash_cli_action(
@@ -584,6 +659,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             permission_mode,
             compact,
             base_commit,
+            reasoning_effort,
         ),
         _other => Ok(CliAction::Prompt {
             prompt: rest.join(" "),
@@ -593,6 +669,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             permission_mode,
             compact,
             base_commit,
+            reasoning_effort: reasoning_effort.clone(),
         }),
     }
 }
@@ -686,6 +763,7 @@ fn parse_direct_slash_cli_action(
     permission_mode: PermissionMode,
     compact: bool,
     base_commit: Option<String>,
+    reasoning_effort: Option<String>,
 ) -> Result<CliAction, String> {
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
@@ -713,6 +791,7 @@ fn parse_direct_slash_cli_action(
                     permission_mode,
                     compact,
                     base_commit,
+                    reasoning_effort: reasoning_effort.clone(),
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -1348,16 +1427,16 @@ fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::e
     let cwd = env::current_dir()?;
     let state_path = cwd.join(".claw").join("worker-state.json");
     if !state_path.exists() {
-        match output_format {
-            CliOutputFormat::Text => {
-                println!("No worker state file found at {}", state_path.display())
-            }
-            CliOutputFormat::Json => println!(
-                "{}",
-                serde_json::json!({"error": "no_state_file", "path": state_path.display().to_string()})
-            ),
-        }
-        return Ok(());
+        // Emit a structured error, then return Err so the process exits 1.
+        // Callers (scripts, CI) need a non-zero exit to detect "no state" without
+        // parsing prose output.
+        // Let the error propagate to main() which will format it correctly
+        // (prose for text mode, JSON envelope for --output-format json).
+        return Err(format!(
+            "no worker state file found at {} — run a worker first",
+            state_path.display()
+        )
+        .into());
     }
     let raw = std::fs::read_to_string(&state_path)?;
     match output_format {
@@ -2762,10 +2841,12 @@ fn run_repl(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     base_commit: Option<String>,
+    reasoning_effort: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+    cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
@@ -2793,6 +2874,26 @@ fn run_repl(
                     Ok(None) => {}
                     Err(error) => {
                         eprintln!("{error}");
+                        continue;
+                    }
+                }
+                // Bare-word skill dispatch: if the first token of the input
+                // matches a known skill name, invoke it as `/skills <input>`
+                // rather than forwarding raw text to the LLM (ROADMAP #36).
+                let bare_first_token = trimmed.split_whitespace().next().unwrap_or_default();
+                let looks_like_skill_name = !bare_first_token.is_empty()
+                    && !bare_first_token.starts_with('/')
+                    && bare_first_token
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '-' || c == '_');
+                if looks_like_skill_name {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    if let Ok(SkillSlashDispatch::Invoke(prompt)) =
+                        resolve_skill_invocation(&cwd, Some(&trimmed))
+                    {
+                        editor.push_history(input);
+                        cli.record_prompt_history(&trimmed);
+                        cli.run_turn(&prompt)?;
                         continue;
                     }
                 }
@@ -3346,6 +3447,12 @@ impl LiveCli {
         };
         cli.persist_session()?;
         Ok(cli)
+    }
+
+    fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        if let Some(rt) = self.runtime.runtime.as_mut() {
+            rt.api_client_mut().set_reasoning_effort(effort);
+        }
     }
 
     fn startup_banner(&self) -> String {
@@ -4650,7 +4757,7 @@ fn render_repl_help() -> String {
         "  Browse sessions      /session list".to_string(),
         "  Show prompt history  /history [count]".to_string(),
         String::new(),
-        render_slash_command_help(),
+        render_slash_command_help_filtered(STUB_COMMANDS),
     ]
     .join(
         "
@@ -4718,6 +4825,11 @@ fn status_json_value(
             "unstaged_files": context.git_summary.unstaged_files,
             "untracked_files": context.git_summary.untracked_files,
             "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
+            "session_id": context.session_path.as_ref().and_then(|path| {
+                // Session files live under .claw/sessions/<session-id>/<file>.jsonl
+                // Extract the session-id directory component.
+                path.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned())
+            }),
             "loaded_config_files": context.loaded_config_files,
             "discovered_config_files": context.discovered_config_files,
             "memory_file_count": context.memory_file_count,
@@ -6370,6 +6482,7 @@ struct AnthropicRuntimeClient {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    reasoning_effort: Option<String>,
 }
 
 impl AnthropicRuntimeClient {
@@ -6434,7 +6547,12 @@ impl AnthropicRuntimeClient {
             allowed_tools,
             tool_registry,
             progress_reporter,
+            reasoning_effort: None,
         })
+    }
+
+    fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        self.reasoning_effort = effort;
     }
 }
 
@@ -6481,6 +6599,7 @@ impl ApiClient for AnthropicRuntimeClient {
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
+            reasoning_effort: self.reasoning_effort.clone(),
             ..Default::default()
         };
 
@@ -6857,6 +6976,51 @@ fn collect_prompt_cache_events(summary: &runtime::TurnSummary) -> Vec<serde_json
         .collect()
 }
 
+/// Slash commands that are registered in the spec list but not yet implemented
+/// in this build. Used to filter both REPL completions and help output so the
+/// discovery surface only shows commands that actually work (ROADMAP #39).
+const STUB_COMMANDS: &[&str] = &[
+    "login",
+    "logout",
+    "vim",
+    "upgrade",
+    "stats",
+    "share",
+    "feedback",
+    "files",
+    "fast",
+    "exit",
+    "summary",
+    "desktop",
+    "brief",
+    "advisor",
+    "stickers",
+    "insights",
+    "thinkback",
+    "release-notes",
+    "security-review",
+    "keybindings",
+    "privacy-settings",
+    "plan",
+    "review",
+    "tasks",
+    "theme",
+    "voice",
+    "usage",
+    "rename",
+    "copy",
+    "hooks",
+    "context",
+    "color",
+    "effort",
+    "branch",
+    "rewind",
+    "ide",
+    "tag",
+    "output-style",
+    "add-dir",
+];
+
 fn slash_command_completion_candidates_with_sessions(
     model: &str,
     active_session_id: Option<&str>,
@@ -6865,9 +7029,14 @@ fn slash_command_completion_candidates_with_sessions(
     let mut completions = BTreeSet::new();
 
     for spec in slash_command_specs() {
+        if STUB_COMMANDS.contains(&spec.name) {
+            continue;
+        }
         completions.insert(format!("/{}", spec.name));
         for alias in spec.aliases {
-            completions.insert(format!("/{alias}"));
+            if !STUB_COMMANDS.contains(alias) {
+                completions.insert(format!("/{alias}"));
+            }
         }
     }
 
@@ -7756,7 +7925,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(out)?;
     writeln!(out, "Interactive slash commands:")?;
-    writeln!(out, "{}", render_slash_command_help())?;
+    writeln!(out, "{}", render_slash_command_help_filtered(STUB_COMMANDS))?;
     writeln!(out)?;
     let resume_commands = resume_supported_slash_commands()
         .into_iter()
@@ -7850,7 +8019,7 @@ mod tests {
         summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture, CliAction,
         CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
         InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry, SlashCommand,
-        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -8174,6 +8343,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -8337,6 +8507,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -8426,6 +8597,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -8455,6 +8627,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: true,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -8496,6 +8669,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -8573,6 +8747,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -8592,6 +8767,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -8620,6 +8796,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -8645,6 +8822,7 @@ mod tests {
                 ),
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -8754,6 +8932,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
         assert_eq!(
@@ -9137,6 +9316,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9203,6 +9383,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
         assert_eq!(
@@ -9228,6 +9409,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
         let error = parse_args(&["/status".to_string()])
@@ -10982,6 +11164,58 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(source_root);
         std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn rejects_invalid_reasoning_effort_value() {
+        let err = parse_args(&[
+            "--reasoning-effort".to_string(),
+            "turbo".to_string(),
+            "prompt".to_string(),
+            "hello".to_string(),
+        ])
+        .unwrap_err();
+        assert!(
+            err.contains("invalid value for --reasoning-effort"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("turbo"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn accepts_valid_reasoning_effort_values() {
+        for value in ["low", "medium", "high"] {
+            let result = parse_args(&[
+                "--reasoning-effort".to_string(),
+                value.to_string(),
+                "prompt".to_string(),
+                "hello".to_string(),
+            ]);
+            assert!(
+                result.is_ok(),
+                "--reasoning-effort {value} should be accepted, got: {:?}",
+                result
+            );
+            if let Ok(CliAction::Prompt {
+                reasoning_effort, ..
+            }) = result
+            {
+                assert_eq!(reasoning_effort.as_deref(), Some(value));
+            }
+        }
+    }
+
+    #[test]
+    fn stub_commands_absent_from_repl_completions() {
+        let candidates =
+            slash_command_completion_candidates_with_sessions("claude-3-5-sonnet", None, vec![]);
+        for stub in STUB_COMMANDS {
+            let with_slash = format!("/{stub}");
+            assert!(
+                !candidates.contains(&with_slash),
+                "stub command {with_slash} should not appear in REPL completions"
+            );
+        }
     }
 }
 
