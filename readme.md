@@ -15,7 +15,6 @@ Kuberwastaken
 ultraworkers
 
 * https://github.com/Ultraworkers/claw-code
-* https://github.com/ultraworkers/claw-code-parity
 
 777genius
 
