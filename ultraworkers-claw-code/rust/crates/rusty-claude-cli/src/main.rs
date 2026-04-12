@@ -78,6 +78,9 @@ const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
+const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/claw-code";
+const OFFICIAL_REPO_SLUG: &str = "ultraworkers/claw-code";
+const DEPRECATED_INSTALL_COMMAND: &str = "cargo install claw-code";
 const LATEST_SESSION_REFERENCE: &str = "latest";
 const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
 const CLI_OPTION_SUGGESTIONS: &[&str] = &[
@@ -1477,6 +1480,7 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
         checks: vec![
             check_auth_health(),
             check_config_health(&config_loader, config.as_ref()),
+            check_install_source_health(),
             check_workspace_health(&context),
             check_sandbox_health(&context.sandbox_status),
             check_system_health(&cwd, config.as_ref().ok()),
@@ -1762,6 +1766,36 @@ fn check_config_health(
             ("load_error".to_string(), json!(error.to_string())),
         ])),
     }
+}
+
+fn check_install_source_health() -> DiagnosticCheck {
+    DiagnosticCheck::new(
+        "Install source",
+        DiagnosticLevel::Ok,
+        format!(
+            "official source of truth is {OFFICIAL_REPO_SLUG}; avoid `{DEPRECATED_INSTALL_COMMAND}`"
+        ),
+    )
+    .with_details(vec![
+        format!("Official repo     {OFFICIAL_REPO_URL}"),
+        "Recommended path  build from this repo or use the upstream binary documented in README.md"
+            .to_string(),
+        format!(
+            "Deprecated crate  `{DEPRECATED_INSTALL_COMMAND}` installs a deprecated stub and does not provide the `claw` binary"
+        )
+            .to_string(),
+    ])
+    .with_data(Map::from_iter([
+        ("official_repo".to_string(), json!(OFFICIAL_REPO_URL)),
+        (
+            "deprecated_install".to_string(),
+            json!(DEPRECATED_INSTALL_COMMAND),
+        ),
+        (
+            "recommended_install".to_string(),
+            json!("build from source or follow the upstream binary instructions in README.md"),
+        ),
+    ]))
 }
 
 fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
@@ -3088,6 +3122,7 @@ struct SessionHandle {
 struct ManagedSessionSummary {
     id: String,
     path: PathBuf,
+    updated_at_ms: u64,
     modified_epoch_millis: u128,
     message_count: usize,
     parent_session_id: Option<String>,
@@ -4677,6 +4712,7 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
         .map(|session| ManagedSessionSummary {
             id: session.id,
             path: session.path,
+            updated_at_ms: session.updated_at_ms,
             modified_epoch_millis: session.modified_epoch_millis,
             message_count: session.message_count,
             parent_session_id: session.parent_session_id,
@@ -4692,6 +4728,7 @@ fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error:
     Ok(ManagedSessionSummary {
         id: session.id,
         path: session.path,
+        updated_at_ms: session.updated_at_ms,
         modified_epoch_millis: session.modified_epoch_millis,
         message_count: session.message_count,
         parent_session_id: session.parent_session_id,
@@ -8111,6 +8148,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
     )?;
+    writeln!(out, "      Source of truth: {OFFICIAL_REPO_SLUG}")?;
+    writeln!(
+        out,
+        "      Warning: do not `{DEPRECATED_INSTALL_COMMAND}` (deprecated stub)"
+    )?;
     writeln!(out, "  claw dump-manifests [--manifests-dir PATH]")?;
     writeln!(out, "  claw bootstrap-plan")?;
     writeln!(out, "  claw agents")?;
@@ -8200,6 +8242,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw mcp show my-server")?;
     writeln!(out, "  claw /skills")?;
     writeln!(out, "  claw doctor")?;
+    writeln!(out, "  source of truth: {OFFICIAL_REPO_URL}")?;
+    writeln!(
+        out,
+        "  do not run `{DEPRECATED_INSTALL_COMMAND}` — it installs a deprecated stub"
+    )?;
     writeln!(out, "  claw init")?;
     writeln!(out, "  claw export")?;
     writeln!(out, "  claw export conversation.md")?;
@@ -10082,6 +10129,8 @@ mod tests {
         assert!(help.contains("claw mcp"));
         assert!(help.contains("claw skills"));
         assert!(help.contains("claw /skills"));
+        assert!(help.contains("ultraworkers/claw-code"));
+        assert!(help.contains("cargo install claw-code"));
         assert!(!help.contains("claw login"));
         assert!(!help.contains("claw logout"));
     }
@@ -10485,7 +10534,7 @@ UU conflicted.rs",
 
     #[test]
     fn managed_sessions_default_to_jsonl_and_resolve_legacy_json() {
-        let _guard = cwd_lock().lock().expect("cwd lock");
+        let _guard = cwd_guard();
         let workspace = temp_workspace("session-resolution");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");
@@ -10524,7 +10573,7 @@ UU conflicted.rs",
 
     #[test]
     fn latest_session_alias_resolves_most_recent_managed_session() {
-        let _guard = cwd_lock().lock().expect("cwd lock");
+        let _guard = cwd_guard();
         let workspace = temp_workspace("latest-session-alias");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");
@@ -10557,7 +10606,7 @@ UU conflicted.rs",
 
     #[test]
     fn load_session_reference_rejects_workspace_mismatch() {
-        let _guard = cwd_lock().lock().expect("cwd lock");
+        let _guard = cwd_guard();
         let workspace_a = temp_workspace("session-mismatch-a");
         let workspace_b = temp_workspace("session-mismatch-b");
         std::fs::create_dir_all(&workspace_a).expect("workspace a should create");
@@ -10629,6 +10678,24 @@ UU conflicted.rs",
     fn cwd_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn cwd_guard() -> MutexGuard<'static, ()> {
+        cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn cwd_guard_recovers_after_poisoning() {
+        let poisoned = std::thread::spawn(|| {
+            let _guard = cwd_guard();
+            panic!("poison cwd lock");
+        })
+        .join();
+        assert!(poisoned.is_err(), "poisoning thread should panic");
+
+        let _guard = cwd_guard();
     }
 
     fn temp_workspace(label: &str) -> PathBuf {
