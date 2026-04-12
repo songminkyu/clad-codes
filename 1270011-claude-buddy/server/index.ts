@@ -9,18 +9,39 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { join, resolve, dirname } from "path";
 
 import {
-  generateBones, renderFace,
-  SPECIES, RARITIES, STAT_NAMES, RARITY_STARS,
-  type Species, type Rarity, type StatName, type Companion,
+  generateBones,
+  renderFace,
+  SPECIES,
+  RARITIES,
+  STAT_NAMES,
+  RARITY_STARS,
+  type Species,
+  type Rarity,
+  type StatName,
+  type Companion,
 } from "./engine.ts";
 import {
-  loadCompanion, saveCompanion, resolveUserId,
-  loadReaction, saveReaction, writeStatusState,
-  loadConfig, saveConfig,
-  loadActiveSlot, saveActiveSlot, slugify, unusedName,
-  loadCompanionSlot, saveCompanionSlot, deleteCompanionSlot, listCompanionSlots,
+  loadCompanion,
+  saveCompanion,
+  resolveUserId,
+  loadReaction,
+  saveReaction,
+  writeStatusState,
+  loadConfig,
+  saveConfig,
+  loadActiveSlot,
+  saveActiveSlot,
+  slugify,
+  unusedName,
+  loadCompanionSlot,
+  saveCompanionSlot,
+  deleteCompanionSlot,
+  listCompanionSlots,
+  setBuddyStatusLine,
+  unsetBuddyStatusLine,
 } from "./state.ts";
 import {
   getReaction, generatePersonalityPrompt,
@@ -29,7 +50,8 @@ import { renderCompanionCardMarkdown } from "./art.ts";
 
 function getInstructions(): string {
   const companion = loadCompanion();
-  if (!companion) return "Companion not yet hatched. Use buddy_show to initialize.";
+  if (!companion)
+    return "Companion not yet hatched. Use buddy_show to initialize.";
   const b = companion.bones;
   return [
     `A ${b.rarity} ${b.species} named ${companion.name} watches from the status line.`,
@@ -49,12 +71,15 @@ function getInstructions(): string {
   ].join("\n");
 }
 
-const server = new McpServer({
-  name: "claude-buddy",
-  version: "0.3.0",
-}, {
-  instructions: getInstructions(),
-});
+const server = new McpServer(
+  {
+    name: "claude-buddy",
+    version: "0.3.0",
+  },
+  {
+    instructions: getInstructions(),
+  },
+);
 
 // ─── Helper: ensure companion exists ────────────────────────────────────────
 
@@ -98,7 +123,8 @@ server.tool(
   async () => {
     const companion = ensureCompanion();
     const reaction = loadReaction();
-    const reactionText = reaction?.reaction ?? `*${companion.name} watches your code quietly*`;
+    const reactionText =
+      reaction?.reaction ?? `*${companion.name} watches your code quietly*`;
 
     // Use markdown rendering for the MCP tool response — Claude Code's UI
     // doesn't render raw ANSI escape codes, so we return pure markdown with
@@ -124,13 +150,19 @@ server.tool(
   {},
   async () => {
     const companion = ensureCompanion();
-    const reaction = getReaction("pet", companion.bones.species, companion.bones.rarity);
+    const reaction = getReaction(
+      "pet",
+      companion.bones.species,
+      companion.bones.rarity,
+    );
     saveReaction(reaction, "pet");
     writeStatusState(companion, reaction);
 
     const face = renderFace(companion.bones.species, companion.bones.eye);
     return {
-      content: [{ type: "text", text: `${face} ${companion.name}: "${reaction}"` }],
+      content: [
+        { type: "text", text: `${face} ${companion.name}: "${reaction}"` },
+      ],
     };
   },
 );
@@ -149,7 +181,7 @@ server.tool(
     const card = renderCompanionCardMarkdown(
       companion.bones,
       companion.name,
-      "",  // no personality in stats view
+      "", // no personality in stats view
     );
 
     return { content: [{ type: "text", text: card }] };
@@ -162,8 +194,17 @@ server.tool(
   "buddy_react",
   "Post a buddy comment. Call this at the END of every response with a short in-character comment from the companion about what just happened. The comment should be 1 sentence, in character, and reference something specific from the conversation — a pitfall noticed, a compliment on clean code, a warning about edge cases, etc. Write the comment yourself based on the companion's personality.",
   {
-    comment: z.string().min(1).max(150).describe("The buddy's comment, written in-character (1 short sentence, max 150 chars). Use *asterisks* for actions."),
-    reason: z.enum(["error", "test-fail", "large-diff", "turn"]).optional().describe("What triggered the reaction"),
+    comment: z
+      .string()
+      .min(1)
+      .max(150)
+      .describe(
+        "The buddy's comment, written in-character (1 short sentence, max 150 chars). Use *asterisks* for actions.",
+      ),
+    reason: z
+      .enum(["error", "test-fail", "large-diff", "turn"])
+      .optional()
+      .describe("What triggered the reaction"),
   },
   async ({ comment, reason }) => {
     const companion = ensureCompanion();
@@ -172,7 +213,9 @@ server.tool(
 
     const face = renderFace(companion.bones.species, companion.bones.eye);
     return {
-      content: [{ type: "text", text: `${face} ${companion.name}: "${comment}"` }],
+      content: [
+        { type: "text", text: `${face} ${companion.name}: "${comment}"` },
+      ],
     };
   },
 );
@@ -183,7 +226,11 @@ server.tool(
   "buddy_rename",
   "Rename your coding companion",
   {
-    name: z.string().min(1).max(14).describe("New name for your buddy (1-14 characters)"),
+    name: z
+      .string()
+      .min(1)
+      .max(14)
+      .describe("New name for your buddy (1-14 characters)"),
   },
   async ({ name }) => {
     const companion = ensureCompanion();
@@ -204,7 +251,11 @@ server.tool(
   "buddy_set_personality",
   "Set a custom personality description for your buddy",
   {
-    personality: z.string().min(1).max(500).describe("Personality description (1-500 chars)"),
+    personality: z
+      .string()
+      .min(1)
+      .max(500)
+      .describe("Personality description (1-500 chars)"),
   },
   async ({ personality }) => {
     const companion = ensureCompanion();
@@ -212,7 +263,9 @@ server.tool(
     saveCompanion(companion);
 
     return {
-      content: [{ type: "text", text: `Personality updated for ${companion.name}.` }],
+      content: [
+        { type: "text", text: `Personality updated for ${companion.name}.` },
+      ],
     };
   },
 );
@@ -245,6 +298,7 @@ server.tool(
       "  /buddy style      Show or set bubble style (tmux only)",
       "  /buddy position   Show or set bubble position (tmux only)",
       "  /buddy rarity     Show or hide rarity stars (tmux only)",
+      "  /buddy statusline Enable or disable buddy in the status line",
       "",
       "CLI:",
       "  bun run help            Show full CLI help",
@@ -273,12 +327,22 @@ server.tool(
     if (cooldown === undefined) {
       const cfg = loadConfig();
       return {
-        content: [{ type: "text", text: `Comment cooldown: ${cfg.commentCooldown}s between displayed comments.\nUse /buddy frequency <seconds> to change.` }],
+        content: [
+          {
+            type: "text",
+            text: `Comment cooldown: ${cfg.commentCooldown}s between displayed comments.\nUse /buddy frequency <seconds> to change.`,
+          },
+        ],
       };
     }
     const cfg = saveConfig({ commentCooldown: cooldown });
     return {
-      content: [{ type: "text", text: `Updated: ${cfg.commentCooldown}s cooldown between displayed comments.` }],
+      content: [
+        {
+          type: "text",
+          text: `Updated: ${cfg.commentCooldown}s cooldown between displayed comments.`,
+        },
+      ],
     };
   },
 );
@@ -287,15 +351,37 @@ server.tool(
   "buddy_style",
   "Configure the popup appearance. Returns current settings if called without arguments.",
   {
-    style: z.enum(["classic", "round"]).optional().describe("Bubble border style: classic (pipes/dashes like status line) or round (parens/tildes)"),
-    position: z.enum(["top", "left"]).optional().describe("Bubble position relative to buddy: top (above) or left (beside)"),
-    showRarity: z.boolean().optional().describe("Show or hide the stars + rarity line in the popup"),
+    style: z
+      .enum(["classic", "round"])
+      .optional()
+      .describe(
+        "Bubble border style: classic (pipes/dashes like status line) or round (parens/tildes)",
+      ),
+    position: z
+      .enum(["top", "left"])
+      .optional()
+      .describe(
+        "Bubble position relative to buddy: top (above) or left (beside)",
+      ),
+    showRarity: z
+      .boolean()
+      .optional()
+      .describe("Show or hide the stars + rarity line in the popup"),
   },
   async ({ style, position, showRarity }) => {
-    if (style === undefined && position === undefined && showRarity === undefined) {
+    if (
+      style === undefined &&
+      position === undefined &&
+      showRarity === undefined
+    ) {
       const cfg = loadConfig();
       return {
-        content: [{ type: "text", text: `Bubble style: ${cfg.bubbleStyle}\nBubble position: ${cfg.bubblePosition}\nShow rarity: ${cfg.showRarity}\nUse /buddy style <classic|round>, /buddy position <top|left>, /buddy rarity <on|off> to change.` }],
+        content: [
+          {
+            type: "text",
+            text: `Bubble style: ${cfg.bubbleStyle}\nBubble position: ${cfg.bubblePosition}\nShow rarity: ${cfg.showRarity}\nUse /buddy style <classic|round>, /buddy position <top|left>, /buddy rarity <on|off> to change.`,
+          },
+        ],
       };
     }
     const updates: Record<string, string | boolean> = {};
@@ -304,7 +390,12 @@ server.tool(
     if (showRarity !== undefined) updates.showRarity = showRarity;
     const cfg = saveConfig(updates);
     return {
-      content: [{ type: "text", text: `Updated: style=${cfg.bubbleStyle}, position=${cfg.bubblePosition}, showRarity=${cfg.showRarity}\nRestart Claude Code for changes to take effect.` }],
+      content: [
+        {
+          type: "text",
+          text: `Updated: style=${cfg.bubbleStyle}, position=${cfg.bubblePosition}, showRarity=${cfg.showRarity}\nRestart Claude Code for changes to take effect.`,
+        },
+      ],
     };
   },
 );
@@ -316,19 +407,75 @@ server.tool(
   async () => {
     const companion = ensureCompanion();
     writeStatusState(companion, "", true);
-    return { content: [{ type: "text", text: `${companion.name} goes quiet. /buddy on to unmute.` }] };
+    return {
+      content: [
+        {
+          type: "text",
+          text: `${companion.name} goes quiet. /buddy on to unmute.`,
+        },
+      ],
+    };
   },
 );
 
+server.tool("buddy_unmute", "Unmute buddy reactions", {}, async () => {
+  const companion = ensureCompanion();
+  writeStatusState(companion, "*stretches* I'm back!", false);
+  saveReaction("*stretches* I'm back!", "pet");
+  return { content: [{ type: "text", text: `${companion.name} is back!` }] };
+});
+
+// ─── Tool: buddy_statusline ─────────────────────────────────────────────────
+
 server.tool(
-  "buddy_unmute",
-  "Unmute buddy reactions",
-  {},
-  async () => {
-    const companion = ensureCompanion();
-    writeStatusState(companion, "*stretches* I'm back!", false);
-    saveReaction("*stretches* I'm back!", "pet");
-    return { content: [{ type: "text", text: `${companion.name} is back!` }] };
+  "buddy_statusline",
+  "Enable or disable the buddy status line. When enabled, configures Claude Code's status line to show your buddy with animation and reactions. When disabled, the status line is released for other use. Returns current status if called without arguments.",
+  {
+    enabled: z
+      .boolean()
+      .optional()
+      .describe(
+        "true to enable, false to disable. Omit to show current status.",
+      ),
+  },
+  async ({ enabled }) => {
+    if (enabled === undefined) {
+      const cfg = loadConfig();
+      const state = cfg.statusLineEnabled ? "enabled" : "disabled";
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Status line: ${state}\nUse /buddy statusline on or /buddy statusline off to change.\nRestart Claude Code after enabling for it to take effect.`,
+          },
+        ],
+      };
+    }
+    saveConfig({ statusLineEnabled: enabled });
+
+    if (enabled) {
+      const pluginRoot = resolve(dirname(import.meta.dir));
+      const statusScript = join(pluginRoot, "statusline", "buddy-status.sh");
+      setBuddyStatusLine(statusScript);
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Status line enabled! Restart Claude Code to see your buddy in the status line.",
+          },
+        ],
+      };
+    } else {
+      unsetBuddyStatusLine();
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Status line disabled. Restart Claude Code to apply.",
+          },
+        ],
+      };
+    }
   },
 );
 
@@ -338,9 +485,14 @@ server.tool(
   "buddy_summon",
   "Summon a buddy by slot name. Loads a saved buddy if the slot exists; generates a new deterministic buddy for unknown slot names. Omit slot to pick randomly from all saved buddies. Your current buddy is NOT destroyed — they stay saved in their slot.",
   {
-    slot: z.string().min(1).max(14).optional().describe(
-      "Slot name to summon (e.g. 'fafnir', 'dragon-2'). Omit to pick a random saved buddy.",
-    ),
+    slot: z
+      .string()
+      .min(1)
+      .max(14)
+      .optional()
+      .describe(
+        "Slot name to summon (e.g. 'fafnir', 'dragon-2'). Omit to pick a random saved buddy.",
+      ),
   },
   async ({ slot }) => {
     const userId = resolveUserId();
@@ -352,7 +504,12 @@ server.tool(
       const saved = listCompanionSlots();
       if (saved.length === 0) {
         return {
-          content: [{ type: "text", text: "Your menagerie is empty. Use buddy_summon with a slot name to add one." }],
+          content: [
+            {
+              type: "text",
+              text: "Your menagerie is empty. Use buddy_summon with a slot name to add one.",
+            },
+          ],
         };
       }
       targetSlot = saved[Math.floor(Math.random() * saved.length)].slot;
@@ -364,7 +521,12 @@ server.tool(
     const companion = loadCompanionSlot(targetSlot);
     if (!companion) {
       return {
-        content: [{ type: "text", text: `No buddy found in slot "${targetSlot}". Use /buddy list to see saved buddies.` }],
+        content: [
+          {
+            type: "text",
+            text: `No buddy found in slot "${targetSlot}". Use /buddy list to see saved buddies.`,
+          },
+        ],
       };
     }
 
@@ -388,9 +550,14 @@ server.tool(
   "buddy_save",
   "Save the current buddy to a named slot. Useful for bookmarking before trying a new buddy.",
   {
-    slot: z.string().min(1).max(14).optional().describe(
-      "Slot name (defaults to the buddy's current name, slugified). Overwrites existing slot with same name.",
-    ),
+    slot: z
+      .string()
+      .min(1)
+      .max(14)
+      .optional()
+      .describe(
+        "Slot name (defaults to the buddy's current name, slugified). Overwrites existing slot with same name.",
+      ),
   },
   async ({ slot }) => {
     const companion = ensureCompanion();
@@ -398,7 +565,12 @@ server.tool(
     saveCompanionSlot(companion, targetSlot);
     saveActiveSlot(targetSlot);
     return {
-      content: [{ type: "text", text: `${companion.name} saved to slot "${targetSlot}".` }],
+      content: [
+        {
+          type: "text",
+          text: `${companion.name} saved to slot "${targetSlot}".`,
+        },
+      ],
     };
   },
 );
@@ -414,7 +586,14 @@ server.tool(
     const activeSlot = loadActiveSlot();
 
     if (saved.length === 0) {
-      return { content: [{ type: "text", text: "Your menagerie is empty. Use buddy_summon <slot> to add one." }] };
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Your menagerie is empty. Use buddy_summon <slot> to add one.",
+          },
+        ],
+      };
     }
 
     const lines = saved.map(({ slot, companion }) => {
@@ -442,20 +621,32 @@ server.tool(
 
     if (targetSlot === activeSlot) {
       return {
-        content: [{ type: "text", text: `Cannot dismiss the active buddy. Use buddy_summon to switch first, then buddy_dismiss "${targetSlot}".` }],
+        content: [
+          {
+            type: "text",
+            text: `Cannot dismiss the active buddy. Use buddy_summon to switch first, then buddy_dismiss "${targetSlot}".`,
+          },
+        ],
       };
     }
 
     const companion = loadCompanionSlot(targetSlot);
     if (!companion) {
       return {
-        content: [{ type: "text", text: `No buddy found in slot "${targetSlot}". Use buddy_list to see saved buddies.` }],
+        content: [
+          {
+            type: "text",
+            text: `No buddy found in slot "${targetSlot}". Use buddy_list to see saved buddies.`,
+          },
+        ],
       };
     }
 
     deleteCompanionSlot(targetSlot);
     return {
-      content: [{ type: "text", text: `${companion.name} [${targetSlot}] dismissed.` }],
+      content: [
+        { type: "text", text: `${companion.name} [${targetSlot}] dismissed.` },
+      ],
     };
   },
 );
@@ -469,11 +660,13 @@ server.resource(
   async () => {
     const companion = ensureCompanion();
     return {
-      contents: [{
-        uri: "buddy://companion",
-        mimeType: "application/json",
-        text: JSON.stringify(companion, null, 2),
-      }],
+      contents: [
+        {
+          uri: "buddy://companion",
+          mimeType: "application/json",
+          text: JSON.stringify(companion, null, 2),
+        },
+      ],
     };
   },
 );
@@ -522,11 +715,13 @@ server.resource(
     ].join("\n");
 
     return {
-      contents: [{
-        uri: "buddy://prompt",
-        mimeType: "text/plain",
-        text: prompt,
-      }],
+      contents: [
+        {
+          uri: "buddy://prompt",
+          mimeType: "text/plain",
+          text: prompt,
+        },
+      ],
     };
   },
 );
