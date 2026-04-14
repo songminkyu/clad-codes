@@ -11,6 +11,7 @@ import { join, resolve, dirname } from "path";
 import { homedir } from "os";
 
 import { generateBones, renderBuddy, renderFace, RARITY_STARS } from "../server/engine.ts";
+import { toUnixPath } from "../server/path.ts";
 import { loadCompanion, saveCompanion, resolveUserId, writeStatusState } from "../server/state.ts";
 import { generateFallbackName } from "../server/reactions.ts";
 
@@ -65,7 +66,7 @@ function preflight(): boolean {
       execSync("sudo apt-get install -y jq 2>/dev/null || brew install jq 2>/dev/null", { stdio: "ignore" });
       ok("jq installed");
     } catch {
-      err("Could not install jq. Install manually: apt install jq / brew install jq");
+      err("Could not install jq. Install manually: apt install jq / brew install jq / windows: install from https://github.com/jqlang/jq/releases/latest and add to PATH");
       pass = false;
     }
   }
@@ -120,8 +121,8 @@ function installMcp() {
 
   claudeJson.mcpServers["claude-buddy"] = {
     command: "bun",
-    args: [serverPath],
-    cwd: PROJECT_ROOT,
+    args: [toUnixPath(serverPath)],
+    cwd: toUnixPath(PROJECT_ROOT),
   };
 
   writeFileSync(claudeJsonPath, JSON.stringify(claudeJson, null, 2));
@@ -144,7 +145,7 @@ function installStatusLine(settings: Record<string, any>) {
 
   settings.statusLine = {
     type: "command",
-    command: statusScript,
+    command: toUnixPath(statusScript),
     padding: 1,
     refreshInterval: 1,  // 1 second — drives the buddy animation
   };
@@ -152,45 +153,23 @@ function installStatusLine(settings: Record<string, any>) {
   ok("Status line configured (with animation refresh)");
 }
 
-// ─── Step 3b: Configure tmux popup mode (if in tmux) ────────────────────────
+// The tmux popup mode was removed in favour of the status line / buddy-shell
+// — its modal `tmux display-popup` intercepted the `Ctrl+b` prefix, breaking
+// every tmux binding while the buddy was visible (issue #57). For backwards
+// compatibility any legacy SessionStart/SessionEnd hooks that reference the
+// popup manager are stripped out below when re-installing.
 
-function detectTmux(): boolean {
-  if (!process.env.TMUX) return false;
-  try {
-    const ver = execSync("tmux -V 2>/dev/null", { encoding: "utf8" }).trim();
-    const match = ver.match(/(\d+)\.(\d+)/);
-    if (!match) return false;
-    const major = parseInt(match[1]), minor = parseInt(match[2]);
-    return major > 3 || (major === 3 && minor >= 2);
-  } catch {
-    return false;
+function stripLegacyPopupHooks(settings: Record<string, any>) {
+  if (!settings.hooks) return;
+  for (const hookType of ["SessionStart", "SessionEnd"] as const) {
+    if (!settings.hooks[hookType]) continue;
+    settings.hooks[hookType] = settings.hooks[hookType].filter(
+      (h: any) => !h.hooks?.some((hh: any) =>
+        hh.command?.includes("popup-manager") || hh.command?.includes("claude-buddy/popup"),
+      ),
+    );
+    if (settings.hooks[hookType].length === 0) delete settings.hooks[hookType];
   }
-}
-
-function installPopupHooks(settings: Record<string, any>) {
-  const popupManager = join(PROJECT_ROOT, "popup", "popup-manager.sh");
-
-  if (!settings.hooks) settings.hooks = {};
-
-  // SessionStart: open popup
-  if (!settings.hooks.SessionStart) settings.hooks.SessionStart = [];
-  settings.hooks.SessionStart = settings.hooks.SessionStart.filter(
-    (h: any) => !h.hooks?.some((hh: any) => hh.command?.includes("claude-buddy")),
-  );
-  settings.hooks.SessionStart.push({
-    hooks: [{ type: "command", command: `${popupManager} start` }],
-  });
-
-  // SessionEnd: close popup
-  if (!settings.hooks.SessionEnd) settings.hooks.SessionEnd = [];
-  settings.hooks.SessionEnd = settings.hooks.SessionEnd.filter(
-    (h: any) => !h.hooks?.some((hh: any) => hh.command?.includes("claude-buddy")),
-  );
-  settings.hooks.SessionEnd.push({
-    hooks: [{ type: "command", command: `${popupManager} stop` }],
-  });
-
-  ok("Popup hooks registered: SessionStart + SessionEnd");
 }
 
 // ─── Step 4: Register hooks ─────────────────────────────────────────────────
@@ -209,7 +188,7 @@ function installHooks(settings: Record<string, any>) {
   );
   settings.hooks.PostToolUse.push({
     matcher: "Bash",
-    hooks: [{ type: "command", command: reactHook }],
+    hooks: [{ type: "command", command: toUnixPath(reactHook) }],
   });
 
   // Stop: extract <!-- buddy: --> comment from Claude's response
@@ -218,7 +197,7 @@ function installHooks(settings: Record<string, any>) {
     (h: any) => !h.hooks?.some((hh: any) => hh.command?.includes("claude-buddy")),
   );
   settings.hooks.Stop.push({
-    hooks: [{ type: "command", command: commentHook }],
+    hooks: [{ type: "command", command: toUnixPath(commentHook) }],
   });
 
   // UserPromptSubmit: detect buddy's name in user message → instant status line reaction
@@ -227,7 +206,7 @@ function installHooks(settings: Record<string, any>) {
     (h: any) => !h.hooks?.some((hh: any) => hh.command?.includes("claude-buddy")),
   );
   settings.hooks.UserPromptSubmit.push({
-    hooks: [{ type: "command", command: nameHook }],
+    hooks: [{ type: "command", command: toUnixPath(nameHook) }],
   });
 
   ok("Hooks registered: PostToolUse + Stop + UserPromptSubmit");
@@ -294,18 +273,8 @@ const settings = loadSettings();
 installMcp();
 installSkill();
 
-const useTmuxPopup = detectTmux();
-if (useTmuxPopup) {
-  info("tmux detected (>= 3.2) -- using popup overlay mode");
-  installPopupHooks(settings);
-  // Disable status line to avoid duplicate buddy rendering
-  if (settings.statusLine?.command?.includes("buddy")) {
-    delete settings.statusLine;
-    ok("Status line disabled (popup replaces it)");
-  }
-} else {
-  installStatusLine(settings);
-}
+stripLegacyPopupHooks(settings);
+installStatusLine(settings);
 
 installHooks(settings);
 ensurePermissions(settings);
@@ -320,10 +289,9 @@ console.log("");
 console.log(`  ${BOLD}${companion.name}${NC} -- ${companion.personality}`);
 console.log("");
 
-const modeMsg = useTmuxPopup ? "popup overlay" : "status line";
 console.log(`${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}`);
 console.log(`${GREEN}  Done! Restart Claude Code and type /buddy${NC}`);
-console.log(`${GREEN}  Display mode: ${modeMsg}${NC}`);
+console.log(`${GREEN}  Display mode: status line${NC}`);
 console.log(`${GREEN}  Your companion is now permanent -- survives any update.${NC}`);
 console.log(`${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}`);
 console.log("");

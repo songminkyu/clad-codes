@@ -72,6 +72,12 @@
 <!-- QUICK START                                                  -->
 <!-- ============================================================ -->
 
+## 📋 Requirements
+
+- **[bun](https://bun.sh/install)** on `PATH` — claude-buddy's MCP server runs on bun. Install once: `curl -fsSL https://bun.sh/install | bash`
+- **Claude Code v2.1.80+**
+- **Linux or macOS** (Windows is experimental)
+
 ## 🚀 Quick Start
 
 ```bash
@@ -83,8 +89,6 @@ bun run install-buddy
 
 Then restart Claude Code and type `/buddy`. That's it.
 
-<sub>💡 Need Bun? → `curl -fsSL https://bun.sh/install | bash`</sub>
-<br>
 <sub>💡 Want a global `claude-buddy` command? → `bun link`</sub>
 <br>
 <sub>💡 Need help? → `bun run help` or `claude-buddy help` (if linked) in terminal · `/buddy help` in Claude Code</sub>
@@ -340,41 +344,6 @@ bun run cli/uninstall.ts    # full clean removal
 ---
 
 <details>
-<summary><b>🖥️ &nbsp; tmux Popup Mode</b></summary>
-
-<br>
-
-Inside tmux, buddy appears as a floating popup overlay in the bottom-right corner instead of the status line.
-
-**Features:** animated ASCII art with speech bubbles · ESC passthrough · dynamic resizing · full keyboard forwarding
-
-| tmux version | Support |
-|---|---|
-| **3.4+** | Full support (borderless) |
-| **3.2 – 3.3** | Supported with border |
-| **< 3.2** | Falls back to status line |
-
-### Recommended `~/.tmux.conf`
-
-```
-set -g set-titles on
-set -g set-titles-string "#{pane_title}"
-set -g mouse on
-set -g history-limit 10000
-```
-
-### Scrolling
-
-The popup is modal. To scroll:
-1. Press **F12** → scroll mode (popup hides, copy-mode activates)
-2. Scroll with **mouse wheel** or **arrows**
-3. Press **q** → exit scroll mode
-
-</details>
-
----
-
-<details>
 <summary><b>📋 &nbsp; Requirements</b></summary>
 
 <br>
@@ -383,7 +352,7 @@ The popup is modal. To scroll:
 |---|---|
 | **[Bun](https://bun.sh)** | `curl -fsSL https://bun.sh/install \| bash` |
 | **Claude Code** v2.1.80+ | Any version with MCP support |
-| **jq** | `apt install jq` / `brew install jq` |
+| **jq** | `apt install jq` / `brew install jq` / [`windows: download and add 'jq.exe' from jqlang/jq to path`](https://github.com/jqlang/jq/releases/latest)|
 
 > **Will I get the same buddy I had?** Yes. claude-buddy uses the exact same algorithm as the original (`wyhash + mulberry32`, same salt, same identity resolution). If your `~/.claude.json` still has your `accountUuid`, you'll get the identical species, rarity, stats, and cosmetics.
 
@@ -395,13 +364,12 @@ The popup is modal. To scroll:
 
 ## 🗺️ Roadmap
 
-- [x] **Multi-buddy support** — menagerie system with named slots, interactive TUI picker
-- [x] **tmux popup mode** — floating overlay via `tmux display-popup`
+- [x] **Multi-buddy support** — menagerie system with named slots, interactive TUI picker 💜[@doctor-ew](https://github.com/doctor-ew)💜
 - [ ] **Leveling system** — XP from coding sessions, unlockable reactions and upgrades
 - [ ] **Buddy pair-programming** — active help during sessions, pattern detection
 - [ ] **Cross-session memory** — remembers past projects and earlier conversations
 - [ ] **Mood system** — shifts based on code quality, tests, time of day
-- [ ] **Achievement badges** — "1000 lines reviewed", "week streak", etc.
+- [x] **Achievement badges** — "1000 lines reviewed", "week streak", etc. 💜[ndcorder](https://github.com/ndcorder)💜
 - [ ] **Light theme colors** — auto-detect and match light theme RGB
 - [ ] **New species + community art** — submit your own designs
 - [ ] **`npx claude-buddy`** — one-command install without cloning

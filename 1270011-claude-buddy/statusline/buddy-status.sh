@@ -8,6 +8,10 @@
 #   - refreshInterval: 1s in settings.json cycles the animation
 #
 # Uses Braille Blank (U+2800) for padding — survives JS .trim()
+#
+# When running inside buddy-shell (the PTY wrapper), skip status line rendering
+# so the buddy doesn't show up twice (once in status line, once in wrapper panel).
+[ "$BUDDY_SHELL" = "1" ] && exit 0
 
 STATE="$HOME/.claude-buddy/status.json"
 # Session ID: sanitized tmux pane number, or "default" outside tmux
@@ -26,6 +30,7 @@ SPECIES=$(jq -r '.species // ""' "$STATE" 2>/dev/null)
 HAT=$(jq -r '.hat // "none"' "$STATE" 2>/dev/null)
 RARITY=$(jq -r '.rarity // "common"' "$STATE" 2>/dev/null)
 REACTION=$(jq -r '.reaction // ""' "$STATE" 2>/dev/null)
+ACHIEVEMENT=$(jq -r '.achievement // ""' "$STATE" 2>/dev/null)
 # eye is written to status.json by writeStatusState (v2+); fall back to "°"
 E=$(jq -r '.eye // "°"' "$STATE" 2>/dev/null)
 
@@ -211,6 +216,9 @@ esac
 
 # ─── Reaction bubble (with TTL check) ────────────────────────────────────────
 BUBBLE=""
+if [ -n "$ACHIEVEMENT" ] && [ "$ACHIEVEMENT" != "null" ] && [ "$ACHIEVEMENT" != "" ]; then
+    BUBBLE=$'\xf0\x9f\x8f\x86'" $ACHIEVEMENT"
+fi
 REACTION_FILE="$HOME/.claude-buddy/reaction.$SID.json"
 REACTION_TTL=0
 CONFIG_FILE="$HOME/.claude-buddy/config.json"
@@ -230,7 +238,13 @@ if [ -n "$REACTION" ] && [ "$REACTION" != "null" ] && [ "$REACTION" != "" ]; the
             [ "$AGE" -lt "$REACTION_TTL" ] && FRESH=1
         fi
     fi
-    [ "$FRESH" -eq 1 ] && BUBBLE="\"${REACTION}\""
+    if [ "$FRESH" -eq 1 ]; then
+        if [ -n "$BUBBLE" ]; then
+            BUBBLE="$BUBBLE | \"${REACTION}\""
+        else
+            BUBBLE="\"${REACTION}\""
+        fi
+    fi
 fi
 
 # ─── Build art lines ─────────────────────────────────────────────────────────
