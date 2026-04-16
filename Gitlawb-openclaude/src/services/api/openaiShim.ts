@@ -47,6 +47,7 @@ import {
   type AnthropicUsage,
   type ShimCreateParams,
 } from './codexShim.js'
+import { fetchWithProxyRetry } from './fetchWithProxyRetry.js'
 import {
   isLocalProviderUrl,
   resolveRuntimeCodexCredentials,
@@ -1360,8 +1361,12 @@ class OpenAIShimMessages {
       ...filterAnthropicHeaders(options?.headers),
     }
 
-    const isGemini = isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI)
-    const apiKey = this.providerOverride?.apiKey ?? process.env.OPENAI_API_KEY ?? ''
+    const isGemini = isGeminiMode()
+    const isMiniMax = !!process.env.MINIMAX_API_KEY
+    const apiKey =
+      this.providerOverride?.apiKey ??
+      process.env.OPENAI_API_KEY ??
+      (isMiniMax ? process.env.MINIMAX_API_KEY : '')
     // Detect Azure endpoints by hostname (not raw URL) to prevent bypass via
     // path segments like https://evil.com/cognitiveservices.azure.com/
     let isAzure = false
@@ -1427,7 +1432,7 @@ class OpenAIShimMessages {
     const maxAttempts = isGithub ? GITHUB_429_MAX_RETRIES : 1
     let response: Response | undefined
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      response = await fetch(chatCompletionsUrl, fetchInit)
+      response = await fetchWithProxyRetry(chatCompletionsUrl, fetchInit)
       if (response.ok) {
         return response
       }
@@ -1500,7 +1505,7 @@ class OpenAIShimMessages {
             }
           }
 
-          const responsesResponse = await fetch(responsesUrl, {
+          const responsesResponse = await fetchWithProxyRetry(responsesUrl, {
             method: 'POST',
             headers,
             body: JSON.stringify(responsesBody),

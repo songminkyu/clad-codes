@@ -15,6 +15,10 @@ OpenClaude is also mirrored to GitLawb:
 
 [Quick Start](#quick-start) | [Setup Guides](#setup-guides) | [Providers](#supported-providers) | [Source Build](#source-build-and-local-development) | [VS Code Extension](#vs-code-extension) | [Community](#community)
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/chart?repos=gitlawb/openclaude&type=date&legend=top-left)](https://www.star-history.com/?repos=gitlawb%2Fopenclaude&type=date&legend=top-left)
+
 ## Why OpenClaude
 
 - Use one CLI across cloud APIs and local model backends
@@ -88,6 +92,16 @@ $env:OPENAI_MODEL="qwen2.5-coder:7b"
 openclaude
 ```
 
+### Using Ollama's launch command
+
+If you have [Ollama](https://ollama.com) installed, you can skip the env var setup entirely:
+
+```bash
+ollama launch openclaude --model qwen2.5-coder:7b
+```
+
+This automatically sets `ANTHROPIC_BASE_URL`, model routing, and auth so all API traffic goes through your local Ollama instance. Works with any model you have pulled — local or cloud.
+
 ## Setup Guides
 
 Beginner-friendly guides:
@@ -110,7 +124,7 @@ Advanced and source-build guides:
 | GitHub Models | `/onboard-github` | Interactive onboarding with saved credentials |
 | Codex OAuth | `/provider` | Opens ChatGPT sign-in in your browser and stores Codex credentials securely |
 | Codex | `/provider` | Uses existing Codex CLI auth, OpenClaude secure storage, or env credentials |
-| Ollama | `/provider` or env vars | Local inference with no API key |
+| Ollama | `/provider`, env vars, or `ollama launch` | Local inference with no API key |
 | Atomic Chat | advanced setup | Local Apple Silicon backend |
 | Bedrock / Vertex / Foundry | env vars | Additional provider integrations for supported environments |
 
