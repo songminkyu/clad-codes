@@ -197,6 +197,10 @@ export function getLocalOpenAICompatibleProviderLabel(baseUrl?: string): string 
     if (host.includes('minimax') || haystack.includes('minimax')) {
       return 'MiniMax'
     }
+    // Moonshot AI (Kimi) direct API
+    if (host.includes('moonshot') || haystack.includes('moonshot') || haystack.includes('kimi')) {
+      return 'Moonshot (Kimi)'
+    }
   } catch {
     // Fall back to the generic label when the base URL is malformed.
   }
@@ -296,6 +300,24 @@ export async function listAtomicChatModels(
   } finally {
     clear()
   }
+}
+
+export type AtomicChatReadiness =
+  | { state: 'unreachable' }
+  | { state: 'no_models' }
+  | { state: 'ready'; models: string[] }
+
+export async function probeAtomicChatReadiness(options?: {
+  baseUrl?: string
+}): Promise<AtomicChatReadiness> {
+  if (!(await hasLocalAtomicChat(options?.baseUrl))) {
+    return { state: 'unreachable' }
+  }
+  const models = await listAtomicChatModels(options?.baseUrl)
+  if (models.length === 0) {
+    return { state: 'no_models' }
+  }
+  return { state: 'ready', models }
 }
 
 export async function benchmarkOllamaModel(
