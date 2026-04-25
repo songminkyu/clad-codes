@@ -197,9 +197,21 @@ export function getLocalOpenAICompatibleProviderLabel(baseUrl?: string): string 
     if (host.includes('minimax') || haystack.includes('minimax')) {
       return 'MiniMax'
     }
-    // Moonshot AI (Kimi) direct API
-    if (host.includes('moonshot') || haystack.includes('moonshot') || haystack.includes('kimi')) {
-      return 'Moonshot (Kimi)'
+    // Kimi Code subscription API
+    if (hostname === 'api.kimi.com' && path.includes('/coding')) {
+      return 'Moonshot AI - Kimi Code'
+    }
+    // Check for Bankr LLM gateway
+    if (host.includes('bankr') || haystack.includes('bankr')) {
+      return 'Bankr'
+    }
+    // Moonshot AI direct API
+    if (
+      host.includes('moonshot') ||
+      haystack.includes('moonshot') ||
+      haystack.includes('kimi')
+    ) {
+      return 'Moonshot AI - API'
     }
   } catch {
     // Fall back to the generic label when the base URL is malformed.
@@ -226,14 +238,16 @@ export async function listOpenAICompatibleModels(options?: {
 }): Promise<string[] | null> {
   const { signal, clear } = withTimeoutSignal(5000)
   try {
+    const baseUrl = getOpenAICompatibleModelsBaseUrl(options?.baseUrl)
+    const isBankr = baseUrl.toLowerCase().includes('bankr')
     const response = await fetch(
-      `${getOpenAICompatibleModelsBaseUrl(options?.baseUrl)}/models`,
+      `${baseUrl}/models`,
       {
         method: 'GET',
         headers: options?.apiKey
-          ? {
-              Authorization: `Bearer ${options.apiKey}`,
-            }
+          ? isBankr
+            ? { 'X-API-Key': options.apiKey }
+            : { Authorization: `Bearer ${options.apiKey}` }
           : undefined,
         signal,
       },

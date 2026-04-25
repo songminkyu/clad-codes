@@ -46,6 +46,7 @@ import {
   rankOllamaModels,
   recommendOllamaModel,
 } from '../utils/providerRecommendation.js'
+import { clearStartupProviderOverrides } from '../utils/providerStartupOverrides.js'
 import { redactUrlForDisplay } from '../utils/urlRedaction.js'
 import { updateSettingsForSource } from '../utils/settings/settings.js'
 import {
@@ -124,8 +125,8 @@ const FORM_STEPS: Array<{
   {
     key: 'model',
     label: 'Default model',
-    placeholder: 'e.g. llama3.1:8b or glm-4.7, glm-4.7-flash',
-    helpText: 'Model name(s) to use. Separate multiple with commas; first is default.',
+    placeholder: 'e.g. llama3.1:8b or glm-4.7; glm-4.7-flash',
+    helpText: 'Model name(s) to use. Separate multiple with ";" or ","; first is default.',
   },
   {
     key: 'apiKey',
@@ -671,17 +672,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
   }
 
   function clearStartupProviderOverrideFromUserSettings(): string | null {
-    const { error } = updateSettingsForSource('userSettings', {
-      env: {
-        CLAUDE_CODE_USE_OPENAI: undefined as any,
-        CLAUDE_CODE_USE_GEMINI: undefined as any,
-        CLAUDE_CODE_USE_GITHUB: undefined as any,
-        CLAUDE_CODE_USE_BEDROCK: undefined as any,
-        CLAUDE_CODE_USE_VERTEX: undefined as any,
-        CLAUDE_CODE_USE_FOUNDRY: undefined as any,
-      },
-    })
-    return error ? error.message : null
+    return clearStartupProviderOverrides()
   }
 
   function buildCodexOAuthActivationMessage(options: {
@@ -789,19 +780,14 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
       // Update the session model to the new provider's first model.
       // persistActiveProviderProfileModel (called by onChangeAppState) will
       // not overwrite the multi-model list because it checks if the model
-      // is already in the profile's comma-separated model list.
+      // is already in the provider's configured model list.
       const newModel = getPrimaryModel(active.model)
       setAppState(prev => ({
         ...prev,
         mainLoopModel: newModel,
-      }))
-
-      providerLabel = active.name
-      setAppState(prev => ({
-        ...prev,
-        mainLoopModel: active.model,
         mainLoopModelForSession: null,
       }))
+      providerLabel = active.name
       const settingsOverrideError =
         clearStartupProviderOverrideFromUserSettings()
       const isActiveCodexOAuth = isCodexOAuthProfile(
@@ -1005,7 +991,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     if (isActiveSavedProfile) {
       setAppState(prev => ({
         ...prev,
-        mainLoopModel: saved.model,
+        mainLoopModel: getPrimaryModel(saved.model),
         mainLoopModelForSession: null,
       }))
     }
@@ -1279,6 +1265,11 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
         label: 'Azure OpenAI',
         description: 'Azure OpenAI endpoint (model=deployment name)',
       },
+      {
+        value: 'bankr',
+        label: 'Bankr',
+        description: 'Bankr LLM Gateway (OpenAI-compatible)',
+      },
       ...(canUseCodexOAuth
         ? [
             {
@@ -1321,8 +1312,13 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
       },
       {
         value: 'moonshotai',
-        label: 'Moonshot AI',
-        description: 'Kimi OpenAI-compatible endpoint',
+        label: 'Moonshot AI - API',
+        description: 'Moonshot AI - API endpoint',
+      },
+      {
+        value: 'kimi-code',
+        label: 'Moonshot AI - Kimi Code',
+        description: 'Moonshot AI - Kimi Code Subscription endpoint',
       },
       {
         value: 'nvidia-nim',
