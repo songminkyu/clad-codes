@@ -72,6 +72,7 @@ pub use types::{
     MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
 };
 pub use config::{AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
+pub use import_config::{ClaudeMdPreview, ImportExecutionResult, ImportPaths, ImportPreview, ImportSelection, PreviewAction, PreviewField, SettingsPreview, build_import_preview, execute_import, summarize_import_result};
 
 // Skill discovery: filesystem and git URL skill loading.
 pub mod skill_discovery;
@@ -1154,7 +1155,7 @@ pub mod config {
                 Some("google") => "gemini-2.5-flash",
                 Some("groq") => "llama-3.3-70b-versatile",
                 Some("cerebras") => "llama-3.3-70b",
-                Some("deepseek") => "deepseek-chat",
+                Some("deepseek") => "deepseek-v4-pro",
                 Some("mistral") => "mistral-large-latest",
                 Some("xai") => "grok-2",
                 Some("openrouter") => "anthropic/claude-sonnet-4",
@@ -3572,6 +3573,7 @@ pub mod feature_gates;
 pub mod tips;
 pub mod remote_settings;
 pub mod settings_sync;
+pub mod import_config;
 pub mod effort;
 pub mod prompt_history;
 pub mod bash_classifier;
