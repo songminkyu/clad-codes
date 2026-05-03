@@ -2064,6 +2064,21 @@ impl App {
             "voice" => {
                 let was_on = self.voice_recorder.is_some();
                 if was_on {
+                    // Stop any active recording before disabling.
+                    if self.voice_recording {
+                        self.voice_recording = false;
+                        self.voice_event_rx = None;
+                        if let Some(ref recorder_arc) = self.voice_recorder {
+                            let recorder = recorder_arc.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Ok(mut r) = recorder.lock() {
+                                    tokio::runtime::Handle::current()
+                                        .block_on(r.stop_recording())
+                                        .ok();
+                                }
+                            });
+                        }
+                    }
                     self.voice_recorder = None;
                     self.voice_mode_notice.dismiss();
                     self.status_message = Some("Voice mode disabled.".to_string());
@@ -2074,7 +2089,9 @@ impl App {
                     }
                     self.voice_recorder = Some(recorder);
                     self.voice_mode_notice = crate::voice_mode_notice::VoiceModeNoticeState::new();
-                    self.status_message = Some("Voice mode enabled. Press Alt+V to record.".to_string());
+                    self.status_message = Some(
+                        "Voice mode enabled. Press Alt+V to start recording.".to_string(),
+                    );
                 }
                 true
             }
@@ -3362,6 +3379,24 @@ impl App {
             return false;
         }
 
+        // Cancel an active voice recording with Esc.
+        if key.code == KeyCode::Esc && self.voice_recording {
+            self.voice_recording = false;
+            self.voice_event_rx = None;
+            if let Some(ref recorder_arc) = self.voice_recorder {
+                let recorder = recorder_arc.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(mut r) = recorder.lock() {
+                        tokio::runtime::Handle::current()
+                            .block_on(r.stop_recording())
+                            .ok();
+                    }
+                });
+            }
+            self.status_message = Some("Recording cancelled.".to_string());
+            return false;
+        }
+
         // Desktop upsell startup dialog
         if self.desktop_upsell.visible {
             match key.code {
@@ -3489,7 +3524,7 @@ impl App {
                 }
                 self.notifications.push(
                     NotificationKind::Info,
-                    "Recording\u{2026} (press Alt+V again to transcribe)".to_string(),
+                    "Recording\u{2026} (Alt+V to transcribe · Esc to cancel)".to_string(),
                     None,
                 );
             } else {
@@ -5034,6 +5069,17 @@ impl App {
                     && mouse_event.column >= selectable_area.x
                     && mouse_event.column < selectable_area.x.saturating_add(selectable_area.width);
 
+                // Check for click on a thinking block header (takes priority over text selection).
+                if let Some(&hash) = self.thinking_row_map.borrow().get(&mouse_event.row) {
+                    if self.thinking_expanded.contains(&hash) {
+                        self.thinking_expanded.remove(&hash);
+                    } else {
+                        self.thinking_expanded.insert(hash);
+                    }
+                    self.invalidate_transcript();
+                    return;
+                }
+
                 if in_input {
                     self.focus = FocusTarget::Input;
                     self.clear_selection();
@@ -5388,7 +5434,7 @@ impl App {
                         VoiceEvent::RecordingStarted => {
                             self.voice_recording = true;
                             self.status_message =
-                                Some("Recording\u{2026} press V again or Enter to stop".to_string());
+                                Some("Recording\u{2026} (Alt+V or Esc to stop)".to_string());
                         }
                         VoiceEvent::RecordingStopped => {
                             self.voice_recording = false;
