@@ -1,5 +1,5 @@
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
 import {
   DEFAULT_CODEX_BASE_URL,
   DEFAULT_OPENAI_BASE_URL,
@@ -18,9 +18,11 @@ import { readGeminiAccessToken } from './geminiCredentials.js'
 import { getOllamaChatBaseUrl } from './providerDiscovery.js'
 import { getPrimaryModel } from './providerModels.js'
 import { getProviderValidationError } from './providerValidation.js'
+import { getErrnoCode } from './errors.js'
 import {
   getRouteDefaultBaseUrl,
   getRouteDefaultModel,
+  normalizeXiaomiMimoBaseUrl,
 } from '../integrations/routeMetadata.js'
 import {
   maskSecretForDisplay,
@@ -35,7 +37,7 @@ export {
   sanitizeApiKey,
   sanitizeProviderConfigValue,
 } from './providerSecrets.js'
-import { isEnvTruthy } from './envUtils.js'
+import { getClaudeConfigHomeDir, isEnvTruthy } from './envUtils.js'
 
 export const PROFILE_FILE_NAME = '.openclaude-profile.json'
 export const DEFAULT_GEMINI_BASE_URL =
@@ -89,6 +91,8 @@ const PROFILE_ENV_KEYS = [
   'BNKR_API_KEY',
   'BANKR_MODEL',
   'XAI_API_KEY',
+  'VENICE_API_KEY',
+  'MIMO_API_KEY',
 ] as const
 
 export type CompatibilityProfileMode =
@@ -111,6 +115,8 @@ const SECRET_ENV_KEYS = [
   'MISTRAL_API_KEY',
   'BNKR_API_KEY',
   'XAI_API_KEY',
+  'VENICE_API_KEY',
+  'MIMO_API_KEY',
 ] as const
 
 export type ProviderProfile =
@@ -165,6 +171,8 @@ export type ProfileEnv = {
   BNKR_API_KEY?: string
   BANKR_MODEL?: string
   XAI_API_KEY?: string
+  VENICE_API_KEY?: string
+  MIMO_API_KEY?: string
 }
 
 export type ProfileFile = {
@@ -184,14 +192,25 @@ type SecretValueSource = Partial<
     | 'MINIMAX_API_KEY'
     | 'MISTRAL_API_KEY'
     | 'BNKR_API_KEY'
-    | 'XAI_API_KEY',
+    | 'XAI_API_KEY'
+    | 'VENICE_API_KEY'
+    | 'MIMO_API_KEY',
     string | undefined
   >
 >
 
-type ProfileFileLocation = {
+export type ProfileFileLocation = {
+  configDir?: string
   cwd?: string
   filePath?: string
+}
+
+export function getDefaultProfileFilePath(configDir?: string): string {
+  return join(configDir ?? getClaudeConfigHomeDir(), PROFILE_FILE_NAME)
+}
+
+function resolveLegacyProfileFilePath(cwd = process.cwd()): string {
+  return resolve(cwd, PROFILE_FILE_NAME)
 }
 
 function resolveProfileFilePath(options?: ProfileFileLocation): string {
@@ -199,7 +218,69 @@ function resolveProfileFilePath(options?: ProfileFileLocation): string {
     return options.filePath
   }
 
-  return resolve(options?.cwd ?? process.cwd(), PROFILE_FILE_NAME)
+  if (options?.cwd && !options?.configDir) {
+    return resolveLegacyProfileFilePath(options.cwd)
+  }
+
+  return getDefaultProfileFilePath(options?.configDir)
+}
+
+function resolveProfileFileReadPaths(options?: ProfileFileLocation): string[] {
+  const primary = resolveProfileFilePath(options)
+  if (options?.filePath || (options?.cwd && !options?.configDir)) {
+    return [primary]
+  }
+
+  if (existsSync(primary)) {
+    return [primary]
+  }
+
+  const legacy = resolveLegacyProfileFilePath(options?.cwd)
+  return legacy === primary ? [primary] : [primary, legacy]
+}
+
+function resolveProfileFileCleanupPaths(options?: ProfileFileLocation): string[] {
+  const primary = resolveProfileFilePath(options)
+  if (options?.filePath || (options?.cwd && !options?.configDir)) {
+    return [primary]
+  }
+
+  const legacy = resolveLegacyProfileFilePath(options?.cwd)
+  return legacy === primary ? [primary] : [primary, legacy]
+}
+
+function ensureProfileDirectory(filePath: string): void {
+  try {
+    mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 })
+  } catch (error) {
+    if (getErrnoCode(error) !== 'EEXIST') {
+      throw error
+    }
+  }
+}
+
+function readProfileFile(filePath: string): ProfileFile | null {
+  if (!existsSync(filePath)) {
+    return null
+  }
+
+  try {
+    const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as Partial<ProfileFile>
+    if (!isProviderProfile(parsed.profile) || !parsed.env || typeof parsed.env !== 'object') {
+      return null
+    }
+
+    return {
+      profile: parsed.profile,
+      env: parsed.env,
+      createdAt:
+        typeof parsed.createdAt === 'string'
+          ? parsed.createdAt
+          : new Date().toISOString(),
+    }
+  } catch {
+    return null
+  }
 }
 
 function normalizeProfileModel(
@@ -384,6 +465,90 @@ export function buildMiniMaxProfileEnv(options: {
     MINIMAX_API_KEY: key,
     MINIMAX_BASE_URL: defaultBaseUrl,
     MINIMAX_MODEL: defaultModel,
+  }
+}
+
+export function buildVeniceProfileEnv(options: {
+  model?: string | null
+  baseUrl?: string | null
+  apiKey?: string | null
+  processEnv?: NodeJS.ProcessEnv
+}): ProfileEnv | null {
+  const processEnv = options.processEnv ?? process.env
+  const key = sanitizeApiKey(options.apiKey ?? processEnv.VENICE_API_KEY)
+  if (!key) {
+    return null
+  }
+
+  const defaultBaseUrl = getRouteDefaultBaseUrl('venice')
+  const defaultModel = getRouteDefaultModel('venice')
+  if (!defaultBaseUrl || !defaultModel) {
+    throw new Error('Venice route defaults are missing from integration metadata.')
+  }
+  const secretSource: SecretValueSource = {
+    OPENAI_API_KEY: key,
+    VENICE_API_KEY: key,
+  }
+
+  return {
+    OPENAI_BASE_URL:
+      sanitizeProviderConfigValue(options.baseUrl, secretSource) ||
+      sanitizeProviderConfigValue(processEnv.OPENAI_BASE_URL, secretSource) ||
+      defaultBaseUrl,
+    OPENAI_MODEL:
+      normalizeProfileModel(
+        sanitizeProviderConfigValue(options.model, secretSource),
+      ) ||
+      normalizeProfileModel(
+        sanitizeProviderConfigValue(processEnv.OPENAI_MODEL, secretSource),
+      ) ||
+      defaultModel,
+    OPENAI_API_KEY: key,
+    VENICE_API_KEY: key,
+  }
+}
+
+export function buildXiaomiMimoProfileEnv(options: {
+  model?: string | null
+  baseUrl?: string | null
+  apiKey?: string | null
+  processEnv?: NodeJS.ProcessEnv
+}): ProfileEnv | null {
+  const processEnv = options.processEnv ?? process.env
+  const key = sanitizeApiKey(options.apiKey ?? processEnv.MIMO_API_KEY)
+  if (!key) {
+    return null
+  }
+
+  const defaultBaseUrl = getRouteDefaultBaseUrl('xiaomi-mimo')
+  const defaultModel = getRouteDefaultModel('xiaomi-mimo')
+  if (!defaultBaseUrl || !defaultModel) {
+    throw new Error('Xiaomi MiMo route defaults are missing from integration metadata.')
+  }
+  const secretSource: SecretValueSource = {
+    OPENAI_API_KEY: key,
+    MIMO_API_KEY: key,
+  }
+
+  return {
+    OPENAI_BASE_URL:
+      normalizeXiaomiMimoBaseUrl(
+        sanitizeProviderConfigValue(options.baseUrl, secretSource),
+      ) ||
+      normalizeXiaomiMimoBaseUrl(
+        sanitizeProviderConfigValue(processEnv.OPENAI_BASE_URL, secretSource),
+      ) ||
+      defaultBaseUrl,
+    OPENAI_MODEL:
+      normalizeProfileModel(
+        sanitizeProviderConfigValue(options.model, secretSource),
+      ) ||
+      normalizeProfileModel(
+        sanitizeProviderConfigValue(processEnv.OPENAI_MODEL, secretSource),
+      ) ||
+      defaultModel,
+    OPENAI_API_KEY: key,
+    MIMO_API_KEY: key,
   }
 }
 
@@ -619,7 +784,7 @@ function buildXaiProfileEnv(options: {
     XAI_API_KEY: key,
   }
   const defaultBaseUrl = getRouteDefaultBaseUrl('xai') ?? 'https://api.x.ai/v1'
-  const defaultModel = getRouteDefaultModel('xai') ?? 'grok-4'
+  const defaultModel = getRouteDefaultModel('xai') ?? 'grok-4.3'
   const env: ProfileEnv = {
     OPENAI_BASE_URL:
       sanitizeProviderConfigValue(options.baseUrl, secretSource) ||
@@ -743,37 +908,28 @@ export function isPersistedCodexOAuthProfile(
 export function clearPersistedCodexOAuthProfile(
   options?: ProfileFileLocation,
 ): string | null {
-  const persisted = loadProfileFile(options)
-  if (!isPersistedCodexOAuthProfile(persisted)) {
-    return null
+  let removedPath: string | null = null
+
+  for (const filePath of resolveProfileFileCleanupPaths(options)) {
+    const persisted = readProfileFile(filePath)
+    if (isPersistedCodexOAuthProfile(persisted)) {
+      rmSync(filePath, { force: true })
+      removedPath ??= filePath
+    }
   }
 
-  return deleteProfileFile(options)
+  return removedPath
 }
 
 export function loadProfileFile(options?: ProfileFileLocation): ProfileFile | null {
-  const filePath = resolveProfileFilePath(options)
-  if (!existsSync(filePath)) {
-    return null
+  for (const filePath of resolveProfileFileReadPaths(options)) {
+    const profile = readProfileFile(filePath)
+    if (profile) {
+      return profile
+    }
   }
 
-  try {
-    const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as Partial<ProfileFile>
-    if (!isProviderProfile(parsed.profile) || !parsed.env || typeof parsed.env !== 'object') {
-      return null
-    }
-
-    return {
-      profile: parsed.profile,
-      env: parsed.env,
-      createdAt:
-        typeof parsed.createdAt === 'string'
-          ? parsed.createdAt
-          : new Date().toISOString(),
-    }
-  } catch {
-    return null
-  }
+  return null
 }
 
 export function saveProfileFile(
@@ -781,6 +937,7 @@ export function saveProfileFile(
   options?: ProfileFileLocation,
 ): string {
   const filePath = resolveProfileFilePath(options)
+  ensureProfileDirectory(filePath)
   writeFileSync(filePath, JSON.stringify(profileFile, null, 2), {
     encoding: 'utf8',
     mode: 0o600,
@@ -790,7 +947,12 @@ export function saveProfileFile(
 
 export function deleteProfileFile(options?: ProfileFileLocation): string {
   const filePath = resolveProfileFilePath(options)
-  rmSync(filePath, { force: true })
+  const cleanupPaths = new Set(resolveProfileFileCleanupPaths(options))
+
+  for (const cleanupPath of cleanupPaths) {
+    rmSync(cleanupPath, { force: true })
+  }
+
   return filePath
 }
 
@@ -807,6 +969,61 @@ export function hasExplicitProviderSelection(
     isEnvTruthy(processEnv.CLAUDE_CODE_USE_GITHUB) ||
     isEnvTruthy(processEnv.CLAUDE_CODE_USE_GEMINI) ||
     isEnvTruthy(processEnv.CLAUDE_CODE_USE_MISTRAL) ||
+    isEnvTruthy(processEnv.CLAUDE_CODE_USE_BEDROCK) ||
+    isEnvTruthy(processEnv.CLAUDE_CODE_USE_VERTEX) ||
+    isEnvTruthy(processEnv.CLAUDE_CODE_USE_FOUNDRY)
+  )
+}
+
+function hasConcreteProviderSelection(
+  processEnv: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (processEnv.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED === '1') {
+    return true
+  }
+
+  if (isEnvTruthy(processEnv.CLAUDE_CODE_USE_OPENAI)) {
+    return (
+      sanitizeProviderConfigValue(processEnv.OPENAI_BASE_URL) !== undefined ||
+      sanitizeProviderConfigValue(processEnv.OPENAI_API_BASE) !== undefined ||
+      normalizeProfileModel(
+        sanitizeProviderConfigValue(processEnv.OPENAI_MODEL),
+      ) !== undefined
+    )
+  }
+
+  if (isEnvTruthy(processEnv.CLAUDE_CODE_USE_GEMINI)) {
+    return (
+      sanitizeProviderConfigValue(processEnv.GEMINI_BASE_URL) !== undefined ||
+      normalizeProfileModel(
+        sanitizeProviderConfigValue(processEnv.GEMINI_MODEL),
+      ) !== undefined ||
+      sanitizeApiKey(processEnv.GEMINI_API_KEY) !== undefined ||
+      sanitizeApiKey(processEnv.GOOGLE_API_KEY) !== undefined
+    )
+  }
+
+  if (isEnvTruthy(processEnv.CLAUDE_CODE_USE_MISTRAL)) {
+    return (
+      sanitizeProviderConfigValue(processEnv.MISTRAL_BASE_URL) !== undefined ||
+      normalizeProfileModel(
+        sanitizeProviderConfigValue(processEnv.MISTRAL_MODEL),
+      ) !== undefined ||
+      sanitizeApiKey(processEnv.MISTRAL_API_KEY) !== undefined
+    )
+  }
+
+  if (isEnvTruthy(processEnv.CLAUDE_CODE_USE_GITHUB)) {
+    return (
+      sanitizeApiKey(processEnv.GITHUB_TOKEN) !== undefined ||
+      sanitizeApiKey(processEnv.GH_TOKEN) !== undefined ||
+      normalizeProfileModel(
+        sanitizeProviderConfigValue(processEnv.OPENAI_MODEL),
+      ) !== undefined
+    )
+  }
+
+  return (
     isEnvTruthy(processEnv.CLAUDE_CODE_USE_BEDROCK) ||
     isEnvTruthy(processEnv.CLAUDE_CODE_USE_VERTEX) ||
     isEnvTruthy(processEnv.CLAUDE_CODE_USE_FOUNDRY)
@@ -1261,6 +1478,7 @@ export async function buildStartupEnvFromProfile(options?: {
   persisted?: ProfileFile | null
   goal?: RecommendationGoal
   processEnv?: NodeJS.ProcessEnv
+  hasConfiguredProviderProfile?: boolean
   getOllamaChatBaseUrl?: (baseUrl?: string) => string
   resolveOllamaDefaultModel?: (goal: RecommendationGoal) => Promise<string>
   readGeminiAccessToken?: () => string | undefined
@@ -1269,8 +1487,10 @@ export async function buildStartupEnvFromProfile(options?: {
   const persisted = options?.persisted ?? loadProfileFile()
 
   const profileManagedEnv = processEnv.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED === '1'
+  const hasConfiguredProviderProfile =
+    options?.hasConfiguredProviderProfile ?? false
 
-  // The legacy single-profile file (~/.openclaude-profile.json) is a
+  // The single-profile file in the user config directory is a
   // first-run / fallback mechanism. The newer plural provider-profile
   // system (`/provider` presets + activeProviderProfileId in config) is
   // applied earlier in the bootstrap via applyActiveProviderProfileFromConfig
@@ -1286,12 +1506,43 @@ export async function buildStartupEnvFromProfile(options?: {
     return processEnv
   }
 
+  // If startup already has a concrete provider selection and the modern
+  // plural-profile system is configured, keep trusting that selection.
+  // This prevents the legacy single-profile file from becoming a silent
+  // third precedence layer when `/provider` profiles or explicit env/flags
+  // already chose a provider before startup fallback runs.
+  if (
+    hasConfiguredProviderProfile &&
+    hasConcreteProviderSelection(processEnv)
+  ) {
+    return processEnv
+  }
+
   if (isEnvTruthy(processEnv.CLAUDE_CODE_USE_GITHUB)) {
     return processEnv
   }
 
   if (!persisted) {
-    return processEnv
+    // No saved profile — default to Codex OAuth / GPT 5.5.
+    // If Codex credentials are available (OAuth or existing), use Codex.
+    // Otherwise inject the Codex env defaults so the provider picker
+    // shows GPT 5.5 as the default model when the user lands on it.
+    const codexEnv = buildCodexProfileEnv({})
+    if (codexEnv) {
+      return buildCompatibilityProcessEnv({
+        processEnv,
+        compatibilityMode: 'openai',
+        profileEnv: codexEnv,
+      })
+    }
+    return buildCompatibilityProcessEnv({
+      processEnv,
+      compatibilityMode: 'openai',
+      profileEnv: {
+        OPENAI_BASE_URL: DEFAULT_CODEX_BASE_URL,
+        OPENAI_MODEL: 'codexplan',
+      },
+    })
   }
 
   return buildLaunchEnv({

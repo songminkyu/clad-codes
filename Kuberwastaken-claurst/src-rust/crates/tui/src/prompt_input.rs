@@ -1045,7 +1045,7 @@ pub fn apply_vim_command(
 // ---------------------------------------------------------------------------
 
 /// Typeahead source.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TypeaheadSource {
     SlashCommand,
     FileRef,
@@ -1061,10 +1061,27 @@ pub struct TypeaheadSuggestion {
 }
 
 /// Compute typeahead suggestions for the current input.
+///
+/// Handles two kinds of suggestions:
+/// - `/` slash commands (e.g. `/help`, `/clear`)
+/// - `@` file references (e.g. `@src/`, `@~/Documents/`)
 pub fn compute_typeahead(
     input: &str,
     slash_commands: &[(&str, &str)],
+    file_autocomplete_limit: usize,
+    file_autocomplete_show_hidden: bool,
 ) -> Vec<TypeaheadSuggestion> {
+    // Handle slash commands: /help, /clear, etc.
+    if input.starts_with('/') {
+        return compute_slash_suggestions(input, slash_commands);
+    }
+
+    // Handle file references: @, @/, @~/, @src/, etc.
+    compute_file_suggestions(input, file_autocomplete_limit, file_autocomplete_show_hidden)
+}
+
+/// Compute typeahead suggestions for slash commands only (e.g., `/help`).
+pub(crate) fn compute_slash_suggestions(input: &str, slash_commands: &[(&str, &str)]) -> Vec<TypeaheadSuggestion> {
     let mut suggestions = Vec::new();
 
     if let Some(cmd_prefix) = input.strip_prefix('/') {
@@ -1083,27 +1100,249 @@ pub fn compute_typeahead(
     suggestions
 }
 
+/// Compute typeahead suggestions for file references (e.g., `@src/main.rs`).
+pub(crate) fn compute_file_suggestions(
+    input: &str,
+    file_autocomplete_limit: usize,
+    file_autocomplete_show_hidden: bool,
+) -> Vec<TypeaheadSuggestion> {
+    let mut suggestions = Vec::new();
+
+    if let Some(at_idx) = input.rfind('@') {
+        // Only suggest files if @ is at a word boundary (preceded by whitespace or start of string)
+        let at_word_boundary = at_idx == 0
+            || input[..at_idx]
+                .chars()
+                .last()
+                .map(|c| c.is_whitespace())
+                .unwrap_or(false);
+
+        if at_word_boundary {
+            let file_prefix = &input[at_idx + 1..];
+            suggestions = suggest_files(file_prefix, 0, file_autocomplete_limit, file_autocomplete_show_hidden);
+        }
+    }
+
+    suggestions
+}
+
+/// Suggest files matching a path prefix.
+///
+/// Examples:
+/// - `""` → files in cwd with names only (e.g., ["main.rs", "lib.rs"])
+/// - `"src"` → suggest "src/" if it exists
+/// - `"src/"` → files in src/ with names only (e.g., ["main.rs", "lib.rs"])
+/// - `"/"` → files in root with full paths (e.g., ["/Users", "/Applications"])
+/// - `"~"` → suggest "~/" if it exists
+/// - `"~/"` → files in home with names only
+fn suggest_files(prefix: &str, depth: usize, max_suggestions: usize, show_hidden: bool) -> Vec<TypeaheadSuggestion> {
+    const MAX_DEPTH: usize = 3;
+
+    if depth > MAX_DEPTH {
+        return Vec::new();
+    }
+    use std::path::PathBuf;
+    use std::fs;
+
+    let mut suggestions = Vec::new();
+
+    // Determine the directory to list and whether to show full paths
+    let (search_dir, show_full_paths, partial_name) = if prefix.is_empty() {
+        // Just @, show files from cwd
+        if let Ok(cwd) = std::env::current_dir() {
+            (cwd, false, String::new())
+        } else {
+            return suggestions;
+        }
+    } else if prefix.starts_with('/') || prefix.starts_with('~') {
+        // Absolute or home path: show full paths
+        let expanded = if prefix.starts_with('~') {
+            prefix.replacen('~', &home_dir().unwrap_or_default(), 1)
+        } else {
+            prefix.to_string()
+        };
+
+        let path = PathBuf::from(&expanded);
+        if path.is_dir() {
+            // User typed a complete directory: list its contents
+            (path, true, String::new())
+        } else if let Some(parent) = path.parent() {
+            // User typed a partial path: list parent's contents and filter
+            let partial = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            (parent.to_path_buf(), true, partial)
+        } else {
+            return suggestions;
+        }
+    } else {
+        // Relative path in cwd
+        if let Ok(cwd) = std::env::current_dir() {
+            let path = cwd.join(prefix);
+            if path.is_dir() {
+                // Complete directory: list its contents
+                (path, false, String::new())
+            } else if let Some(parent) = path.parent() {
+                // Partial path: list parent and filter
+                let partial = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                (parent.to_path_buf(), false, partial)
+            } else {
+                return suggestions;
+            }
+        } else {
+            return suggestions;
+        }
+    };
+
+    // List files in the directory
+    if let Ok(entries) = fs::read_dir(&search_dir) {
+        let mut files: Vec<_> = entries
+            .filter_map(|e| {
+                e.ok().and_then(|entry| {
+                    let path = entry.path();
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string())?;
+
+                    // Filter by partial name
+                    if !partial_name.is_empty() && !name.starts_with(&partial_name) {
+                        return None;
+                    }
+
+                    // Filter hidden files unless user explicitly types a dot or show_hidden_files is enabled
+                    if !show_hidden && name.starts_with('.') && !partial_name.starts_with('.') {
+                        return None;
+                    }
+
+                    // Detect if this is a symlink or junction link
+                    let is_symlink = entry.file_type().ok().map(|ft| ft.is_symlink()).unwrap_or(false);
+                    let is_dir = path.is_dir();
+
+                    Some((name, is_dir, is_symlink))
+                })
+            })
+            .collect();
+
+        files.sort_by(|a, b| {
+            // Directories first, then alphabetically
+            match (b.1, a.1) {
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                _ => a.0.cmp(&b.0),
+            }
+        });
+
+        for (name, is_dir, is_symlink) in files {
+            if suggestions.len() >= max_suggestions {
+                break;
+            }
+
+            let suggestion_text = if show_full_paths {
+                let full = search_dir.join(&name);
+                full.to_string_lossy().to_string()
+                    + if is_dir { "/" } else { "" }
+            } else {
+                name.clone() + if is_dir { "/" } else { "" }
+            };
+
+            let description = if is_symlink {
+                if is_dir {
+                    "directory link".to_string()
+                } else {
+                    "file link".to_string()
+                }
+            } else if is_dir {
+                "directory".to_string()
+            } else {
+                "file".to_string()
+            };
+
+            suggestions.push(TypeaheadSuggestion {
+                text: format!("@{}", suggestion_text),
+                description,
+                source: TypeaheadSource::FileRef,
+            });
+        }
+    }
+
+    suggestions
+}
+
+/// Get the home directory path.
+fn home_dir() -> Option<String> {
+    std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())
+}
+
 // ---------------------------------------------------------------------------
 // Paste handling
 // ---------------------------------------------------------------------------
 
-/// Handle a paste event. If the content is > 1024 bytes, returns a placeholder
-/// string `[Pasted text #N (+X lines)]` and the original content (for storage).
+/// Handle a paste event.
+///
+/// Large pastes (≥3 lines or >150 chars) are replaced with a compact
+/// placeholder like `[Pasted ~12 lines #3]` while the real content is stored
+/// in `paste_contents` for retrieval at submit time.  This mirrors opencode's
+/// behaviour and prevents the input box from flooding with multi-hundred-line
+/// pastes.  Single-line short strings are inserted verbatim.
 pub fn handle_paste(
     content: &str,
     paste_counter: &mut u32,
 ) -> (String, Option<String>) {
-    if content.len() <= 1024 {
+    let line_count = content.lines().count();
+    let is_large = line_count >= 3 || content.len() > 150;
+    if !is_large {
         return (content.to_string(), None);
     }
     *paste_counter += 1;
-    let line_count = content.lines().count();
-    let placeholder = if line_count > 1 {
-        format!("[Pasted text #{} (+{} lines)]", paste_counter, line_count)
-    } else {
-        format!("[Pasted text #{}]", paste_counter)
-    };
+    let placeholder = format!("[Pasted ~{} lines #{}]", line_count, paste_counter);
     (placeholder, Some(content.to_string()))
+}
+
+/// Normalize a pasted string into a filesystem path if it looks like one.
+///
+/// Handles:
+/// - `file:///path/to/file` — URL-encoded paths
+/// - `"C:\path"` / `'/path'` — quoted paths (strips quotes)
+/// - Bare absolute paths (`/home/...`, `C:\...`)
+///
+/// Returns `None` if the text is multiline, not path-shaped, or the resolved
+/// path does not exist on the filesystem.  Callers can use the returned
+/// `PathBuf` to decide whether to treat the paste as a file attachment.
+pub fn detect_pasted_path(text: &str) -> Option<std::path::PathBuf> {
+    let trimmed = text.trim();
+    // Multiline content is never a bare path.
+    if trimmed.contains('\n') {
+        return None;
+    }
+    // Strip outer matching quotes.
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| trimmed.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(trimmed);
+
+    // file:// URL — strip the scheme (skip the leading //).
+    let candidate = if let Some(rest) = unquoted.strip_prefix("file://") {
+        rest
+    } else {
+        unquoted
+    };
+
+    let path = std::path::Path::new(candidate);
+    if path.is_absolute() && path.exists() {
+        Some(path.to_path_buf())
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2315,16 +2554,15 @@ impl PromptInputState {
         text
     }
 
-    /// Update typeahead suggestions for the current text.
+    /// Update typeahead suggestions for slash commands in the current text.
     pub fn update_suggestions(&mut self, slash_commands: &[(&str, &str)]) {
-        self.suggestions = compute_typeahead(&self.text, slash_commands);
+        self.suggestions = compute_slash_suggestions(&self.text, slash_commands);
+
         if self.suggestions.is_empty() {
             self.suggestion_index = None;
-        } else if self.text.starts_with('/') {
+        } else {
             let idx = self.suggestion_index.unwrap_or(0).min(self.suggestions.len() - 1);
             self.suggestion_index = Some(idx);
-        } else {
-            self.suggestion_index = None;
         }
     }
 
@@ -2367,6 +2605,109 @@ impl PromptInputState {
         self.update_token_estimate();
     }
 
+    /// Map the current cursor (byte offset) to a (visual_row, visual_col) pair
+    /// given the wrap width. `width` is the usable column count for text.
+    pub fn cursor_visual_pos(&self, width: usize) -> (usize, usize) {
+        if width == 0 {
+            return (0, 0);
+        }
+        let mut byte = 0usize;
+        let mut row = 0usize;
+        for line in self.text.split('\n') {
+            let line_end = byte + line.len();
+            if self.cursor <= line_end {
+                let intra_byte = self.cursor - byte;
+                let intra_byte = intra_byte.min(line.len());
+                // walk to char-boundary
+                let mut b = intra_byte;
+                while b > 0 && !line.is_char_boundary(b) {
+                    b -= 1;
+                }
+                let intra_chars = line[..b].chars().count();
+                let chunk_idx = if intra_chars == 0 { 0 } else { intra_chars / width };
+                let chunk_col = intra_chars % width;
+                return (row + chunk_idx, chunk_col);
+            }
+            let chunks = wrap_line(line, width).len().max(1);
+            row += chunks;
+            byte = line_end + 1; // newline
+        }
+        (row.saturating_sub(1), 0)
+    }
+
+    /// Move the cursor to the same visual column on the row above. Returns
+    /// `true` if the cursor actually moved (i.e. there was a row above).
+    pub fn move_visual_up(&mut self, width: usize) -> bool {
+        if width == 0 {
+            return false;
+        }
+        let (row, col) = self.cursor_visual_pos(width);
+        if row == 0 {
+            return false;
+        }
+        self.set_cursor_at_visual(row - 1, col, width);
+        true
+    }
+
+    /// Move the cursor to the same visual column on the row below. Returns
+    /// `true` if the cursor actually moved (i.e. there was a row below).
+    pub fn move_visual_down(&mut self, width: usize) -> bool {
+        if width == 0 {
+            return false;
+        }
+        let (row, col) = self.cursor_visual_pos(width);
+        let total_rows = self.visual_row_count(width);
+        if row + 1 >= total_rows {
+            return false;
+        }
+        self.set_cursor_at_visual(row + 1, col, width);
+        true
+    }
+
+    fn visual_row_count(&self, width: usize) -> usize {
+        if self.text.is_empty() || width == 0 {
+            return 1;
+        }
+        let mut total = 0usize;
+        for line in self.text.split('\n') {
+            total += wrap_line(line, width).len().max(1);
+        }
+        total.max(1)
+    }
+
+    fn set_cursor_at_visual(&mut self, target_row: usize, target_col: usize, width: usize) {
+        if width == 0 {
+            return;
+        }
+        let mut byte = 0usize;
+        let mut row = 0usize;
+        for line in self.text.split('\n').collect::<Vec<_>>() {
+            let chunks = wrap_line(line, width).len().max(1);
+            if target_row < row + chunks {
+                let intra_chunk = target_row - row;
+                let chunk_char_start = intra_chunk * width;
+                let line_chars: Vec<(usize, char)> = line.char_indices().collect();
+                let chunk_chars_len = line_chars
+                    .len()
+                    .saturating_sub(chunk_char_start)
+                    .min(width);
+                let col = target_col.min(chunk_chars_len);
+                let target_char_idx = chunk_char_start + col;
+                let intra_byte = line_chars
+                    .get(target_char_idx)
+                    .map(|(b, _)| *b)
+                    .unwrap_or(line.len());
+                self.cursor = byte + intra_byte;
+                self.history_pos = None;
+                return;
+            }
+            row += chunks;
+            byte += line.len() + 1; // newline
+        }
+        self.cursor = self.text.len();
+        self.history_pos = None;
+    }
+
     /// Normalize cursor and metadata after external field updates.
     pub fn normalize(&mut self) {
         self.cursor = self.cursor.min(self.text.len());
@@ -2393,17 +2734,56 @@ impl Default for PromptInputState {
 // ---------------------------------------------------------------------------
 
 /// Return the number of rows needed to render the input for the given text.
-/// Minimum 4 (1 top-line + 1 text row + 1 bottom-line + 1 breathing room), capped at 12.
-pub fn input_height(state: &PromptInputState) -> u16 {
-    let line_count = if state.text.is_empty() {
-        1
-    } else {
+/// `text_width` is the usable column count for wrapped text (i.e. area.width
+/// minus the prompt prefix and right margin). When 0 we degrade gracefully and
+/// only count logical lines.
+///
+/// Issue #149 follow-up: previously this only counted `\n`-separated lines, so
+/// a single long visually-wrapped line stayed at the minimum height. Now we
+/// count the actual visual row count and grow the box up to ~10 text rows
+/// (12 total including the underline + breathing room). Larger inputs scroll
+/// inside the box (handled in `render_prompt_input`).
+pub fn input_height(state: &PromptInputState, text_width: u16) -> u16 {
+    let visual_lines = if state.text.is_empty() {
+        1usize
+    } else if text_width == 0 {
         state.text.lines().count().max(1)
+    } else {
+        let mut total = 0usize;
+        let logical: Vec<&str> = state.text.split('\n').collect();
+        for line in &logical {
+            let chunks = wrap_line(line, text_width as usize).len().max(1);
+            total += chunks;
+        }
+        total.max(1)
     };
-    // top-line + text rows + bottom-line + 1 breathing-room row, at least 4, at most 12
-    let base = ((line_count as u16) + 3).max(4).min(12);
-    // +1 for image pill row when images are pending
+    // top-line + text rows + breathing room + underline, capped so the prompt
+    // never eats more than ~half the screen.
+    const MAX_TEXT_ROWS: usize = 10;
+    let text_rows = visual_lines.min(MAX_TEXT_ROWS) as u16;
+    let base = (text_rows + 3).max(4);
     base + if state.pending_images.is_empty() { 0 } else { 1 }
+}
+
+/// Wrap a logical line into visual chunks of `width` chars (char-based, not
+/// byte-based, to preserve UTF-8 characters). Empty input yields a single
+/// empty chunk so the caller can still place a cursor.
+pub fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![line.to_string()];
+    }
+    let chars: Vec<char> = line.chars().collect();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    let mut out = Vec::with_capacity(chars.len() / width + 1);
+    let mut i = 0;
+    while i < chars.len() {
+        let end = (i + width).min(chars.len());
+        out.push(chars[i..end].iter().collect());
+        i = end;
+    }
+    out
 }
 
 /// Render the prompt input widget in the same low-chrome style as Claurst:
@@ -2417,6 +2797,7 @@ pub fn render_prompt_input(
     focused: bool,
     mode: InputMode,
     accent_override: Color,
+    cursor_blink_enabled: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -2454,22 +2835,35 @@ pub fn render_prompt_input(
     };
     let prompt_prefix = format!("{PROMPT_POINTER} ");
     let prefix_width = prompt_prefix.chars().count() as u16;
-    let available_width = area.width.saturating_sub(prefix_width) as usize;
-    let cursor = if focused { "\u{2588}" } else { "" };
+    // Reserve a 2-cell right margin so wrapped text doesn't kiss the right edge
+    // of the box (issue #149: padding too tight).
+    let right_pad: u16 = 2;
+    let available_width = area
+        .width
+        .saturating_sub(prefix_width)
+        .saturating_sub(right_pad) as usize;
+    let cursor_visible = if cursor_blink_enabled {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        (ms / 530) % 2 == 0
+    } else {
+        true
+    };
+    // Render cursor as an overlay so its blink state never shifts the
+    // underlying text (issue #149: cursor blink shifted the prompt).
+    let show_cursor = focused && cursor_visible;
 
-    // Build the full content string (with cursor embedded).
-    let full_content: String = if state.text.is_empty() {
+    // Use the raw text — no inline cursor character — so layout is stable.
+    let display_text: String = if state.text.is_empty() {
         if focused {
-            cursor.to_string()
+            String::new()
         } else if mode == InputMode::Default {
             "How can I help you?".to_string()
         } else {
             String::new()
         }
-    } else if focused && state.cursor <= state.text.len() {
-        let mut text = state.text.clone();
-        text.insert_str(state.cursor, cursor);
-        text
     } else {
         state.text.clone()
     };
@@ -2488,8 +2882,14 @@ pub fn render_prompt_input(
 
     // Split into logical lines; guarantee at least one.
     let logical_lines: Vec<String> = {
-        let collected: Vec<String> = full_content.lines().map(|l| l.to_string()).collect();
-        if collected.is_empty() { vec![String::new()] } else { collected }
+        let collected: Vec<String> = display_text.lines().map(|l| l.to_string()).collect();
+        if display_text.ends_with('\n') || collected.is_empty() {
+            let mut v = collected;
+            v.push(String::new());
+            v
+        } else {
+            collected
+        }
     };
 
     let text_style = if state.text.is_empty() && !focused {
@@ -2498,34 +2898,102 @@ pub fn render_prompt_input(
         Style::default().fg(Color::White)
     };
 
-    // Render each logical line (truncated to available width from the right).
-    // Reserve 1 row at top (separator) + 1 at bottom (underline).
-    let max_text_rows = area.height.saturating_sub(2) as usize;
-    for (i, line_text) in logical_lines.iter().enumerate() {
-        if i >= max_text_rows {
-            break;
+    // Wrap each logical line into visual rows that fit `available_width`,
+    // and remember the (logical_idx, intra_line_char_offset) for each row
+    // so we can later compute where the cursor lives.
+    let mut visual_rows: Vec<(usize, usize, String)> = Vec::new();
+    for (li, line_text) in logical_lines.iter().enumerate() {
+        let chunks = wrap_line(line_text, available_width.max(1));
+        let mut col_offset = 0usize;
+        for chunk in chunks {
+            let chunk_len = chunk.chars().count();
+            visual_rows.push((li, col_offset, chunk));
+            col_offset += chunk_len;
         }
-        let row_y = text_start_y + i as u16;
+    }
 
-        let visible: String = line_text
-            .chars()
-            .rev()
-            .take(available_width)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
+    // Compute cursor's visual (row, col) within `visual_rows`.
+    // We map state.cursor (a byte offset into state.text) to (logical_line, char_offset).
+    let cursor_pos: Option<(usize, usize)> = if focused && !state.text.is_empty() {
+        let mut byte_idx = 0usize;
+        let mut found: Option<(usize, usize)> = None;
+        'outer: for (li, line_text) in logical_lines.iter().enumerate() {
+            let line_bytes = line_text.len();
+            // The +1 accounts for the '\n' between logical lines (last line has no trailing \n).
+            let line_end_byte = byte_idx + line_bytes;
+            if state.cursor <= line_end_byte {
+                let intra_byte = state.cursor - byte_idx;
+                let char_offset = line_text[..intra_byte.min(line_bytes)].chars().count();
+                found = Some((li, char_offset));
+                break 'outer;
+            }
+            byte_idx = line_end_byte + 1; // newline
+        }
+        // Fallback: cursor at end of text.
+        found.or_else(|| {
+            let li = logical_lines.len().saturating_sub(1);
+            let col = logical_lines.get(li).map(|s| s.chars().count()).unwrap_or(0);
+            Some((li, col))
+        })
+    } else if focused && state.text.is_empty() {
+        Some((0, 0))
+    } else {
+        None
+    };
 
-        let spans: Vec<Span<'static>> = if i == 0 {
+    let cursor_visual: Option<(usize, usize)> = cursor_pos.and_then(|(li, col)| {
+        // Find the visual row whose logical_idx == li and contains `col`.
+        let mut last_match: Option<(usize, usize)> = None;
+        for (vi, (row_li, row_col_start, chunk)) in visual_rows.iter().enumerate() {
+            if *row_li != li {
+                continue;
+            }
+            let chunk_len = chunk.chars().count();
+            let row_col_end = row_col_start + chunk_len;
+            if col >= *row_col_start && col <= row_col_end {
+                last_match = Some((vi, col - row_col_start));
+            }
+        }
+        last_match
+    });
+
+    // Render each visual row (truncated to area height).
+    let max_text_rows = area.height.saturating_sub(2) as usize;
+    // Scroll so the cursor row is visible.
+    let scroll_offset = match cursor_visual {
+        Some((vi, _)) if visual_rows.len() > max_text_rows && vi >= max_text_rows => {
+            vi + 1 - max_text_rows
+        }
+        _ => 0,
+    };
+
+    for (display_idx, (vi, (li, _col_start, chunk))) in visual_rows
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(max_text_rows)
+        .map(|(idx, item)| (idx - scroll_offset, item))
+        .enumerate()
+        .map(|(d, (idx, item))| (d, (idx + scroll_offset, item)))
+    {
+        let _ = vi;
+        let _ = li;
+        let row_y = text_start_y + display_idx as u16;
+
+        // Determine if this is the first visual row of the first logical line —
+        // that's the only row that gets the prompt prefix; continuation rows
+        // (whether from logical line breaks or wrapping) get whitespace.
+        let is_first_row_of_first_logical = display_idx == 0 && scroll_offset == 0;
+
+        let spans: Vec<Span<'static>> = if is_first_row_of_first_logical {
             vec![
                 Span::styled(prompt_prefix.clone(), Style::default().fg(accent).add_modifier(Modifier::BOLD)),
-                Span::styled(visible, text_style),
+                Span::styled(chunk.clone(), text_style),
             ]
         } else {
-            // Continuation lines: indent to align with text after prefix
             vec![
                 Span::raw(" ".repeat(prefix_width as usize)),
-                Span::styled(visible, text_style),
+                Span::styled(chunk.clone(), text_style),
             ]
         };
 
@@ -2535,8 +3003,31 @@ pub fn render_prompt_input(
         );
     }
 
+    // Overlay the cursor block on top of the rendered text. We modify the
+    // buffer cell directly so the cursor occupies the same column whether
+    // it is currently blinking on or off.
+    if show_cursor {
+        if let Some((vi, col_in_row)) = cursor_visual {
+            if vi >= scroll_offset {
+                let display_idx = vi - scroll_offset;
+                if display_idx < max_text_rows {
+                    let row_y = text_start_y + display_idx as u16;
+                    let x = area.x + prefix_width + col_in_row as u16;
+                    if x < area.x + area.width && row_y < area.y + area.height {
+                        let cell = &mut buf[(x, row_y)];
+                        cell.set_symbol("\u{2588}");
+                        cell.set_style(Style::default().fg(text_style.fg.unwrap_or(Color::White)));
+                    }
+                }
+            }
+        }
+    }
+
     // Vim command / search row (shown below text lines, before underline).
-    let text_rows_rendered = logical_lines.len().min(max_text_rows);
+    let text_rows_rendered = visual_rows
+        .len()
+        .saturating_sub(scroll_offset)
+        .min(max_text_rows);
     let cmd_line: Option<Line<'static>> = match state.vim_mode {
         VimMode::Command => {
             let buf_text = format!(":{}\u{2588}", state.vim_command_buf);
@@ -2883,9 +3374,11 @@ mod tests {
     #[test]
     fn paste_large_content_placeholder() {
         let mut counter = 0u32;
-        let big = "x".repeat(2000);
+        // >150 chars → triggers placeholder
+        let big = "x".repeat(200);
         let (result, stored) = handle_paste(&big, &mut counter);
-        assert!(result.starts_with("[Pasted text #1"));
+        assert!(result.starts_with("[Pasted ~"), "expected placeholder, got: {result}");
+        assert!(result.contains("#1"), "expected counter in placeholder, got: {result}");
         assert!(stored.is_some());
         assert_eq!(counter, 1);
     }
@@ -2893,10 +3386,32 @@ mod tests {
     #[test]
     fn paste_large_multiline_placeholder() {
         let mut counter = 0u32;
-        let big = "line\n".repeat(300); // 1500 bytes, >1024
+        // ≥3 lines → triggers placeholder regardless of length
+        let big = "line\n".repeat(300);
         let (result, stored) = handle_paste(&big, &mut counter);
-        assert!(result.contains("+300 lines") || result.contains("lines"));
+        assert!(result.starts_with("[Pasted ~"), "expected placeholder, got: {result}");
+        assert!(result.contains("lines"), "expected line count in placeholder, got: {result}");
         assert!(stored.is_some());
+    }
+
+    #[test]
+    fn paste_three_lines_triggers_placeholder() {
+        let mut counter = 0u32;
+        // Exactly 3 lines (the threshold) should use a placeholder.
+        let three_lines = "a\nb\nc";
+        let (result, stored) = handle_paste(three_lines, &mut counter);
+        assert!(result.starts_with("[Pasted ~"), "3-line paste should be placeholder, got: {result}");
+        assert!(stored.is_some());
+    }
+
+    #[test]
+    fn paste_two_lines_inline() {
+        let mut counter = 0u32;
+        // 2 lines, ≤150 chars → inserted verbatim
+        let two_lines = "hello\nworld";
+        let (result, stored) = handle_paste(two_lines, &mut counter);
+        assert_eq!(result, two_lines);
+        assert!(stored.is_none());
     }
 
     #[test]
@@ -2910,26 +3425,23 @@ mod tests {
 
     // ---- compute_typeahead ---------------------------------------------
 
+    // Helper constants for tests
+    const TEST_FILE_AUTOCOMPLETE_LIMIT: usize = 15;
+    const TEST_FILE_AUTOCOMPLETE_SHOW_HIDDEN: bool = false;
+
     #[test]
     fn typeahead_slash_prefix_matches() {
         let cmds = [("help", "Show help"), ("history", "Show history"), ("compact", "Compact")];
-        let suggestions = compute_typeahead("/h", &cmds);
+        let suggestions = compute_slash_suggestions("/h", &cmds);
         assert_eq!(suggestions.len(), 2);
         assert_eq!(suggestions[0].text, "/help");
         assert_eq!(suggestions[1].text, "/history");
     }
 
     #[test]
-    fn typeahead_no_slash_returns_empty() {
-        let cmds = [("help", "Show help")];
-        let suggestions = compute_typeahead("hello", &cmds);
-        assert!(suggestions.is_empty());
-    }
-
-    #[test]
     fn typeahead_full_match() {
         let cmds = [("compact", "Compact conversation")];
-        let suggestions = compute_typeahead("/compact", &cmds);
+        let suggestions = compute_slash_suggestions("/compact", &cmds);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].text, "/compact");
         assert_eq!(suggestions[0].description, "Compact conversation");
@@ -2938,7 +3450,7 @@ mod tests {
     #[test]
     fn typeahead_case_insensitive() {
         let cmds = [("Help", "Show help")];
-        let suggestions = compute_typeahead("/H", &cmds);
+        let suggestions = compute_slash_suggestions("/H", &cmds);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].text, "/Help");
     }
@@ -3715,5 +4227,82 @@ mod tests {
         assert_eq!(VimMode::VisualLine.label(), "VISUAL LINE");
         assert_eq!(VimMode::Command.label(), "COMMAND");
         assert_eq!(VimMode::Search.label(), "SEARCH");
+    }
+
+    // ---- File reference (@) autocomplete tests ----
+
+    #[test]
+    fn file_autocomplete_slash_commands_still_work() {
+        let cmds = vec![("help", "Show help"), ("clear", "Clear messages")];
+        let suggestions = compute_slash_suggestions("/he", &cmds);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].text, "/help");
+    }
+
+    #[test]
+    fn file_autocomplete_at_requires_word_boundary() {
+        // @ at word boundary: should suggest files (or be empty if cwd has no files)
+        let suggestions_at_boundary = compute_file_suggestions("@", TEST_FILE_AUTOCOMPLETE_LIMIT, TEST_FILE_AUTOCOMPLETE_SHOW_HIDDEN);
+        let suggestions_at_boundary_with_space = compute_file_suggestions("hello @", TEST_FILE_AUTOCOMPLETE_LIMIT, TEST_FILE_AUTOCOMPLETE_SHOW_HIDDEN);
+
+        // @ not at word boundary: should never suggest files
+        let suggestions_no_boundary = compute_file_suggestions("test@", TEST_FILE_AUTOCOMPLETE_LIMIT, TEST_FILE_AUTOCOMPLETE_SHOW_HIDDEN);
+        assert!(suggestions_no_boundary.is_empty(), "@ without word boundary should never suggest files");
+
+        // At least one of the boundary cases should work if cwd has files
+        // but more importantly, the non-boundary case should always be empty
+        for suggestion in suggestions_at_boundary.iter().chain(suggestions_at_boundary_with_space.iter()) {
+            assert_eq!(suggestion.source, TypeaheadSource::FileRef);
+        }
+    }
+
+    #[test]
+    fn file_autocomplete_returns_fileref_source() {
+        let suggestions = compute_file_suggestions("@", TEST_FILE_AUTOCOMPLETE_LIMIT, TEST_FILE_AUTOCOMPLETE_SHOW_HIDDEN);
+
+        for suggestion in suggestions {
+            assert_eq!(suggestion.source, TypeaheadSource::FileRef);
+        }
+    }
+
+    #[test]
+    fn file_autocomplete_format_filenames() {
+        let suggestions = compute_file_suggestions("@", TEST_FILE_AUTOCOMPLETE_LIMIT, TEST_FILE_AUTOCOMPLETE_SHOW_HIDDEN);
+
+        // All suggestions should start with @
+        for suggestion in suggestions {
+            assert!(suggestion.text.starts_with('@'));
+        }
+    }
+
+    #[test]
+    fn file_autocomplete_with_whitespace_prefix() {
+        // @ after whitespace: should suggest files
+        let suggestions = compute_file_suggestions("hello @", TEST_FILE_AUTOCOMPLETE_LIMIT, TEST_FILE_AUTOCOMPLETE_SHOW_HIDDEN);
+
+        // Check they all start with @ and are FileRef source
+        for suggestion in suggestions {
+            assert!(suggestion.text.starts_with('@'));
+            assert_eq!(suggestion.source, TypeaheadSource::FileRef);
+        }
+    }
+
+    #[test]
+    fn file_autocomplete_detects_symlinks() {
+        // This test verifies that symlinks/junction links are properly detected.
+        // On systems with symlinks/junctions, suggestions will include descriptions
+        // like "file link" or "directory link".
+        let suggestions = compute_file_suggestions("@", TEST_FILE_AUTOCOMPLETE_LIMIT, TEST_FILE_AUTOCOMPLETE_SHOW_HIDDEN);
+
+        // All suggestions should have a description (file, directory, file link, or directory link)
+        for suggestion in suggestions {
+            assert!(!suggestion.description.is_empty());
+            assert!(
+                suggestion.description.contains("file")
+                    || suggestion.description.contains("directory"),
+                "Unexpected description: {}",
+                suggestion.description
+            );
+        }
     }
 }

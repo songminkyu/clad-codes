@@ -44,6 +44,11 @@ pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
         "upstage" => Some(upstage()),
         "stepfun" => Some(stepfun()),
         "fireworks" => Some(fireworks()),
+        "opencode-go" | "opencode_go" => Some(opencode_go()),
+        "opencode-zen" | "opencode_zen" => Some(opencode_zen()),
+        "synthetic" => Some(synthetic()),
+        "routing" => Some(routing()),
+        "neuralwatt" => Some(neuralwatt()),
         _ => None,
     }
 }
@@ -475,4 +480,87 @@ pub fn fireworks() -> OpenAiCompatProvider {
         "https://api.fireworks.ai/inference/v1",
     )
     .with_api_key(key)
+}
+
+/// OpenCode Go — flat-rate subscription endpoint hosted by opencode.ai.
+/// OpenAI-compatible chat completions surface; same key works for the Zen
+/// metered tier, hence the shared `OPENCODE_API_KEY` env var.
+pub fn opencode_go() -> OpenAiCompatProvider {
+    let key = std::env::var("OPENCODE_API_KEY").unwrap_or_default();
+    OpenAiCompatProvider::new(
+        ProviderId::OPENCODE_GO,
+        "OpenCode Go",
+        "https://opencode.ai/zen/go/v1",
+    )
+    .with_api_key(key)
+    .with_quirks(ProviderQuirks {
+        include_usage_in_stream: true,
+        ..Default::default()
+    })
+}
+
+/// OpenCode Zen — pay-as-you-go metered endpoint hosted by opencode.ai.
+/// Exposes the free pool (Big Pickle, MiniMax M2.5 Free, Ring 2.6 1T Free,
+/// Nemotron 3 Super Free) alongside paid models.  Same `OPENCODE_API_KEY` as
+/// OpenCode Go.
+pub fn opencode_zen() -> OpenAiCompatProvider {
+    let key = std::env::var("OPENCODE_API_KEY").unwrap_or_default();
+    OpenAiCompatProvider::new(
+        ProviderId::OPENCODE_ZEN,
+        "OpenCode Zen",
+        "https://opencode.ai/zen/v1",
+    )
+    .with_api_key(key)
+    .with_quirks(ProviderQuirks {
+        include_usage_in_stream: true,
+        ..Default::default()
+    })
+}
+
+/// Synthetic.dev — OpenAI-compatible endpoint with curated model selection.
+/// Reads `SYNTHETIC_API_KEY` for authentication.
+pub fn synthetic() -> OpenAiCompatProvider {
+    let key = std::env::var("SYNTHETIC_API_KEY").unwrap_or_default();
+    OpenAiCompatProvider::new(
+        ProviderId::SYNTHETIC,
+        "Synthetic.dev",
+        "https://api.synthetic.new/openai/v1",
+    )
+    .with_api_key(key)
+    .with_quirks(ProviderQuirks {
+        include_usage_in_stream: true,
+        ..Default::default()
+    })
+}
+
+/// routing.run — OpenAI-compatible endpoint for model routing.
+/// Reads `ROUTING_API_KEY` for authentication.
+pub fn routing() -> OpenAiCompatProvider {
+    let key = std::env::var("ROUTING_API_KEY").unwrap_or_default();
+    OpenAiCompatProvider::new(
+        ProviderId::ROUTING,
+        "routing.run",
+        "https://api.routing.run/v1",
+    )
+    .with_api_key(key)
+    .with_quirks(ProviderQuirks {
+        include_usage_in_stream: true,
+        ..Default::default()
+    })
+}
+
+/// NeuralWatt — OpenAI-compatible endpoint for fast inference.
+/// Reads `NEURALWATT_API_KEY` for authentication.
+pub fn neuralwatt() -> OpenAiCompatProvider {
+    let key = std::env::var("NEURALWATT_API_KEY").unwrap_or_default();
+    OpenAiCompatProvider::new(
+        ProviderId::NEURALWATT,
+        "NeuralWatt",
+        "https://api.neuralwatt.com/v1",
+    )
+    .with_api_key(key)
+    .with_quirks(ProviderQuirks {
+        include_usage_in_stream: true,
+        ..Default::default()
+    })
 }

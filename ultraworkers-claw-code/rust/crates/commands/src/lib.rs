@@ -221,11 +221,11 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "session",
         aliases: &[],
-        summary: "List, switch, fork, or delete managed local sessions",
+        summary: "List, check, switch, fork, or delete managed local sessions",
         argument_hint: Some(
-            "[list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]",
+            "[list|exists <session-id>|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]",
         ),
-        resume_supported: false,
+        resume_supported: true,
     },
     SlashCommandSpec {
         name: "plugin",
@@ -1590,7 +1590,17 @@ fn parse_session_command(args: &[&str]) -> Result<SlashCommand, SlashCommandPars
             action: Some("list".to_string()),
             target: None,
         }),
-        ["list", ..] => Err(usage_error("session", "[list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]")),
+        ["list", ..] => Err(usage_error("session", "[list|exists <session-id>|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]")),
+        ["exists"] => Err(usage_error("session exists", "<session-id>")),
+        ["exists", target] => Ok(SlashCommand::Session {
+            action: Some("exists".to_string()),
+            target: Some((*target).to_string()),
+        }),
+        ["exists", ..] => Err(command_error(
+            "Unexpected arguments for /session exists.",
+            "session",
+            "/session exists <session-id>",
+        )),
         ["switch"] => Err(usage_error("session switch", "<session-id>")),
         ["switch", target] => Ok(SlashCommand::Session {
             action: Some("switch".to_string()),
@@ -1637,10 +1647,10 @@ fn parse_session_command(args: &[&str]) -> Result<SlashCommand, SlashCommandPars
         )),
         [action, ..] => Err(command_error(
             &format!(
-                "Unknown /session action '{action}'. Use list, switch <session-id>, fork [branch-name], or delete <session-id> [--force]."
+                "Unknown /session action '{action}'. Use list, exists <session-id>, switch <session-id>, fork [branch-name], or delete <session-id> [--force]."
             ),
             "session",
-            "/session [list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]",
+            "/session [list|exists <session-id>|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]",
         )),
     }
 }
@@ -2371,6 +2381,40 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
             let skills = load_skills_from_roots(&roots)?;
             Ok(render_skills_report(&skills))
         }
+        Some(args) if args.starts_with("list ") => {
+            let filter = args["list ".len()..].trim().to_lowercase();
+            let roots = discover_skill_roots(cwd);
+            let skills = load_skills_from_roots(&roots)?;
+            let filtered: Vec<_> = skills
+                .into_iter()
+                .filter(|s| s.name.to_lowercase().contains(&filter))
+                .collect();
+            Ok(render_skills_report(&filtered))
+        }
+        Some("show" | "info" | "describe") => {
+            let roots = discover_skill_roots(cwd);
+            let skills = load_skills_from_roots(&roots)?;
+            Ok(render_skills_report(&skills))
+        }
+        Some(args)
+            if args.starts_with("show ")
+                || args.starts_with("info ")
+                || args.starts_with("describe ") =>
+        {
+            let name = args
+                .split_once(' ')
+                .map(|(_, name)| name)
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
+            let roots = discover_skill_roots(cwd);
+            let skills = load_skills_from_roots(&roots)?;
+            let matched: Vec<_> = skills
+                .into_iter()
+                .filter(|s| s.name.to_lowercase() == name)
+                .collect();
+            Ok(render_skills_report(&matched))
+        }
         Some("install") => Ok(render_skills_usage(Some("install"))),
         Some(args) if args.starts_with("install ") => {
             let target = args["install ".len()..].trim();
@@ -2402,6 +2446,40 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
             let skills = load_skills_from_roots(&roots)?;
             Ok(render_skills_report_json(&skills))
         }
+        Some(args) if args.starts_with("list ") => {
+            let filter = args["list ".len()..].trim().to_lowercase();
+            let roots = discover_skill_roots(cwd);
+            let skills = load_skills_from_roots(&roots)?;
+            let filtered: Vec<_> = skills
+                .into_iter()
+                .filter(|s| s.name.to_lowercase().contains(&filter))
+                .collect();
+            Ok(render_skills_report_json(&filtered))
+        }
+        Some("show" | "info" | "describe") => {
+            let roots = discover_skill_roots(cwd);
+            let skills = load_skills_from_roots(&roots)?;
+            Ok(render_skills_report_json(&skills))
+        }
+        Some(args)
+            if args.starts_with("show ")
+                || args.starts_with("info ")
+                || args.starts_with("describe ") =>
+        {
+            let name = args
+                .split_once(' ')
+                .map(|(_, name)| name)
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
+            let roots = discover_skill_roots(cwd);
+            let skills = load_skills_from_roots(&roots)?;
+            let matched: Vec<_> = skills
+                .into_iter()
+                .filter(|s| s.name.to_lowercase() == name)
+                .collect();
+            Ok(render_skills_report_json(&matched))
+        }
         Some("install") => Ok(render_skills_usage_json(Some("install"))),
         Some(args) if args.starts_with("install ") => {
             let target = args["install ".len()..].trim();
@@ -2419,8 +2497,25 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
 #[must_use]
 pub fn classify_skills_slash_command(args: Option<&str>) -> SkillSlashDispatch {
     match normalize_optional_args(args) {
-        None | Some("list" | "help" | "-h" | "--help") => SkillSlashDispatch::Local,
+        None | Some("list" | "help" | "-h" | "--help" | "show" | "info" | "describe") => {
+            SkillSlashDispatch::Local
+        }
+        Some(args)
+            if args
+                .split_whitespace()
+                .any(|part| matches!(part, "-h" | "--help")) =>
+        {
+            SkillSlashDispatch::Local
+        }
         Some(args) if args == "install" || args.starts_with("install ") => {
+            SkillSlashDispatch::Local
+        }
+        Some(args)
+            if args.starts_with("list ")
+                || args.starts_with("show ")
+                || args.starts_with("info ")
+                || args.starts_with("describe ") =>
+        {
             SkillSlashDispatch::Local
         }
         Some(args) => SkillSlashDispatch::Invoke(format!("${}", args.trim_start_matches('/'))),
@@ -2537,6 +2632,7 @@ pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
     ))
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn render_mcp_report_for(
     loader: &ConfigLoader,
     cwd: &Path,
@@ -2596,10 +2692,45 @@ fn render_mcp_report_for(
                 )),
             }
         }
+        Some(args) if args.split_whitespace().next() == Some("list") && args.contains(' ') => {
+            // `mcp list <filter>` — list does not accept arguments; treat as unsupported action.
+            Ok(render_mcp_unsupported_action_text(
+                args,
+                "list accepts no filter argument; use `claw mcp list`",
+            ))
+        }
+        Some(args) if matches!(args.split_whitespace().next(), Some("info" | "describe")) => {
+            Ok(render_mcp_unsupported_action_text(
+                args,
+                "use `claw mcp show <server>` to inspect a server",
+            ))
+        }
         Some(args) => Ok(render_mcp_usage(Some(args))),
     }
 }
 
+fn render_mcp_unsupported_action_text(action: &str, hint: &str) -> String {
+    format!(
+        "MCP\n  Error            unsupported action '{action}'\n  Hint             {hint}\n  Usage            /mcp [list|show <server>|help]"
+    )
+}
+
+fn render_mcp_unsupported_action_json(action: &str, hint: &str) -> Value {
+    json!({
+        "kind": "mcp",
+        "action": "error",
+        "ok": false,
+        "error_kind": "unsupported_action",
+        "requested_action": action,
+        "hint": hint,
+        "usage": {
+            "slash_command": "/mcp [list|show <server>|help]",
+            "direct_cli": "claw mcp [list|show <server>|help]",
+        },
+    })
+}
+
+#[allow(clippy::unnecessary_wraps)]
 fn render_mcp_report_json_for(
     loader: &ConfigLoader,
     cwd: &Path,
@@ -2679,6 +2810,18 @@ fn render_mcp_report_json_for(
                     "working_directory": cwd.display().to_string(),
                 })),
             }
+        }
+        Some(args) if args.split_whitespace().next() == Some("list") && args.contains(' ') => {
+            Ok(render_mcp_unsupported_action_json(
+                args,
+                "list accepts no filter argument; use `claw mcp list`",
+            ))
+        }
+        Some(args) if matches!(args.split_whitespace().next(), Some("info" | "describe")) => {
+            Ok(render_mcp_unsupported_action_json(
+                args,
+                "use `claw mcp show <server>` to inspect a server",
+            ))
         }
         Some(args) => Ok(render_mcp_usage_json(Some(args))),
     }
@@ -3659,6 +3802,7 @@ fn render_mcp_server_report(
         format!("  Working directory {}", cwd.display()),
         format!("  Name              {server_name}"),
         format!("  Scope             {}", config_source_label(server.scope)),
+        format!("  Required          {}", server.required),
         format!(
             "  Transport         {}",
             mcp_transport_label(&server.config)
@@ -4057,6 +4201,7 @@ fn mcp_server_details_json(config: &McpServerConfig) -> Value {
 fn mcp_server_json(name: &str, server: &ScopedMcpServerConfig) -> Value {
     json!({
         "name": name,
+        "required": server.required,
         "scope": config_source_json(server.scope),
         "transport": mcp_transport_json(&server.config),
         "summary": mcp_server_summary(&server.config),
@@ -4184,8 +4329,8 @@ mod tests {
         DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch, SlashCommand,
     };
     use plugins::{
-        PluginError, PluginKind, PluginLoadFailure, PluginManager, PluginManagerConfig,
-        PluginMetadata, PluginSummary,
+        PluginError, PluginKind, PluginLifecycle, PluginLoadFailure, PluginManager,
+        PluginManagerConfig, PluginMetadata, PluginSummary,
     };
     use runtime::{
         CompactionConfig, ConfigLoader, ContentBlock, ConversationMessage, MessageRole, Session,
@@ -4460,6 +4605,13 @@ mod tests {
             }))
         );
         assert_eq!(
+            SlashCommand::parse("/session exists abc123"),
+            Ok(Some(SlashCommand::Session {
+                action: Some("exists".to_string()),
+                target: Some("abc123".to_string())
+            }))
+        );
+        assert_eq!(
             SlashCommand::parse("/plugins install demo"),
             Ok(Some(SlashCommand::Plugins {
                 action: Some("install".to_string()),
@@ -4620,6 +4772,32 @@ mod tests {
     }
 
     #[test]
+    fn skills_show_and_list_filter_do_not_invoke_model() {
+        // `show`, `info`, `list <filter>` must route to Local, not Invoke.
+        // Regression for: `claw skills show plan` unexpectedly spawned a model session.
+        for token in &["show", "info", "describe"] {
+            assert_eq!(
+                classify_skills_slash_command(Some(token)),
+                SkillSlashDispatch::Local,
+                "`skills {token}` alone must be Local"
+            );
+        }
+        for prefix in &["show ", "info ", "list ", "describe "] {
+            let arg = format!("{prefix}plan");
+            assert_eq!(
+                classify_skills_slash_command(Some(&arg)),
+                SkillSlashDispatch::Local,
+                "`skills {arg}` must be Local, not Invoke"
+            );
+        }
+        // Bare invocable tokens still dispatch to Invoke.
+        assert_eq!(
+            classify_skills_slash_command(Some("plan")),
+            SkillSlashDispatch::Invoke("$plan".to_string()),
+        );
+    }
+
+    #[test]
     fn accepts_skills_invocation_arguments_for_prompt_dispatch() {
         assert_eq!(
             SlashCommand::parse("/skills help overview"),
@@ -4639,6 +4817,38 @@ mod tests {
             classify_skills_slash_command(Some("install ./skill-pack")),
             SkillSlashDispatch::Local
         );
+    }
+
+    #[test]
+    fn mcp_unsupported_actions_return_typed_error_not_generic_help() {
+        // `mcp info <name>` and `mcp list <filter>` must return typed errors, not raw help.
+        // Regression for #504: these previously fell through to render_mcp_usage with
+        // unexpected=arg, giving no machine-readable error_kind.
+        use crate::handle_mcp_slash_command_json;
+        use std::path::PathBuf;
+        let cwd = PathBuf::from("/tmp");
+
+        let info_json = handle_mcp_slash_command_json(Some("info nonexistent"), &cwd)
+            .expect("info nonexistent should not error at IO level");
+        assert_eq!(info_json["kind"], "mcp");
+        assert_eq!(info_json["ok"], false);
+        assert_eq!(info_json["error_kind"], "unsupported_action");
+        assert!(info_json["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("show"));
+
+        let list_filter_json = handle_mcp_slash_command_json(Some("list nonexistent"), &cwd)
+            .expect("list nonexistent should not error at IO level");
+        assert_eq!(list_filter_json["kind"], "mcp");
+        assert_eq!(list_filter_json["ok"], false);
+        assert_eq!(list_filter_json["error_kind"], "unsupported_action");
+
+        let describe_json = handle_mcp_slash_command_json(Some("describe myserver"), &cwd)
+            .expect("describe myserver should not error at IO level");
+        assert_eq!(describe_json["kind"], "mcp");
+        assert_eq!(describe_json["ok"], false);
+        assert_eq!(describe_json["error_kind"], "unsupported_action");
     }
 
     #[test]
@@ -4938,6 +5148,7 @@ mod tests {
                     root: None,
                 },
                 enabled: true,
+                lifecycle: PluginLifecycle::default(),
             },
             PluginSummary {
                 metadata: PluginMetadata {
@@ -4951,6 +5162,7 @@ mod tests {
                     root: None,
                 },
                 enabled: false,
+                lifecycle: PluginLifecycle::default(),
             },
         ]);
 
@@ -4977,6 +5189,7 @@ mod tests {
                     root: None,
                 },
                 enabled: true,
+                lifecycle: PluginLifecycle::default(),
             }],
             &[PluginLoadFailure::new(
                 PathBuf::from("/tmp/broken-plugin"),
@@ -5391,6 +5604,7 @@ mod tests {
                   "command": "uvx",
                   "args": ["alpha-server"],
                   "env": {"ALPHA_TOKEN": "secret"},
+                  "required": true,
                   "toolCallTimeoutMs": 1200
                 },
                 "remote": {
@@ -5436,6 +5650,7 @@ mod tests {
         let show = super::render_mcp_report_for(&loader, &workspace, Some("show alpha"))
             .expect("mcp show report should render");
         assert!(show.contains("Name              alpha"));
+        assert!(show.contains("Required          true"));
         assert!(show.contains("Command           uvx"));
         assert!(show.contains("Args              alpha-server"));
         assert!(show.contains("Env keys          ALPHA_TOKEN"));
@@ -5468,6 +5683,7 @@ mod tests {
                   "command": "uvx",
                   "args": ["alpha-server"],
                   "env": {"ALPHA_TOKEN": "secret"},
+                  "required": true,
                   "toolCallTimeoutMs": 1200
                 },
                 "remote": {
@@ -5504,6 +5720,7 @@ mod tests {
         assert_eq!(list["action"], "list");
         assert_eq!(list["configured_servers"], 2);
         assert_eq!(list["servers"][0]["name"], "alpha");
+        assert_eq!(list["servers"][0]["required"], true);
         assert_eq!(list["servers"][0]["transport"]["id"], "stdio");
         assert_eq!(list["servers"][0]["details"]["command"], "uvx");
         assert_eq!(list["servers"][1]["name"], "remote");
@@ -5519,6 +5736,7 @@ mod tests {
         assert_eq!(show["action"], "show");
         assert_eq!(show["found"], true);
         assert_eq!(show["server"]["name"], "alpha");
+        assert_eq!(show["server"]["required"], true);
         assert_eq!(show["server"]["details"]["env_keys"][0], "ALPHA_TOKEN");
         assert_eq!(show["server"]["details"]["tool_call_timeout_ms"], 1200);
 

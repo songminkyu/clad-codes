@@ -12,7 +12,17 @@
 // - Bridge connection status badge
 // - Plugin hint banners
 
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
+// EnableBracketedPaste is enabled on macOS and Linux only. On Windows, it causes
+// Windows Terminal to wrap Ctrl+V content in VT escape sequences that crossterm's
+// Windows Console API backend doesn't decode as `Event::Paste` — the bytes land as
+// raw key events, turning every `\n` into a prompt submit. Unix terminals (macOS/Linux)
+// handle bracketed paste correctly, allowing multi-line pastes to preserve newlines.
+#[cfg(not(target_os = "windows"))]
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -59,8 +69,6 @@ pub mod settings_screen;
 pub mod theme_screen;
 /// Color palette management for different themes and accessibility support.
 pub mod theme_colors;
-/// Privacy settings dialog.
-pub mod privacy_screen;
 /// Diff viewer dialog (two-pane: file list + unified diff detail).
 pub mod diff_viewer;
 /// Virtual scrollable list for efficient message rendering.
@@ -105,12 +113,16 @@ pub mod invalid_config_dialog;
 pub mod bypass_permissions_dialog;
 /// First-launch onboarding / welcome dialog.
 pub mod onboarding_dialog;
+/// Effort-level picker dialog (/effort).
+pub mod effort_picker;
 /// Reusable fuzzy-search selection dialog widget.
 pub mod dialog_select;
 /// Masked text input overlay for entering API keys.
 pub mod key_input_dialog;
 /// Modal dialog for entering custom provider URL + API key.
 pub mod custom_provider_dialog;
+/// Setup dialog for the composite "Free" provider (Zen → OpenRouter).
+pub mod free_mode_dialog;
 /// Device code / browser-based auth overlay (GitHub Copilot, Anthropic OAuth).
 pub mod device_auth_dialog;
 /// Push-to-talk voice capture and Whisper transcription.
@@ -121,6 +133,12 @@ pub mod tasks_overlay;
 pub mod import_config_dialog;
 /// Session branching overlay (Ctrl+B) — create and switch between conversation branches.
 pub mod session_branching;
+/// Model-initiated question dialog (AskUserQuestion tool).
+pub mod ask_user_dialog;
+/// File injection utilities for parsing @file references.
+pub mod file_injection;
+/// File injection warning dialog (shown when oversized files detected).
+pub mod file_injection_dialog;
 
 // ---------------------------------------------------------------------------
 // Public re-exports
@@ -152,11 +170,40 @@ pub use onboarding_dialog::{OnboardingDialogState, render_onboarding_dialog};
 pub use dialog_select::{DialogSelectState, SelectItem, render_dialog_select};
 pub use key_input_dialog::{KeyInputDialogState, render_key_input_dialog};
 pub use custom_provider_dialog::{CustomProviderDialogState, CustomProviderField, render_custom_provider_dialog};
+pub use free_mode_dialog::{FreeModeDialogState, FreeModeField, render_free_mode_dialog};
 pub use device_auth_dialog::{DeviceAuthDialogState, DeviceAuthStatus, DeviceAuthEvent, render_device_auth_dialog};
+pub use file_injection::{parse_at_refs, build_file_blocks, AtFileRef, AtFileIssue};
+pub use file_injection_dialog::{FileInjectionDialogState, FileInjectionOutcome, render_file_injection_dialog};
 
 // ---------------------------------------------------------------------------
 // Terminal initialization / teardown helpers (public API)
 // ---------------------------------------------------------------------------
+
+/// Restore terminal capabilities (alternate screen, mouse capture, bracketed paste, keyboard enhancement).
+/// Used by both restore_terminal and the panic hook.
+fn restore_terminal_cleanup() -> io::Result<()> {
+    #[cfg(not(target_os = "windows"))]
+    execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        PopKeyboardEnhancementFlags,
+    )?;
+
+    // On Windows, KeyboardEnhancementFlags may not have been pushed
+    // (conhost / older terminals reject the escape).  Pop is harmless
+    // whether it succeeded or not — ignore errors on restore.
+    #[cfg(target_os = "windows")]
+    {
+        // Pop may fail on legacy Windows conhost where the push was a no-op;
+        // do it best-effort so cleanup never errors out the process.
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+    }
+
+    Ok(())
+}
 
 /// Set up the terminal for TUI mode (raw mode + alternate screen + mouse capture).
 ///
@@ -177,19 +224,47 @@ pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
         if std::thread::current().id() == main_thread_id {
             // Best-effort restore — ignore errors, we're already unwinding.
             let _ = disable_raw_mode();
-            let _ = execute!(
-                io::stdout(),
-                LeaveAlternateScreen,
-                DisableMouseCapture,
-                crossterm::cursor::Show,
-            );
+            let _ = restore_terminal_cleanup();
+            let _ = execute!(io::stdout(), crossterm::cursor::Show);
         }
         original_hook(panic_info);
     }));
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+
+    #[cfg(not(target_os = "windows"))]
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+        ),
+    )?;
+
+    // On Windows, keyboard enhancement is best-effort: conhost and older
+    // terminal builds do not support the kitty keyboard protocol.
+    // crossterm 0.29 improved detection but may still reject in some
+    // configurations.  Warn the user when it fails, then continue.
+    #[cfg(target_os = "windows")]
+    {
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        // Kitty keyboard protocol is unsupported on legacy Windows conhost;
+        // best-effort — modern Windows Terminal accepts it, conhost returns
+        // "Keyboard progressive enhancement not implemented for the legacy
+        // Windows API" which we ignore so the TUI can still start.
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+            ),
+        );
+    }
+
     set_terminal_title("\u{1f980} Claurst");
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
@@ -204,7 +279,7 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io
         terminal.backend_mut(),
         crossterm::terminal::SetTitle(""),
     );
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    restore_terminal_cleanup()?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -1199,6 +1274,4 @@ mod tests {
         assert_eq!(pr.options[3].key, 'n');
     }
 }
-
-
 

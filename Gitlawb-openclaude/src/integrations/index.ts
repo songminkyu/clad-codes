@@ -113,11 +113,15 @@ export {
   getRouteLabel,
   getRouteProviderTypeLabel,
   getTransportKindForRoute,
+  normalizeXiaomiMimoBaseUrl,
   resolveActiveRouteIdFromEnv,
   resolveRouteIdFromBaseUrl,
   routeSupportsApiFormatSelection,
   routeSupportsAuthHeaders,
   routeSupportsCustomHeaders,
+  routeShowsAuthHeader,
+  routeShowsAuthHeaderValue,
+  routeShowsCustomHeaders,
 } from './routeMetadata.js'
 export {
   getProviderPresetUiMetadata,

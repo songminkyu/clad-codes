@@ -2,10 +2,12 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { acquireSharedMutationLock, releaseSharedMutationLock } from '../../test/sharedMutationLock.js'
 import {
   codexStreamToAnthropic,
   convertAnthropicMessagesToResponsesInput,
   convertCodexResponseToAnthropicMessage,
+  convertSystemPrompt,
   convertToolsToResponsesTools,
 } from './codexShim.js'
 import { __test as webSearchToolTest } from '../../tools/WebSearchTool/WebSearchTool.js'
@@ -18,22 +20,30 @@ const originalEnv = {
   OPENAI_MODEL: process.env.OPENAI_MODEL,
 }
 
+beforeEach(async () => {
+  await acquireSharedMutationLock('codexShim.test.ts')
+})
+
 afterEach(() => {
-  if (originalEnv.OPENAI_BASE_URL === undefined) delete process.env.OPENAI_BASE_URL
-  else process.env.OPENAI_BASE_URL = originalEnv.OPENAI_BASE_URL
+  try {
+    if (originalEnv.OPENAI_BASE_URL === undefined) delete process.env.OPENAI_BASE_URL
+    else process.env.OPENAI_BASE_URL = originalEnv.OPENAI_BASE_URL
 
-  if (originalEnv.OPENAI_API_BASE === undefined) delete process.env.OPENAI_API_BASE
-  else process.env.OPENAI_API_BASE = originalEnv.OPENAI_API_BASE
+    if (originalEnv.OPENAI_API_BASE === undefined) delete process.env.OPENAI_API_BASE
+    else process.env.OPENAI_API_BASE = originalEnv.OPENAI_API_BASE
 
-  if (originalEnv.CLAUDE_CODE_USE_GITHUB === undefined) delete process.env.CLAUDE_CODE_USE_GITHUB
-  else process.env.CLAUDE_CODE_USE_GITHUB = originalEnv.CLAUDE_CODE_USE_GITHUB
+    if (originalEnv.CLAUDE_CODE_USE_GITHUB === undefined) delete process.env.CLAUDE_CODE_USE_GITHUB
+    else process.env.CLAUDE_CODE_USE_GITHUB = originalEnv.CLAUDE_CODE_USE_GITHUB
 
-  if (originalEnv.OPENAI_MODEL === undefined) delete process.env.OPENAI_MODEL
-  else process.env.OPENAI_MODEL = originalEnv.OPENAI_MODEL
+    if (originalEnv.OPENAI_MODEL === undefined) delete process.env.OPENAI_MODEL
+    else process.env.OPENAI_MODEL = originalEnv.OPENAI_MODEL
 
-  while (tempDirs.length > 0) {
-    const dir = tempDirs.pop()
-    if (dir) rmSync(dir, { recursive: true, force: true })
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop()
+      if (dir) rmSync(dir, { recursive: true, force: true })
+    }
+  } finally {
+    releaseSharedMutationLock()
   }
 })
 
@@ -480,6 +490,129 @@ describe('Codex request translation', () => {
     ])
   })
 
+  test('defaults untyped MCP tool properties to string for Codex strict mode (issue #1114)', () => {
+    // Repro from issue #1114: MCP server (Ruflo) registers a `value` parameter
+    // with no `type`, which makes Codex strict mode 400 with
+    // "schema must have a 'type' key".
+    const tools = convertToolsToResponsesTools([
+      {
+        name: 'mcp__ruflo__config_set',
+        description: 'Set a Ruflo config value',
+        input_schema: {
+          type: 'object',
+          properties: {
+            key: { type: 'string' },
+            value: { description: 'Any JSON value' },
+          },
+          required: ['key', 'value'],
+        },
+      },
+    ])
+
+    const valueSchema = (tools[0].parameters as Record<string, Record<string, Record<string, unknown>>>).properties.value
+    expect(valueSchema.type).toBe('string')
+    expect(valueSchema.description).toBe('Any JSON value')
+  })
+
+  test('drops orphan required keys when Ruflo MCP schema has no properties', () => {
+    const tools = convertToolsToResponsesTools([
+      {
+        name: 'mcp__ruflo__daa_workflow_create',
+        description: 'Create a Ruflo DAA workflow',
+        input_schema: {
+          type: 'object',
+          required: ['steps'],
+        },
+      },
+    ])
+
+    expect(tools[0].parameters).toEqual({
+      type: 'object',
+      properties: {},
+      required: [],
+      additionalProperties: false,
+    })
+  })
+
+  test('infers object type for untyped schemas with nested properties', () => {
+    const tools = convertToolsToResponsesTools([
+      {
+        name: 'mcp__nest__call',
+        input_schema: {
+          type: 'object',
+          properties: {
+            payload: {
+              properties: { name: { type: 'string' } },
+            },
+          },
+        },
+      },
+    ])
+
+    const payload = (tools[0].parameters as Record<string, Record<string, Record<string, unknown>>>).properties.payload
+    expect(payload.type).toBe('object')
+  })
+
+  test('infers array type for untyped schemas with items', () => {
+    const tools = convertToolsToResponsesTools([
+      {
+        name: 'mcp__list__call',
+        input_schema: {
+          type: 'object',
+          properties: {
+            tags: { items: { type: 'string' } },
+          },
+        },
+      },
+    ])
+
+    const tags = (tools[0].parameters as Record<string, Record<string, Record<string, unknown>>>).properties.tags
+    expect(tags.type).toBe('array')
+  })
+
+  test('infers type from enum values when type is missing', () => {
+    const tools = convertToolsToResponsesTools([
+      {
+        name: 'mcp__enum__call',
+        input_schema: {
+          type: 'object',
+          properties: {
+            mode: { enum: ['fast', 'slow'] },
+            level: { enum: [1, 2, 3] },
+            ratio: { enum: [0.5, 1.5] },
+            flag: { enum: [true, false] },
+          },
+        },
+      },
+    ])
+
+    const props = (tools[0].parameters as Record<string, Record<string, Record<string, unknown>>>).properties
+    expect(props.mode.type).toBe('string')
+    expect(props.level.type).toBe('integer')
+    expect(props.ratio.type).toBe('number')
+    expect(props.flag.type).toBe('boolean')
+  })
+
+  test('leaves combinator-only schemas untyped to preserve alternatives', () => {
+    const tools = convertToolsToResponsesTools([
+      {
+        name: 'mcp__combo__call',
+        input_schema: {
+          type: 'object',
+          properties: {
+            either: {
+              anyOf: [{ type: 'string' }, { type: 'number' }],
+            },
+          },
+        },
+      },
+    ])
+
+    const either = (tools[0].parameters as Record<string, Record<string, Record<string, unknown>>>).properties.either
+    expect(either.type).toBeUndefined()
+    expect(either.anyOf).toEqual([{ type: 'string' }, { type: 'number' }])
+  })
+
   test('converts assistant tool use and user tool result into Responses items', () => {
     const items = convertAnthropicMessagesToResponsesInput([
       {
@@ -880,6 +1013,43 @@ describe('Codex request translation', () => {
 
     expect(textDeltas.join('')).toBe(
       'I should note that the user role requires a briefly concise friendly response format.',
+    )
+  })
+})
+
+describe('convertSystemPrompt', () => {
+  test('strips Anthropic attribution header block from text-block array (#607)', () => {
+    const result = convertSystemPrompt([
+      {
+        type: 'text',
+        text:
+          'x-anthropic-billing-header: cc_version=0.8.0.abc123; ' +
+          'cc_entrypoint=cli;',
+      },
+      { type: 'text', text: 'You are Claude Code.' },
+      { type: 'text', text: 'Project context: bun + react.' },
+    ])
+
+    expect(result).not.toContain('x-anthropic-billing-header')
+    expect(result).not.toContain('cc_version=')
+    expect(result).toContain('You are Claude Code.')
+    expect(result).toContain('Project context: bun + react.')
+  })
+
+  test('returns empty string when only the attribution block is present', () => {
+    const result = convertSystemPrompt([
+      {
+        type: 'text',
+        text: 'x-anthropic-billing-header: cc_version=0.8.0.abc;',
+      },
+    ])
+
+    expect(result).toBe('')
+  })
+
+  test('passes plain string system prompts through untouched', () => {
+    expect(convertSystemPrompt('You are Claude Code.')).toBe(
+      'You are Claude Code.',
     )
   })
 })

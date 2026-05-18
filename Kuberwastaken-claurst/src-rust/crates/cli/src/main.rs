@@ -10,6 +10,7 @@
 
 mod oauth_flow;
 mod codex_oauth_flow;
+mod upgrade;
 
 // ---------------------------------------------------------------------------
 // Build-time metadata (embedded via build.rs)
@@ -112,7 +113,7 @@ impl Tool for McpToolWrapper {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "claude",
+    name = "claurst",
     version = APP_VERSION,
     about = "Claurst - AI-powered coding assistant",
     long_about = None,
@@ -133,8 +134,8 @@ struct Cli {
     #[arg(long = "permission-mode", value_enum, default_value_t = CliPermissionMode::Default)]
     permission_mode: CliPermissionMode,
 
-    /// Resume a previous session by ID
-    #[arg(long = "resume")]
+    /// Resume a previous session by ID (omit ID to resume the most recent session)
+    #[arg(long = "resume", num_args(0..=1), default_missing_value("__last__"))]
     resume: Option<String>,
 
     /// Maximum number of agentic turns
@@ -174,7 +175,7 @@ struct Cli {
     cwd: Option<PathBuf>,
 
     /// Bypass all permission checks (danger!)
-    #[arg(long = "dangerously-skip-permissions", action = ArgAction::SetTrue)]
+    #[arg(long = "dangerously-skip-permissions", visible_alias = "yolo", action = ArgAction::SetTrue)]
     dangerously_skip_permissions: bool,
 
     /// Dump the system prompt to stdout and exit
@@ -188,6 +189,10 @@ struct Cli {
     /// Disable auto-compaction
     #[arg(long = "no-auto-compact", action = ArgAction::SetTrue)]
     no_auto_compact: bool,
+
+    /// Enable shadow-git auto-commit snapshots (enables /revert, /checkpoints, /snapshot)
+    #[arg(long = "auto-commits", action = ArgAction::SetTrue)]
+    auto_commits: bool,
 
     /// Grant Claurst access to an additional directory (can be repeated)
     #[arg(long = "add-dir", value_name = "DIR", action = ArgAction::Append)]
@@ -344,7 +349,7 @@ async fn main() -> anyhow::Result<()> {
     // Fast-path: handle --version before parsing everything
     let raw_args: Vec<String> = std::env::args().collect();
     if raw_args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("claude {}", APP_VERSION);
+        println!("claurst {}", APP_VERSION);
         return Ok(());
     }
 
@@ -353,34 +358,21 @@ async fn main() -> anyhow::Result<()> {
         return handle_auth_command(&raw_args[2..]).await;
     }
 
+    // Fast-path: `claurst upgrade [--version <v>] [--force]` — self-update.
+    if raw_args.get(1).map(|s| s.as_str()) == Some("upgrade") {
+        return upgrade::run_upgrade(&raw_args[2..]).await;
+    }
+
     // Fast-path: `claude acp` — start the Agent Client Protocol stdio server.
     if raw_args.get(1).map(|s| s.as_str()) == Some("acp") {
         return claurst_acp::run_acp_server().await;
     }
 
-    // Fast-path: `claude models` — list all available providers and models.
+    // Fast-path: `claurst models [provider] [--refresh] [--verbose] [--json]`
+    //   — list all available providers and models from the bundled snapshot
+    //     plus any disk-cached overlay from models.dev.
     if raw_args.get(1).map(|s| s.as_str()) == Some("models") {
-        let mut registry = claurst_api::ModelRegistry::new();
-        // Load cached models.dev data if available so the list is comprehensive.
-        registry.load_cache(&models_cache_path());
-        let mut entries = registry.list_all();
-        // Sort by provider then model id for stable output.
-        entries.sort_by(|a, b| {
-            (&*a.info.provider_id).cmp(&*b.info.provider_id)
-                .then_with(|| (&*a.info.id).cmp(&*b.info.id))
-        });
-        for entry in entries {
-            println!(
-                "{}/{} — {} (ctx: {}K, in: ${:.2}/M, out: ${:.2}/M)",
-                entry.info.provider_id,
-                entry.info.id,
-                entry.info.name,
-                entry.info.context_window / 1000,
-                entry.cost_input.unwrap_or(0.0),
-                entry.cost_output.unwrap_or(0.0),
-            );
-        }
-        return Ok(());
+        return run_models_command(&raw_args[2..]).await;
     }
 
     // Fast-path: named commands (`claude agents`, `claude ide`, `claude branch`, …)
@@ -487,6 +479,9 @@ async fn main() -> anyhow::Result<()> {
     config.additional_dirs = cli.add_dir.clone();
     if cli.no_auto_compact {
         config.auto_compact = false;
+    }
+    if cli.auto_commits {
+        config.auto_commits = Some(true);
     }
     config.project_dir = Some(cwd.clone());
     if let Some(p) = &cli.provider {
@@ -619,6 +614,14 @@ async fn main() -> anyhow::Result<()> {
 
     let pending_permissions = Arc::new(ParkingMutex::new(claurst_tools::PendingPermissionStore::default()));
 
+    let is_non_interactive = cli.print || cli.prompt.is_some();
+
+    // Side-channel for the AskUserQuestion tool to send questions to the TUI.
+    // Only created in interactive mode; None in headless/print mode.
+    let (user_question_tx, user_question_rx) =
+        tokio::sync::mpsc::unbounded_channel::<claurst_tools::UserQuestionEvent>();
+    let user_question_rx = if is_non_interactive { None } else { Some(user_question_rx) };
+
     let tool_ctx = ToolContext {
         working_dir: cwd.clone(),
         permission_mode: config.permission_mode.clone(),
@@ -627,14 +630,29 @@ async fn main() -> anyhow::Result<()> {
         session_id: session_id.clone(),
         file_history: file_history.clone(),
         current_turn: current_turn.clone(),
-        non_interactive: cli.print || cli.prompt.is_some(),
+        non_interactive: is_non_interactive,
         mcp_manager: mcp_manager_arc.clone(),
         config: config.clone(),
         managed_agent_config: config.managed_agents.clone(),
         completion_notifier: None,
         pending_permissions: Some(pending_permissions.clone()),
         permission_manager: Some(permission_manager.clone()),
+        user_question_tx: if is_non_interactive { None } else { Some(user_question_tx) },
     };
+
+    // Hourly shadow-snapshot GC loop: only runs when snapshot is explicitly enabled.
+    if config.auto_commits == Some(true) {
+        let gc_dir = cwd.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            loop {
+                if let Some(snap) = claurst_core::snapshot::get_or_create(&gc_dir) {
+                    snap.cleanup().await;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+    }
 
     // Register the cc-query-backed agent runner so TeamCreateTool can spawn real
     // sub-agents.  Must be called before any tool execution begins.
@@ -776,6 +794,7 @@ async fn main() -> anyhow::Result<()> {
             bridge_config,
             has_credentials,
             model_registry,
+            user_question_rx,
         )
         .await
     };
@@ -824,22 +843,267 @@ fn model_cache_dir() -> PathBuf {
         .join("claurst")
 }
 
-fn models_cache_path() -> PathBuf {
-    model_cache_dir().join("models.json")
+/// Resolve the models.dev source URL, honoring env-var overrides.
+fn models_source_url() -> String {
+    std::env::var("CLAURST_MODELS_URL")
+        .or_else(|_| std::env::var("MODELS_DEV_URL"))
+        .unwrap_or_else(|_| "https://models.dev/api.json".to_string())
 }
 
+/// Default cache filename — derived from the source URL so a custom
+/// `CLAURST_MODELS_URL` doesn't stomp the canonical models.dev cache.
+fn models_cache_path() -> PathBuf {
+    let url = models_source_url();
+    let filename = if url == "https://models.dev/api.json" {
+        "models.json".to_string()
+    } else {
+        // Hash the source URL into the filename so two different mirrors
+        // each get their own cache file.
+        let h = xxhash_rust::xxh64::xxh64(url.as_bytes(), 0);
+        format!("models-{:016x}.json", h)
+    };
+    model_cache_dir().join(filename)
+}
+
+/// Legacy cache file location — kept so old installs don't lose their
+/// previously-fetched data on first run with the new layout.
 fn models_dev_cache_path() -> PathBuf {
     model_cache_dir().join("models_dev.json")
 }
 
+/// Implementation of the `claurst models` subcommand.
+///
+/// Flags:
+///   * `--refresh`   — force-fetch from models.dev (ignoring the 5-minute
+///                     freshness window), then list.
+///   * `--verbose`   — also print release date, status, modalities,
+///                     cache pricing, and capability flags.
+///   * `--json`      — emit the registry as a JSON object keyed by
+///                     `provider/model` (suitable for piping into `jq`).
+///   * `<provider>`  — first non-flag arg filters by provider id
+///                     (e.g. `claurst models openai`).
+async fn run_models_command(args: &[String]) -> anyhow::Result<()> {
+    let mut refresh = false;
+    let mut verbose = false;
+    let mut as_json = false;
+    let mut provider_filter: Option<String> = None;
+
+    for arg in args {
+        match arg.as_str() {
+            "--refresh" | "-r" => refresh = true,
+            "--verbose" | "-v" => verbose = true,
+            "--json" => as_json = true,
+            s if s.starts_with("--") => {
+                eprintln!("claurst models: unknown flag: {}", s);
+                eprintln!("Usage: claurst models [<provider>] [--refresh] [--verbose] [--json]");
+                std::process::exit(2);
+            }
+            s => {
+                if provider_filter.is_some() {
+                    eprintln!("claurst models: only one provider id may be supplied");
+                    std::process::exit(2);
+                }
+                provider_filter = Some(s.to_string());
+            }
+        }
+    }
+
+    let mut registry = claurst_api::ModelRegistry::new()
+        .with_cache_path(models_cache_path());
+
+    if refresh {
+        // Force-refresh by clearing the freshness check first.
+        let _ = std::fs::remove_file(models_cache_path());
+        match registry.refresh_from_models_dev().await {
+            Ok(true) => eprintln!("✓ Refreshed from {}", models_source_url()),
+            Ok(false) => eprintln!("(no refresh performed — disabled via env or cache fresh)"),
+            Err(err) => eprintln!("⚠ refresh failed: {}", err),
+        }
+    } else {
+        // Best-effort: overlay any disk-cached copy on top of the bundled
+        // snapshot.  Path may not exist on first run — that's fine.
+        registry.load_cache(&models_cache_path());
+    }
+
+    let mut entries: Vec<&claurst_api::ModelEntry> = match &provider_filter {
+        Some(pid) => registry.list_by_provider(pid),
+        None => registry.list_all(),
+    };
+
+    // Stable order: provider id, then by descending release_date so newest
+    // models appear first.
+    entries.sort_by(|a, b| {
+        (&*a.info.provider_id)
+            .cmp(&*b.info.provider_id)
+            .then_with(|| {
+                let rd_a = a.release_date.as_deref().unwrap_or("");
+                let rd_b = b.release_date.as_deref().unwrap_or("");
+                rd_b.cmp(rd_a)
+            })
+            .then_with(|| (&*a.info.id).cmp(&*b.info.id))
+    });
+
+    if as_json {
+        // Re-key by `provider/model` for jq-friendly output.
+        let mut map: std::collections::BTreeMap<String, &claurst_api::ModelEntry> =
+            std::collections::BTreeMap::new();
+        for e in &entries {
+            map.insert(format!("{}/{}", e.info.provider_id, e.info.id), *e);
+        }
+        let json = serde_json::to_string_pretty(&map)?;
+        println!("{}", json);
+        return Ok(());
+    }
+
+    if entries.is_empty() {
+        if let Some(pid) = &provider_filter {
+            eprintln!("No models found for provider '{}'.", pid);
+            eprintln!("Try: claurst models                # list all providers");
+            eprintln!("     claurst models --refresh      # pull latest from models.dev");
+        } else {
+            eprintln!("No models in registry.  Try `claurst models --refresh`.");
+        }
+        return Ok(());
+    }
+
+    let total = entries.len();
+
+    for entry in &entries {
+        let ctx_k = entry.info.context_window / 1000;
+        let in_cost = entry.cost_input.unwrap_or(0.0);
+        let out_cost = entry.cost_output.unwrap_or(0.0);
+
+        let mut flags = Vec::new();
+        if entry.tool_calling { flags.push("tools"); }
+        if entry.reasoning { flags.push("reasoning"); }
+        if entry.vision() { flags.push("vision"); }
+        if entry.audio_input() { flags.push("audio"); }
+        if entry.pdf_input() { flags.push("pdf"); }
+        let flags_str = if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join(",")) };
+
+        if verbose {
+            println!(
+                "{}/{}  {}  ctx={}K  out={}K  in=${:.2}/M  out=${:.2}/M{}",
+                entry.info.provider_id,
+                entry.info.id,
+                entry.info.name,
+                ctx_k,
+                entry.info.max_output_tokens / 1000,
+                in_cost,
+                out_cost,
+                flags_str,
+            );
+            if let Some(rd) = &entry.release_date {
+                println!("    released {}", rd);
+            }
+            if let Some(k) = &entry.knowledge {
+                println!("    knowledge cutoff {}", k);
+            }
+            if let (Some(cr), Some(cw)) = (entry.cost_cache_read, entry.cost_cache_write) {
+                println!("    cache: read=${:.2}/M  write=${:.2}/M", cr, cw);
+            } else if let Some(cr) = entry.cost_cache_read {
+                println!("    cache read=${:.2}/M", cr);
+            }
+            if !matches!(entry.status, claurst_api::ModelStatus::Active) {
+                println!("    status: {:?}", entry.status);
+            }
+            if !entry.modalities_input.is_empty() {
+                println!(
+                    "    modalities: in=[{}] out=[{}]",
+                    entry
+                        .modalities_input
+                        .iter()
+                        .map(|m| format!("{:?}", m).to_lowercase())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    entry
+                        .modalities_output
+                        .iter()
+                        .map(|m| format!("{:?}", m).to_lowercase())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+            }
+        } else {
+            println!(
+                "{}/{} — {} (ctx: {}K, in: ${:.2}/M, out: ${:.2}/M){}",
+                entry.info.provider_id,
+                entry.info.id,
+                entry.info.name,
+                ctx_k,
+                in_cost,
+                out_cost,
+                flags_str,
+            );
+        }
+    }
+
+    if provider_filter.is_none() {
+        eprintln!(
+            "\n{} models across {} providers.  Use `claurst models <provider>` to filter.",
+            total,
+            registry.provider_count()
+        );
+    }
+
+    Ok(())
+}
+
 fn load_cached_model_registry() -> Arc<claurst_api::ModelRegistry> {
     let mut reg = claurst_api::ModelRegistry::new();
-    reg.load_cache(&models_cache_path());
+    // CLAURST_MODELS_PATH wins outright — useful for offline dev where you
+    // pin a known-good api.json on disk.
+    if let Ok(custom) = std::env::var("CLAURST_MODELS_PATH") {
+        reg.load_cache(&PathBuf::from(custom));
+    } else {
+        reg.load_cache(&models_cache_path());
+        // Migration nicety: if the new cache file is missing but the old
+        // one exists, ingest it once.
+        if !models_cache_path().exists() {
+            reg.load_cache(&models_dev_cache_path());
+        }
+    }
     Arc::new(reg)
 }
 
+/// Whether the cache file is fresh enough to skip refreshing.
+fn cache_is_fresh(path: &std::path::Path, ttl: std::time::Duration) -> bool {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let mtime = match meta.modified() {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    match mtime.elapsed() {
+        Ok(age) => age < ttl,
+        Err(_) => true, // future mtime → treat as fresh
+    }
+}
+
+/// Background-refresh the models cache from the configured source URL.
+///
+/// Honors:
+/// * `CLAURST_DISABLE_MODELS_FETCH` — skips the network call entirely.
+/// * `CLAURST_MODELS_URL` / `MODELS_DEV_URL` — overrides the source URL.
+/// * 5-minute mtime-based freshness check — avoids hammering models.dev
+///   on every CLI invocation.
 fn spawn_models_cache_refresh() {
-    let cache_paths = vec![models_cache_path(), models_dev_cache_path()];
+    if std::env::var("CLAURST_DISABLE_MODELS_FETCH").is_ok() {
+        tracing::debug!("CLAURST_DISABLE_MODELS_FETCH set — skipping models.dev refresh");
+        return;
+    }
+
+    let cache_path = models_cache_path();
+    let legacy_cache_path = models_dev_cache_path();
+    let ttl = std::time::Duration::from_secs(5 * 60);
+
+    if cache_is_fresh(&cache_path, ttl) {
+        tracing::debug!("Models cache fresh — skipping models.dev refresh");
+        return;
+    }
+
     tokio::spawn(async move {
         let client = match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -848,26 +1112,34 @@ fn spawn_models_cache_refresh() {
             Ok(c) => c,
             Err(_) => return,
         };
-        let url = std::env::var("MODELS_DEV_URL")
-            .unwrap_or_else(|_| "https://models.dev/api.json".to_string());
-        if let Ok(resp) = client
+        let url = models_source_url();
+        let resp = match client
             .get(&url)
-            .header("User-Agent", "Claurst/0.0.9")
+            .header("User-Agent", concat!("Claurst/", env!("CARGO_PKG_VERSION")))
             .send()
             .await
         {
-            if resp.status().is_success() {
-                if let Ok(text) = resp.text().await {
-                    if let Some(parent) = cache_paths[0].parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    for path in &cache_paths {
-                        let _ = std::fs::write(path, &text);
-                    }
-                    tracing::info!("Models cache refreshed from models.dev");
-                }
+            Ok(r) => r,
+            Err(err) => {
+                tracing::debug!(?err, "models.dev refresh: network error");
+                return;
             }
+        };
+        if !resp.status().is_success() {
+            tracing::debug!(status = ?resp.status(), "models.dev refresh: non-2xx");
+            return;
         }
+        let text = match resp.text().await {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        if let Some(parent) = cache_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Write canonical path + legacy path so older installs keep working.
+        let _ = std::fs::write(&cache_path, &text);
+        let _ = std::fs::write(&legacy_cache_path, &text);
+        tracing::info!(path = %cache_path.display(), "Models cache refreshed from {}", url);
     });
 }
 
@@ -1310,6 +1582,7 @@ async fn run_interactive(
     bridge_config: Option<claurst_bridge::BridgeConfig>,
     has_credentials: bool,
     model_registry: Arc<claurst_api::ModelRegistry>,
+    user_question_rx: Option<tokio::sync::mpsc::UnboundedReceiver<claurst_tools::UserQuestionEvent>>,
 ) -> anyhow::Result<()> {
     use claurst_commands::{execute_command, CommandContext, CommandResult};
     use claurst_bridge::{BridgeOutbound, TuiBridgeEvent};
@@ -1327,6 +1600,23 @@ async fn run_interactive(
     let mut client = client;
     let mut model_registry = model_registry;
     let mut tool_ctx = tool_ctx;
+    let mut resume_warning: Option<String> = None;
+    let resume_id = if resume_id.as_deref() == Some("__last__") {
+        let sessions = claurst_core::history::list_sessions().await;
+        match sessions.first() {
+            Some(last) => {
+                println!("Resuming most recent session: {}", last.id);
+                Some(last.id.clone())
+            }
+            None => {
+                resume_warning = Some("No previous sessions found, starting new session.".into());
+                None
+            }
+        }
+    } else {
+        resume_id
+    };
+
     let mut session = if let Some(ref id) = resume_id {
         match claurst_core::history::load_session(id).await {
             Ok(session) => {
@@ -1341,7 +1631,7 @@ async fn run_interactive(
                 session
             }
             Err(e) => {
-                eprintln!("Warning: could not load session {}: {}", id, e);
+                resume_warning = Some(format!("Could not load session {}: {}. Starting new session.", id, e));
                 let mut session =
                     claurst_core::history::ConversationSession::new(
                         claurst_api::effective_model_for_config(&config, &model_registry),
@@ -1375,6 +1665,9 @@ async fn run_interactive(
     // Set up terminal
     let mut terminal = setup_terminal()?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    if let Some(warning) = resume_warning {
+        app.status_message = Some(warning);
+    }
     // Sync initial effort level (from --effort flag or /effort command) to TUI indicator.
     if let Some(level) = base_query_config.effort_level {
         use claurst_tui::EffortLevel as TuiEL;
@@ -1394,6 +1687,12 @@ async fn run_interactive(
     // disk whenever the /model picker opens.
     {
         spawn_models_cache_refresh();
+    }
+
+    // Wire the ask-user question channel into the app so the TUI can show
+    // the dialog and return an answer to the query loop.
+    if let Some(rx) = user_question_rx {
+        app.user_question_rx = Some(rx);
     }
 
     app.config.project_dir = Some(tool_ctx.working_dir.clone());
@@ -1427,25 +1726,28 @@ async fn run_interactive(
         app.agent_mode = Some(agent_name.clone());
     }
 
-    // Show onboarding: status hint if no credentials, welcome tour if first run.
-    // Skip the welcome tour entirely if the user already has credentials — they've
-    // clearly set things up (via /connect or env vars) and don't need onboarding.
-    if !has_credentials {
-        if !settings.has_completed_onboarding {
-            app.onboarding_dialog.show();
-        } else {
-            app.status_message = Some("No provider configured. Run /connect to set one up.".to_string());
-        }
-    } else if !settings.has_completed_onboarding {
-        // User has credentials but hasn't formally completed onboarding — mark it done
-        // silently so they never see it.
-        let _ = claurst_tui::App::persist_onboarding_complete_pub();
-    }
-
     // Mirror TS BypassPermissionsModeDialog.tsx startup gate
+    // Shown as the highest-priority startup dialog (blocks all other UI).
+    // Only show once per session — subsequent sessions in the same directory
+    // will show the dialog again (not persisted across sessions).
     use claurst_core::config::PermissionMode;
-    if live_config.permission_mode == PermissionMode::BypassPermissions {
+    if live_config.permission_mode == PermissionMode::BypassPermissions && !app.bypass_permissions_dialog_shown {
         app.bypass_permissions_dialog.show();
+        app.bypass_permissions_dialog_shown = true;
+    } else if live_config.permission_mode != PermissionMode::BypassPermissions {
+        // Show onboarding only if NOT in bypass-permissions mode.
+        // Bypass dialog is a mandatory security gate and takes absolute priority.
+        if !has_credentials {
+            if !settings.has_completed_onboarding {
+                app.onboarding_dialog.show();
+            } else {
+                app.status_message = Some("No provider configured. Run /connect to set one up.".to_string());
+            }
+        } else if !settings.has_completed_onboarding {
+            // User has credentials but hasn't formally completed onboarding — mark it done
+            // silently so they never see it.
+            let _ = claurst_tui::App::persist_onboarding_complete_pub();
+        }
     }
 
     // Version-upgrade notice: record the current version for future comparisons.
@@ -1580,6 +1882,8 @@ async fn run_interactive(
     // Active effort level (None = use model default / High).
     // Tracks the user's /effort selection; flows into qcfg each turn.
     let mut current_effort: Option<claurst_core::effort::EffortLevel> = None;
+    // Timestamp of when the most recent query turn was dispatched (for goal elapsed tracking).
+    let mut goal_turn_start: std::time::Instant = std::time::Instant::now();
 
     // Background update check: spawned once at startup; result delivered via channel.
     let (update_tx, mut update_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
@@ -1623,12 +1927,45 @@ async fn run_interactive(
         app.tick_rustle_pose();
         app.notifications.tick();
 
+        // Process file injection dialog outcome (if any)
+        if let Some((outcome, pending_input, _pending_imgs)) = app.file_injection_dialog.take_outcome() {
+            use claurst_tui::FileInjectionOutcome;
+
+            if matches!(outcome, FileInjectionOutcome::Abort) {
+                // Abort: input already restored to prompt by app.rs handler
+                continue;
+            }
+
+            // InjectAll or SkipOversized: restore input to prompt for resubmission
+            // Images attached when dialog was shown are discarded; user can re-attach if needed
+            app.set_prompt_text(pending_input);
+        }
+
         // Draw the UI
         terminal.draw(|f| render_app(f, &app))?;
 
         // Poll for crossterm events (keyboard/mouse) with short timeout
-        if crossterm::event::poll(Duration::from_millis(16))? {
-            let evt = event::read()?;
+        // unless an auto-submit (queued message) is pending — in which case
+        // synthesize an Enter event to dequeue and submit it.
+        let synthetic_event: Option<Event> = if app.pending_auto_submit && !app.is_streaming {
+            app.pending_auto_submit = false;
+            Some(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            )))
+        } else {
+            None
+        };
+
+        let evt_opt: Option<Event> = if let Some(e) = synthetic_event {
+            Some(e)
+        } else if crossterm::event::poll(Duration::from_millis(16))? {
+            Some(event::read()?)
+        } else {
+            None
+        };
+
+        if let Some(evt) = evt_opt {
             match evt {
                 Event::Key(key) => {
                     // On Windows crossterm emits Press + Release for a single key.
@@ -1649,13 +1986,19 @@ async fn run_interactive(
                             continue;
                         }
 
-                        // No selection — handle as cancel (if streaming) or quit
+                        // No selection — handle as cancel (if streaming) or
+                        // clear-prompt (if non-empty) or quit.
                         if app.is_streaming {
                             if let Some(ref ct) = cancel {
                                 ct.cancel();
                             }
                             app.is_streaming = false;
                             app.status_message = Some("Cancelled.".to_string());
+                            continue;
+                        } else if !app.prompt_input.is_empty() {
+                            // Non-empty prompt — let the app clear it via Ctrl+C
+                            // handler instead of quitting (matches readline).
+                            app.handle_key_event(key);
                             continue;
                         } else {
                             break 'main;
@@ -1682,10 +2025,11 @@ async fn run_interactive(
                         || app.model_picker.visible
                         || app.onboarding_dialog.visible
                         || app.bypass_permissions_dialog.visible
+                        || app.file_injection_dialog.visible
+                        || app.ask_user_dialog.visible
                         || app.settings_screen.visible
                         || app.export_dialog.visible
                         || app.theme_screen.visible
-                        || app.privacy_screen.visible
                         || app.stats_dialog.open
                         || app.invalid_config_dialog.visible
                         || app.context_viz.visible
@@ -1703,6 +2047,22 @@ async fn run_interactive(
                         || app.context_menu_state.is_some()
                         || app.permission_request.is_some()
                         || app.global_search.open;
+                    if key.code == KeyCode::Enter && app.is_streaming && !any_dialog_open {
+                        // Queue the message: it will auto-submit once the
+                        // current turn finishes (issue #149).
+                        let input = app.take_input();
+                        if !input.is_empty() {
+                            let preview: String = input.chars().take(40).collect();
+                            app.queued_messages.push_back(input);
+                            let total = app.queued_messages.len();
+                            app.notifications.push(
+                                claurst_tui::NotificationKind::Info,
+                                format!("Queued ({}): {}", total, preview),
+                                Some(3),
+                            );
+                        }
+                        continue;
+                    }
                     if key.code == KeyCode::Enter && !app.is_streaming && !any_dialog_open {
                         // If a slash-command suggestion is active, accept and execute immediately.
                         if !app.prompt_input.suggestions.is_empty()
@@ -2100,32 +2460,99 @@ async fn run_interactive(
                             .await;
                         }
 
-                        // Regular user message (with optional image attachments)
+                        // Regular user message (with optional image attachments + file injection)
                         let pending_imgs = app.prompt_input.clear_images();
-                        let user_msg = if pending_imgs.is_empty() {
-                            claurst_core::types::Message::user(input.clone())
-                        } else {
-                            let mut blocks: Vec<claurst_core::types::ContentBlock> = pending_imgs
-                                .iter()
-                                .filter_map(|img| {
-                                    claurst_tui::image_paste::encode_image_base64(&img.path)
-                                        .map(|b64| claurst_core::types::ContentBlock::Image {
+
+                        // Check for file injection if enabled
+                        if config.file_injection_enabled {
+                            use claurst_tui::file_injection::parse_at_refs;
+
+                            let (within_limit, oversized) = parse_at_refs(&input, &tool_ctx.working_dir, config.file_injection_max_size);
+
+                            if !oversized.is_empty() {
+                                // Show dialog with oversized files
+                                let oversized_summaries: Vec<(String, usize, String)> = oversized
+                                    .iter()
+                                    .map(|f| {
+                                        let issue_str = match &f.issue {
+                                            Some(claurst_tui::AtFileIssue::TooLarge(kb)) => format!("TooLarge: {} KB", kb),
+                                            Some(claurst_tui::AtFileIssue::Binary) => "Binary".to_string(),
+                                            Some(claurst_tui::AtFileIssue::Unreadable(e)) => e.clone(),
+                                            None => "Unknown".to_string(),
+                                        };
+                                        (f.path.display().to_string(), f.size_kb, issue_str)
+                                    })
+                                    .collect();
+
+                                app.file_injection_dialog.show(input.clone(), pending_imgs, oversized_summaries);
+                                continue;
+                            }
+
+                            // No oversized files: inject within-limit files and send
+                            let file_prefix = claurst_tui::file_injection::build_file_blocks(&within_limit);
+
+                            let user_msg = if !file_prefix.is_empty() || !pending_imgs.is_empty() {
+                                let mut blocks: Vec<claurst_core::types::ContentBlock> = Vec::new();
+
+                                // Add file blocks if there's any file content
+                                if !file_prefix.is_empty() {
+                                    blocks.push(claurst_core::types::ContentBlock::Text { text: file_prefix });
+                                }
+
+                                // Add image blocks
+                                for img in &pending_imgs {
+                                    if let Some(b64) = claurst_tui::image_paste::encode_image_base64(&img.path) {
+                                        blocks.push(claurst_core::types::ContentBlock::Image {
                                             source: claurst_core::types::ImageSource {
                                                 source_type: "base64".to_string(),
                                                 media_type: Some("image/png".to_string()),
                                                 data: Some(b64),
                                                 url: None,
                                             },
-                                        })
-                                })
-                                .collect();
-                            blocks.push(claurst_core::types::ContentBlock::Text { text: input.clone() });
-                            claurst_core::types::Message::user_blocks(blocks)
-                        };
-                        messages.push(user_msg.clone());
-                        app.push_message(user_msg);
-                        session.messages = messages.clone();
-                        session.updated_at = chrono::Utc::now();
+                                        });
+                                    }
+                                }
+
+                                // Add the original input text
+                                blocks.push(claurst_core::types::ContentBlock::Text { text: input.clone() });
+
+                                claurst_core::types::Message::user_blocks(blocks)
+                            } else {
+                                claurst_core::types::Message::user(input.clone())
+                            };
+
+                            messages.push(user_msg.clone());
+                            app.push_message(user_msg);
+                            session.messages = messages.clone();
+                            session.updated_at = chrono::Utc::now();
+                        } else {
+                            // File injection disabled: send as-is
+                            let user_msg = if pending_imgs.is_empty() {
+                                claurst_core::types::Message::user(input.clone())
+                            } else {
+                                let mut blocks: Vec<claurst_core::types::ContentBlock> = pending_imgs
+                                    .iter()
+                                    .filter_map(|img| {
+                                        claurst_tui::image_paste::encode_image_base64(&img.path)
+                                            .map(|b64| claurst_core::types::ContentBlock::Image {
+                                                source: claurst_core::types::ImageSource {
+                                                    source_type: "base64".to_string(),
+                                                    media_type: Some("image/png".to_string()),
+                                                    data: Some(b64),
+                                                    url: None,
+                                                },
+                                            })
+                                    })
+                                    .collect();
+                                blocks.push(claurst_core::types::ContentBlock::Text { text: input.clone() });
+                                claurst_core::types::Message::user_blocks(blocks)
+                            };
+
+                            messages.push(user_msg.clone());
+                            app.push_message(user_msg);
+                            session.messages = messages.clone();
+                            session.updated_at = chrono::Utc::now();
+                        }
 
                         // Update terminal title from session title or first message
                         if session.title.is_some() {
@@ -2158,6 +2585,16 @@ async fn run_interactive(
                         qcfg.output_style = cmd_ctx.config.effective_output_style();
                         qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();
                         qcfg.working_directory = Some(tool_ctx.working_dir.display().to_string());
+                        // Inject active goal addendum into system prompt (if goals enabled).
+                        if let Some(goal) = claurst_core::GoalStore::open_default()
+                            .and_then(|s| s.get_active_goal(&session.id))
+                        {
+                            let addendum = claurst_core::goal_system_prompt_addendum(&goal);
+                            qcfg.append_system_prompt = Some(match qcfg.append_system_prompt {
+                                Some(existing) => format!("{}\n{}", existing, addendum),
+                                None => addendum,
+                            });
+                        }
                         // Apply active effort level (set via /effort command).
                         if let Some(level) = current_effort {
                             qcfg.effort_level = Some(level);
@@ -2175,6 +2612,7 @@ async fn run_interactive(
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
                         let client_clone = client.clone();
+                        goal_turn_start = std::time::Instant::now();
 
                         let handle = tokio::spawn(async move {
                             let mut msgs = msgs_arc_clone.lock().await.clone();
@@ -2304,6 +2742,24 @@ async fn run_interactive(
                         messages = app.messages.clone();
                         session.messages = messages.clone();
                         session.updated_at = chrono::Utc::now();
+                    }
+                }
+                Event::Paste(data) => {
+                    // Cmd+V paste on macOS / Ctrl+Shift+V on Linux (via bracketed paste)
+                    if !app.is_streaming
+                        && app.permission_request.is_none()
+                        && !app.history_search_overlay.visible
+                        && app.history_search.is_none()
+                    {
+                        if app.key_input_dialog.visible {
+                            // Paste into API key input dialog
+                            for ch in data.chars() {
+                                app.key_input_dialog.insert_char(ch);
+                            }
+                        } else {
+                            // Paste into main prompt input
+                            app.prompt_input.paste(&data);
+                        }
                     }
                 }
                 Event::Mouse(mouse) => {
@@ -2789,9 +3245,9 @@ async fn run_interactive(
             match rx.try_recv() {
                 Ok(Ok(entries)) => {
                     let provider = app
-                        .config
-                        .provider
+                        .model_picker_provider_id
                         .clone()
+                        .or_else(|| app.config.provider.clone())
                         .unwrap_or_else(|| "anthropic".to_string());
                     let provider_prefix = format!("{}/", provider);
                     let current = app
@@ -2815,13 +3271,33 @@ async fn run_interactive(
             }
         }
 
+        // Drain ask-user question events (non-blocking).
+        // When the AskUserQuestion tool fires, it sends a UserQuestionEvent
+        // here.  We open the dialog and the user's answer travels back via
+        // the embedded oneshot channel.
+        if let Some(ref mut rx) = app.user_question_rx {
+            match rx.try_recv() {
+                Ok(event) => {
+                    app.ask_user_dialog.open(
+                        event.question,
+                        event.options,
+                        event.reply_tx,
+                    );
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    app.user_question_rx = None;
+                }
+            }
+        }
+
         // Spawn async provider model-list fetch when requested.
         if app.model_picker_fetch_pending {
             app.model_picker_fetch_pending = false;
             let provider_id_str = app
-                .config
-                .provider
+                .model_picker_provider_id
                 .clone()
+                .or_else(|| app.config.provider.clone())
                 .unwrap_or_else(|| "anthropic".to_string());
             if let Some(ref registry) = app.provider_registry {
                 let pid = claurst_core::ProviderId::new(&provider_id_str);
@@ -3033,6 +3509,13 @@ async fn run_interactive(
                 session.working_dir = Some(tool_ctx.working_dir.display().to_string());
                 app.is_streaming = false;
                 app.status_message = None;
+                // Drain one queued message into the prompt and request an
+                // auto-submit on the next loop iteration (issue #149).
+                if let Some(next) = app.queued_messages.pop_front() {
+                    app.prompt_input.text = next;
+                    app.prompt_input.cursor = app.prompt_input.text.len();
+                    app.pending_auto_submit = true;
+                }
                 if app.auto_compact_running {
                     app.auto_compact_running = false;
                     // After auto-compact the context was summarised — reset usage.
@@ -3066,6 +3549,116 @@ async fn run_interactive(
                             };
                             let msg_id = msg.uuid.as_deref().unwrap_or("unknown");
                             let _ = store.save_message(&session.id, msg_id, role, &content_str, None);
+                        }
+                    }
+                }
+
+                // --- Goal continuation ---
+                // After every completed turn check if there is an active goal.
+                // If so, inject a continuation user message and dispatch another turn
+                // without waiting for user input.
+                if !app.auto_compact_running && claurst_core::goals_enabled() {
+                    let elapsed_secs = goal_turn_start.elapsed().as_secs();
+                    let total_tokens = cost_tracker.total_tokens();
+                    match claurst_query::check_and_continue_goal(
+                        &session.id,
+                        total_tokens,
+                        elapsed_secs,
+                    ) {
+                        claurst_query::GoalContinuation::Continue { message } => {
+                            // Show a subtle status notice.
+                            app.status_message = Some(
+                                "Goal: continuing autonomously… (use /goal pause to stop)".to_string()
+                            );
+                            // Update the footer badge.
+                            if let Some(goal) = claurst_core::GoalStore::open_default()
+                                .and_then(|s| s.get_active_goal(&session.id))
+                            {
+                                app.active_goal_badge = Some(format!(
+                                    "active · {} · {} turns",
+                                    goal.elapsed_display(),
+                                    goal.turns_used
+                                ));
+                            }
+
+                            // Inject the continuation message into the conversation.
+                            let cont_msg = claurst_core::types::Message::user(message);
+                            messages.push(cont_msg.clone());
+                            app.push_message(cont_msg);
+                            session.messages = messages.clone();
+                            session.updated_at = chrono::Utc::now();
+                            app.is_streaming = true;
+                            app.streaming_text.clear();
+
+                            let ct = CancellationToken::new();
+                            cancel = Some(ct.clone());
+
+                            let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
+                            let msgs_arc_clone = msgs_arc.clone();
+                            let tools_arc_clone = tools_arc.clone();
+                            let mut ctx_clone = tool_ctx.clone();
+                            let mut qcfg = base_query_config.clone();
+                            qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
+                            qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                            qcfg.append_system_prompt = cmd_ctx.config.append_system_prompt.clone();
+                            qcfg.system_prompt = base_query_config.system_prompt.clone();
+                            qcfg.output_style = cmd_ctx.config.effective_output_style();
+                            qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();
+                            qcfg.working_directory = Some(tool_ctx.working_dir.display().to_string());
+                            // Re-inject the goal addendum for this continuation turn.
+                            if let Some(goal) = claurst_core::GoalStore::open_default()
+                                .and_then(|s| s.get_active_goal(&session.id))
+                            {
+                                let addendum = claurst_core::goal_system_prompt_addendum(&goal);
+                                qcfg.append_system_prompt = Some(match qcfg.append_system_prompt {
+                                    Some(existing) => format!("{}\n{}", existing, addendum),
+                                    None => addendum,
+                                });
+                            }
+                            if let Some(level) = current_effort {
+                                qcfg.effort_level = Some(level);
+                            }
+                            if let Some(ref cq) = qcfg.command_queue {
+                                let cq = cq.clone();
+                                ctx_clone.completion_notifier = Some(claurst_tools::CompletionNotifier::new(move |msg| {
+                                    cq.push(
+                                        claurst_query::QueuedCommand::InjectSystemMessage(msg),
+                                        claurst_query::CommandPriority::Normal,
+                                    );
+                                }));
+                            }
+                            let tracker = cost_tracker.clone();
+                            let tx = event_tx.clone();
+                            let client_clone = client.clone();
+                            goal_turn_start = std::time::Instant::now();
+
+                            let handle = tokio::spawn(async move {
+                                let mut msgs = msgs_arc_clone.lock().await.clone();
+                                let outcome = claurst_query::run_query_loop(
+                                    client_clone.as_ref(),
+                                    &mut msgs,
+                                    tools_arc_clone.as_slice(),
+                                    &ctx_clone,
+                                    &qcfg,
+                                    tracker,
+                                    Some(tx),
+                                    ct,
+                                    None,
+                                )
+                                .await;
+                                *msgs_arc_clone.lock().await = msgs;
+                                outcome
+                            });
+                            current_query = Some((handle, msgs_arc));
+                        }
+                        claurst_query::GoalContinuation::Stop { reason } => {
+                            app.active_goal_badge = None;
+                            if let Some(msg) = reason.user_message() {
+                                app.status_message = Some(msg);
+                            }
+                        }
+                        claurst_query::GoalContinuation::NoGoal => {
+                            app.active_goal_badge = None;
                         }
                     }
                 }
@@ -3202,7 +3795,7 @@ async fn handle_auth_command(args: &[String]) -> anyhow::Result<()> {
         Some(unknown) => {
             eprintln!("Unknown auth subcommand: '{}'", unknown);
             eprintln!();
-            eprintln!("Usage: claude auth <subcommand>");
+            eprintln!("Usage: claurst auth <subcommand>");
             eprintln!("  login [--console]   Authenticate (claude.ai by default; --console for API key)");
             eprintln!("  logout              Remove stored credentials");
             eprintln!("  status [--json]     Show authentication status");
@@ -3210,7 +3803,7 @@ async fn handle_auth_command(args: &[String]) -> anyhow::Result<()> {
         }
 
         None => {
-            eprintln!("Usage: claude auth <login|logout|status>");
+            eprintln!("Usage: claurst auth <login|logout|status>");
             eprintln!("  login [--console]   Authenticate with Anthropic");
             eprintln!("  logout              Remove stored credentials");
             eprintln!("  status [--json]     Show authentication status");
@@ -3396,7 +3989,7 @@ async fn auth_status(json_output: bool) {
     } else {
         if !logged_in {
             let hint = if active_provider == "anthropic" {
-                "Run `claude auth login` or set ANTHROPIC_API_KEY.".to_string()
+                "Run `claurst auth login` or set ANTHROPIC_API_KEY.".to_string()
             } else if let Some(env_var) =
                 claurst_core::config::primary_api_key_env_var_for_provider(active_provider)
             {
@@ -3483,10 +4076,10 @@ async fn auth_logout() {
 /// Helper: convert `Option<String>` to a JSON string or null.
 fn subscription_label(subscription_type: Option<&str>) -> Option<String> {
     match subscription_type? {
-        "enterprise" => Some("Claurst Enterprise Account".to_string()),
-        "team" => Some("Claurst Team Account".to_string()),
-        "max" => Some("Claurst Max Account".to_string()),
-        "pro" => Some("Claurst Pro Account".to_string()),
+        "enterprise" => Some("Claude Enterprise Account".to_string()),
+        "team" => Some("Claude Team Account".to_string()),
+        "max" => Some("Claude Max Account".to_string()),
+        "pro" => Some("Claude Pro Account".to_string()),
         other if !other.is_empty() => Some(format!("{} Account", other)),
         _ => None,
     }
@@ -3499,4 +4092,3 @@ fn json_null_or_string(opt: &Option<String>) -> serde_json::Value {
         None => serde_json::Value::Null,
     }
 }
-

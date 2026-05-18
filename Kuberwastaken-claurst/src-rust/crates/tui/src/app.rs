@@ -18,7 +18,6 @@ use crate::overlays::{
     RewindFlowOverlay, SelectorMessage,
 };
 use crate::plugin_views::PluginHintBanner;
-use crate::privacy_screen::PrivacyScreen;
 use crate::prompt_input::{InputMode, PromptInputState, VimMode};
 use crate::render;
 use crate::settings_screen::SettingsScreen;
@@ -62,6 +61,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("fast", "Toggle fast mode"),
     ("feedback", "Open session feedback survey"),
     ("fork", "Fork session into a new branch"),
+    ("goal", "Set or view the current session goal"),
     ("heapdump", "Show process memory and diagnostic information"),
     ("help", "Show help"),
     ("hooks", "Browse configured hooks (read-only)"),
@@ -72,12 +72,12 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("keybindings", "Show keybinding configuration"),
     ("login", "Log in to Claurst"),
     ("logout", "Log out of Claurst"),
+    ("managed-agents", "Configure manager-executor managed agent system"),
     ("mcp", "Browse configured MCP servers"),
     ("memory", "Browse and open AGENTS.md memory files"),
     ("model", "Change the AI model"),
     ("output-style", "Toggle output style (auto/stream/verbose)"),
     ("plugin", "Manage plugins (list/info/enable/disable/reload)"),
-    ("privacy", "Open privacy settings"),
     ("providers", "List available AI providers and their status"),
     ("caveman", "Caveman speech mode — save big token"),
     ("rocky", "Rocky speech mode — amaze amaze amaze"),
@@ -94,6 +94,8 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("survey", "Open session feedback survey"),
     ("theme", "Open the theme picker"),
     ("ultrareview", "Run an exhaustive multi-dimensional code review"),
+    ("update", "Check for updates and upgrade to the latest version"),
+    ("upgrade", "Check for updates and upgrade to the latest version"),
     ("vim", "Toggle vim keybindings"),
     ("voice", "Toggle voice input mode"),
 ];
@@ -103,7 +105,7 @@ fn help_command_category(name: &str) -> &'static str {
         "connect" | "model" | "providers" | "refresh" | "fast" | "effort" | "voice" => "Model & Provider",
         "changes" | "diff" | "review" | "rewind" | "export" | "copy" => "Review & History",
         "stats" | "cost" | "context" | "insights" | "heapdump" | "doctor" => "Diagnostics",
-        "config" | "settings" | "theme" | "privacy" | "keybindings" | "hooks" | "mcp" | "import-config" => {
+        "config" | "settings" | "theme" | "keybindings" | "hooks" | "mcp" | "import-config" => {
             "Workspace"
         }
         "agent" | "agents" | "memory" | "plugin" | "feedback" | "survey" => "Tools",
@@ -238,6 +240,7 @@ fn import_config_picker_items() -> Vec<SelectItem> {
 
 fn provider_picker_items() -> Vec<SelectItem> {
     vec![
+        SelectItem { id: "free".into(), title: "Free Mode".into(), description: "OpenCode Zen → OpenRouter free fallback (no spend)".into(), category: "Popular".into(), badge: Some("FREE".into()) },
         SelectItem { id: "openai".into(), title: "OpenAI".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "openai-codex".into(), title: "OpenAI Codex".into(), description: "(ChatGPT Plus/Pro — browser login)".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "github-copilot".into(), title: "GitHub Copilot".into(), description: "(GitHub subscription or token)".into(), category: "Popular".into(), badge: None },
@@ -247,8 +250,13 @@ fn provider_picker_items() -> Vec<SelectItem> {
         SelectItem { id: "openrouter".into(), title: "OpenRouter".into(), description: "100+ models with one key".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "vercel".into(), title: "Vercel AI Gateway".into(), description: "Gateway for AI SDK models".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "groq".into(), title: "Groq".into(), description: "Fast hosted inference".into(), category: "Popular".into(), badge: Some("FREE".into()) },
-        SelectItem { id: "ollama".into(), title: "Ollama".into(), description: "Run models locally".into(), category: "Popular".into(), badge: Some("LOCAL".into()) },
+        SelectItem { id: "ollama".into(), title: "Ollama".into(), description: "Local inference + cloud models".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "zai".into(), title: "Z.AI".into(), description: "GLM-5.1 / GLM-5 / GLM-4.7 Coding Plan".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "opencode-go".into(), title: "OpenCode Go".into(), description: "$10/mo flat-rate · Kimi · DeepSeek · GLM · MiniMax".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "opencode-zen".into(), title: "OpenCode Zen".into(), description: "Free models + paid · Nemotron · Ring · MiniMax · DeepSeek".into(), category: "Popular".into(), badge: Some("FREE".into()) },
+        SelectItem { id: "synthetic".into(), title: "Synthetic.dev".into(), description: "Hosted open weights".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "routing".into(), title: "routing.run".into(), description: "Hosted open weights · DeepSeek · Llama · Mixtral · Qwen".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "neuralwatt".into(), title: "NeuralWatt".into(), description: "Hosted open weights - energy-efficient".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "cerebras".into(), title: "Cerebras".into(), description: "Fast hosted inference".into(), category: "Other".into(), badge: Some("FREE".into()) },
         SelectItem { id: "sambanova".into(), title: "SambaNova".into(), description: "Fast hosted inference".into(), category: "Other".into(), badge: Some("FREE".into()) },
         SelectItem { id: "lmstudio".into(), title: "LM Studio".into(), description: "Local model server".into(), category: "Other".into(), badge: Some("LOCAL".into()) },
@@ -573,6 +581,54 @@ fn layout_to_latin(c: char) -> String {
     mapped.unwrap_or(lower).to_string()
 }
 
+/// Apply shift transformation to a character based on standard US QWERTY layout.
+/// Handles both ASCII lowercase letters and number/symbol keys.
+///
+/// **Why this exists**: Terminals that support the kitty keyboard protocol send
+/// unshifted characters with modifier flags instead of pre-shifted characters
+/// (e.g., Shift+1 arrives as '1' + SHIFT instead of '!'). This function normalizes
+/// them to the expected shifted characters.
+///
+/// **Keyboard layout limitation**: This only works correctly for US QWERTY keyboards.
+/// Other layouts (AZERTY, QWERTZ, etc.) have different shift mappings. For non-US
+/// layouts, we rely on the terminal to send the correctly shifted character, which
+/// most modern terminals do (especially with kitty protocol enabled).
+fn normalize_char_with_shift(c: char, modifiers: KeyModifiers) -> char {
+    if !modifiers.contains(KeyModifiers::SHIFT) {
+        return c;
+    }
+
+    if c.is_ascii_lowercase() {
+        return c.to_ascii_uppercase();
+    }
+
+    // Map unshifted number/symbol keys to their shifted equivalents (US QWERTY)
+    match c {
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        ';' => ':',
+        '\'' => '"',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        '\\' => '|',
+        '`' => '~',
+        _ => c,
+    }
+}
+
 fn key_event_to_keystroke(key: &KeyEvent) -> Option<ParsedKeystroke> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt  = key.modifiers.contains(KeyModifiers::ALT);
@@ -780,8 +836,6 @@ pub struct App {
     pub settings_screen: SettingsScreen,
     /// Theme picker overlay (/theme).
     pub theme_screen: ThemeScreen,
-    /// Privacy settings dialog (/privacy-settings).
-    pub privacy_screen: PrivacyScreen,
     /// Token/cost analytics dialog.
     pub stats_dialog: StatsDialogState,
     /// MCP server browser and tool detail view.
@@ -828,12 +882,21 @@ pub struct App {
     /// Shown at startup when --dangerously-skip-permissions was passed.
     /// User must explicitly accept or the session exits.
     pub bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState,
+    /// Whether the bypass-permissions dialog has been shown this session.
+    pub bypass_permissions_dialog_shown: bool,
+    /// File injection warning dialog.
+    /// Shown when oversized or binary files are detected in @refs.
+    pub file_injection_dialog: crate::file_injection_dialog::FileInjectionDialogState,
     /// First-launch onboarding welcome dialog.
     pub onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState,
+    /// Effort-level picker (/effort with no args).
+    pub effort_picker: crate::effort_picker::EffortPickerState,
     /// API key input dialog (opened from /connect for key-based providers).
     pub key_input_dialog: crate::key_input_dialog::KeyInputDialogState,
     /// Custom provider dialog for URL + API key input.
     pub custom_provider_dialog: crate::custom_provider_dialog::CustomProviderDialogState,
+    /// "Free" composite-provider setup dialog (warning + 2 API keys).
+    pub free_mode_dialog: crate::free_mode_dialog::FreeModeDialogState,
     /// Device code / browser auth dialog (GitHub Copilot device flow, Anthropic OAuth).
     pub device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState,
     /// When set, the main loop should spawn the async auth task for this provider.
@@ -846,6 +909,9 @@ pub struct App {
     /// When `true`, the main event loop should spawn an async task to fetch
     /// the model list from the current provider's `list_models()` API.
     pub model_picker_fetch_pending: bool,
+    /// The provider ID that the model picker was opened for (used when the
+    /// fetch is triggered from /connect before the provider is activated).
+    pub model_picker_provider_id: Option<String>,
     /// When `true`, the main event loop should spawn an async task to load
     /// the session list from disk and populate the session browser.
     pub session_list_pending: bool,
@@ -854,6 +920,12 @@ pub struct App {
         Option<tokio::sync::mpsc::Receiver<Vec<crate::session_browser::SessionEntry>>>,
     /// Credential store for provider API keys and OAuth tokens.
     pub auth_store: claurst_core::AuthStore,
+    /// Messages typed by the user while a query was streaming. They will be
+    /// auto-submitted in order once the current turn completes (issue #149).
+    pub queued_messages: std::collections::VecDeque<String>,
+    /// When `true`, the main loop will inject a synthetic Enter event on the
+    /// next iteration to dequeue and submit the next queued message.
+    pub pending_auto_submit: bool,
     /// Connect-a-provider dialog (/connect command).
     pub connect_dialog: DialogSelectState,
     /// Import-config source picker (/import-config command).
@@ -863,7 +935,7 @@ pub struct App {
     /// Ctrl+K command palette overlay.
     pub command_palette: DialogSelectState,
     /// Whether Claurst was launched from the user's home directory.
-    /// Shown as a startup notice: "Note: You have launched claude in your home directory…"
+    /// Shown as a startup notice: "Note: You have launched Claurst in your home directory…"
     pub home_dir_warning: bool,
     /// Output style: "auto" | "stream" | "verbose".
     pub output_style: String,
@@ -873,6 +945,10 @@ pub struct App {
     pub pr_url: Option<String>,
     /// PR review state: "approved", "changes_requested", "review_required", etc.
     pub pr_state: Option<String>,
+    /// Current working directory path.
+    pub current_dir: Option<String>,
+    /// Current git branch name.
+    pub git_branch: Option<String>,
     /// Count of in-progress background tasks (drives the footer pill).
     pub background_task_count: usize,
     /// Background task status text shown in footer pill.
@@ -894,11 +970,21 @@ pub struct App {
     pub voice_recording: bool,
     /// Receiver for VoiceEvent messages produced by the recorder task.
     pub voice_event_rx: Option<tokio::sync::mpsc::Receiver<claurst_core::voice::VoiceEvent>>,
+    /// A single key event that was drained from the queue during paste-burst
+    /// detection but wasn't part of the burst (e.g. a modifier key that stopped
+    /// the burst). Replayed at the top of the next loop iteration.
+    pending_key: Option<crossterm::event::KeyEvent>,
     /// Receiver for model-list results fetched in the background when the
     /// /model picker opens.  Drained each frame so models appear as soon as
     /// the fetch completes.
     pub model_fetch_rx:
         Option<tokio::sync::mpsc::Receiver<Result<Vec<crate::model_picker::ModelEntry>, ()>>>,
+    /// Receiver for `UserQuestionEvent`s produced by the AskUserQuestion tool.
+    /// When a question arrives, `ask_user_dialog` is populated and shown.
+    pub user_question_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<claurst_tools::UserQuestionEvent>>,
+    /// State for the model-initiated ask-user question dialog.
+    pub ask_user_dialog: crate::ask_user_dialog::AskUserDialogState,
 
     // ---- Context window & rate limit info ----------------------------------
 
@@ -916,6 +1002,9 @@ pub struct App {
     pub worktree_branch: Option<String>,
     /// Agent type badge: "agent" | "coordinator" | "subagent".
     pub agent_type_badge: Option<String>,
+    /// Goal badge string shown in the footer, e.g. "active · 5m · 3 turns".
+    /// None when no goal is active. Updated by the REPL after each turn.
+    pub active_goal_badge: Option<String>,
 
     // ---- Thinking block expansion state ----------------------------------
     /// Set of thinking block content hashes that are expanded.
@@ -944,6 +1033,10 @@ pub struct App {
     pub selection_focus: Option<(u16, u16)>,
     /// Text extracted from the current selection (updated each render frame).
     pub selection_text: RefCell<String>,
+    /// Cache of row -> rendered text within the selectable area, refreshed
+    /// each frame. Used by double/triple-click word and paragraph detection
+    /// (issue #149 follow-up: prior word-boundary detection was a placeholder).
+    pub last_row_text: RefCell<std::collections::HashMap<u16, String>>,
 
     // ---- Advanced mouse interaction state --------------------------------
     /// Timestamp of the last left mouse click (for double/triple-click detection).
@@ -1217,7 +1310,6 @@ impl App {
             stall_start: None,
             settings_screen: SettingsScreen::new(),
             theme_screen: ThemeScreen::new(),
-            privacy_screen: PrivacyScreen::new(),
             stats_dialog: StatsDialogState::new(),
             mcp_view: McpViewState::new(),
             agents_menu: AgentsMenuState::new(),
@@ -1240,9 +1332,13 @@ impl App {
             mcp_approval: McpApprovalDialogState::new(),
             go_to_line_dialog: GoToLineDialog::new(),
             bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
+            bypass_permissions_dialog_shown: false,
+            file_injection_dialog: crate::file_injection_dialog::FileInjectionDialogState::new(),
             onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState::new(),
+            effort_picker: crate::effort_picker::EffortPickerState::new(),
             key_input_dialog: crate::key_input_dialog::KeyInputDialogState::new(),
             custom_provider_dialog: crate::custom_provider_dialog::CustomProviderDialogState::new(),
+            free_mode_dialog: crate::free_mode_dialog::FreeModeDialogState::new(),
             device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState::new(),
             device_auth_pending: None,
             provider_registry: None,
@@ -1257,9 +1353,12 @@ impl App {
                 reg
             },
             model_picker_fetch_pending: false,
+            model_picker_provider_id: None,
             session_list_pending: false,
             session_list_rx: None,
             auth_store: claurst_core::AuthStore::load(),
+            queued_messages: std::collections::VecDeque::new(),
+            pending_auto_submit: false,
             connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
             import_config_picker: DialogSelectState::new("Import config", import_config_picker_items()),
             import_config_dialog: ImportConfigDialogState::new(),
@@ -1281,6 +1380,12 @@ impl App {
             pr_number: None,
             pr_url: None,
             pr_state: None,
+            current_dir: std::env::current_dir().ok().and_then(|p| {
+                p.to_str().map(|s| s.to_string())
+            }),
+            git_branch: claurst_core::git_utils::get_repo_root(
+                std::env::current_dir().as_deref().unwrap_or_else(|_| std::path::Path::new("."))
+            ).map(|repo_root| claurst_core::git_utils::get_current_branch(&repo_root)),
             background_task_count: 0,
             background_task_status: None,
             status_line_override: None,
@@ -1315,7 +1420,10 @@ impl App {
             },
             voice_recording: false,
             voice_event_rx: None,
+            pending_key: None,
             model_fetch_rx: None,
+            user_question_rx: None,
+            ask_user_dialog: crate::ask_user_dialog::AskUserDialogState::new(),
             context_window_size: 0,
             context_used_tokens: 0,
             rate_limit_5h_pct: None,
@@ -1323,6 +1431,7 @@ impl App {
             worktree_name: None,
             worktree_branch: None,
             agent_type_badge: None,
+            active_goal_badge: None,
             thinking_expanded: std::collections::HashSet::new(),
             last_msg_area: Cell::new(ratatui::layout::Rect::default()),
             last_selectable_area: Cell::new(ratatui::layout::Rect::default()),
@@ -1335,6 +1444,7 @@ impl App {
             selection_anchor: None,
             selection_focus: None,
             selection_text: RefCell::new(String::new()),
+            last_row_text: RefCell::new(std::collections::HashMap::new()),
             last_click_time: None,
             last_click_position: None,
             click_count: 0,
@@ -1538,15 +1648,7 @@ impl App {
     }
 
     fn display_default_model_for_provider(&self, provider_id: &str) -> String {
-        if let Some(best) = self.model_registry.best_model_for_provider(provider_id) {
-            if provider_id == "anthropic" {
-                best
-            } else {
-                format!("{}/{}", provider_id, best)
-            }
-        } else {
-            crate::model_picker::default_model_for_provider(provider_id)
-        }
+        crate::model_picker::default_model_for_provider(provider_id, &self.model_registry)
     }
 
     fn open_model_picker_for_provider(&mut self, provider_id: &str, title: Option<String>) {
@@ -1563,6 +1665,8 @@ impl App {
             &self.model_registry,
         );
         self.model_picker.set_models(models);
+        self.model_picker.loading_models = true;
+        self.model_picker_provider_id = Some(provider_id.to_string());
         self.model_picker_fetch_pending = true;
 
         let provider_prefix = format!("{}/", provider_id);
@@ -1614,6 +1718,15 @@ impl App {
     }
 
     fn infer_provider_from_model(model: &str) -> Option<String> {
+        // Free-mode synthetic IDs always route back through the "free"
+        // composite provider so the Zen → OpenRouter fallback kicks in.
+        if model == "free/auto"
+            || model.starts_with("free/")
+            || model.starts_with("zen/")
+            || model.starts_with("opencode-zen/")
+        {
+            return Some("free".to_string());
+        }
         if let Some((provider, _)) = model.split_once('/') {
             let known = [
                 "anthropic",
@@ -1639,6 +1752,8 @@ impl App {
                 "llamacpp",
                 "azure",
                 "amazon-bedrock",
+                "free",
+                "opencode-zen",
             ];
             if known.contains(&provider) {
                 return Some(provider.to_string());
@@ -1846,10 +1961,12 @@ impl App {
         self.model_picker = ModelPickerState::new();
         self.key_input_dialog = crate::key_input_dialog::KeyInputDialogState::new();
         self.custom_provider_dialog = crate::custom_provider_dialog::CustomProviderDialogState::new();
+        self.free_mode_dialog = crate::free_mode_dialog::FreeModeDialogState::new();
         self.device_auth_dialog = crate::device_auth_dialog::DeviceAuthDialogState::new();
         self.device_auth_pending = None;
         self.pending_mcp_panel_auth = None;
         self.model_picker_fetch_pending = false;
+        self.model_picker_provider_id = None;
         self.has_credentials = has_credentials;
         self.fast_mode = false;
         self.model_name = self.config.effective_model().to_string();
@@ -1883,10 +2000,6 @@ impl App {
                     Theme::Custom(s) => s.as_str(),
                 };
                 self.theme_screen.open(current);
-                true
-            }
-            "privacy-settings" | "privacy" => {
-                self.privacy_screen.open();
                 true
             }
             "stats" => {
@@ -2046,19 +2159,9 @@ impl App {
                 true
             }
             "effort" => {
-                // Only cycle the visual indicator when called with no args (arg-based
-                // effort changes are handled by execute_command + main.rs sync).
-                self.effort_level = match self.effort_level {
-                    EffortLevel::Low => EffortLevel::Normal,
-                    EffortLevel::Normal => EffortLevel::High,
-                    EffortLevel::High => EffortLevel::Max,
-                    EffortLevel::Max => EffortLevel::Low,
-                };
-                self.status_message = Some(format!(
-                    "Effort: {} {}",
-                    self.effort_level.symbol(),
-                    self.effort_level.label(),
-                ));
+                // Open the picker dialog so users can pick an effort level
+                // visually instead of cycling/typing the level (issue #149).
+                self.effort_picker.open(self.effort_level);
                 true
             }
             "voice" => {
@@ -2126,9 +2229,12 @@ impl App {
                 false
             }
             "keybindings" => {
-                // Open settings on KeyBindings tab
-                self.settings_screen.open();
-                self.settings_screen.active_tab = crate::settings_screen::SettingsTab::KeyBindings;
+                // Open the keybindings.json file in the external editor
+                let keybindings_path = claurst_core::config::Settings::config_dir().join("keybindings.json");
+
+                if let Err(e) = open_file_externally(&keybindings_path) {
+                    eprintln!("Failed to open keybindings file: {}", e);
+                }
                 true
             }
             "help" => {
@@ -2163,10 +2269,10 @@ impl App {
         self.command_palette.close();
         self.key_input_dialog.close();
         self.custom_provider_dialog.close();
+        self.free_mode_dialog.close();
         self.device_auth_dialog.close();
         self.settings_screen.close();
         self.theme_screen.close();
-        self.privacy_screen.close();
     }
 
     /// Perform the export based on the selected format. Returns the path written.
@@ -2517,9 +2623,10 @@ impl App {
     }
 
     fn prompt_mode(&self) -> InputMode {
-        if self.is_streaming {
-            InputMode::Readonly
-        } else if self.plan_mode {
+        // Note: previously returned Readonly while streaming, but the prompt
+        // now accepts input during streaming so the user can compose / queue
+        // a follow-up message. Plan mode still wins.
+        if self.plan_mode {
             InputMode::Plan
         } else {
             InputMode::Default
@@ -2765,6 +2872,33 @@ impl App {
             return false;
         }
 
+        // File injection dialog: shown when oversized files are detected in @refs.
+        if self.file_injection_dialog.visible {
+            match key.code {
+                KeyCode::Char('i') | KeyCode::Char('I') => {
+                    self.file_injection_dialog.selected = 0; // InjectAll
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    self.file_injection_dialog.selected = 1; // SkipOversized
+                }
+                KeyCode::Esc => {
+                    self.file_injection_dialog.selected = 2; // Abort
+                    self.file_injection_dialog.confirm();
+                    // Restore input to prompt when aborting
+                    if let Some(input) = &self.file_injection_dialog.pending_input {
+                        self.set_prompt_text(input.clone());
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => self.file_injection_dialog.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => self.file_injection_dialog.select_next(),
+                KeyCode::Enter => {
+                    self.file_injection_dialog.confirm();
+                }
+                _ => {}
+            }
+            return false;
+        }
+
         // Onboarding dialog: shown on first launch, dismissed with Enter/→/Esc.
         if self.onboarding_dialog.visible {
             match key.code {
@@ -2780,6 +2914,27 @@ impl App {
                 }
                 KeyCode::Left => {
                     self.onboarding_dialog.prev_page();
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        // Effort picker dialog (/effort).
+        if self.effort_picker.visible {
+            match key.code {
+                KeyCode::Esc => self.effort_picker.close(),
+                KeyCode::Up | KeyCode::Char('k') => self.effort_picker.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => self.effort_picker.select_next(),
+                KeyCode::Enter => {
+                    let chosen = self.effort_picker.current();
+                    self.effort_level = chosen;
+                    self.effort_picker.close();
+                    self.status_message = Some(format!(
+                        "Effort set to {} {}.",
+                        chosen.symbol(),
+                        chosen.label()
+                    ));
                 }
                 _ => {}
             }
@@ -2829,6 +2984,46 @@ impl App {
         }
 
         // API key input dialog (opened from /connect for key-based providers)
+        // Ask-user question dialog (AskUserQuestion tool)
+        if self.ask_user_dialog.visible {
+            match key.code {
+                KeyCode::Esc => {
+                    self.ask_user_dialog.dismiss();
+                }
+                KeyCode::Enter => {
+                    self.ask_user_dialog.confirm();
+                }
+                KeyCode::Up | KeyCode::BackTab => {
+                    self.ask_user_dialog.select_prev();
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    self.ask_user_dialog.select_next();
+                }
+                KeyCode::Char(c)
+                    if c.is_ascii_digit()
+                        && self.ask_user_dialog.options.is_some()
+                        && !self.ask_user_dialog.in_custom_input =>
+                {
+                    // Digit keys select an option by number ONLY when the user
+                    // is not already typing a custom answer.  Once in custom
+                    // mode, digits flow through to push_char like any other char.
+                    let n = (c as u8 - b'0') as usize;
+                    if n >= 1 {
+                        self.ask_user_dialog.select_by_number(n);
+                    }
+                }
+                KeyCode::Char(c) => {
+                    let c = normalize_char_with_shift(c, key.modifiers);
+                    self.ask_user_dialog.push_char(c);
+                }
+                KeyCode::Backspace => {
+                    self.ask_user_dialog.pop_char();
+                }
+                _ => {}
+            }
+            return false;
+        }
+
         if self.key_input_dialog.visible {
             match key.code {
                 KeyCode::Esc => {
@@ -2849,8 +3044,67 @@ impl App {
                 KeyCode::Backspace => {
                     self.key_input_dialog.backspace();
                 }
+                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER) => {
+                    if let Some(text) = crate::image_paste::read_clipboard_text() {
+                        if text.is_empty() {
+                            self.notifications.push(NotificationKind::Warning, "Clipboard is empty".to_string(), Some(2));
+                        } else {
+                            for ch in text.chars() {
+                                self.key_input_dialog.insert_char(ch);
+                            }
+                        }
+                    } else {
+                        self.notifications.push(NotificationKind::Warning, "Could not read clipboard".to_string(), Some(2));
+                    }
+                }
                 KeyCode::Char(c) => {
+                    let c = normalize_char_with_shift(c, key.modifiers);
                     self.key_input_dialog.insert_char(c);
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        // "Free" composite-provider setup dialog (collects Zen + OpenRouter keys)
+        if self.free_mode_dialog.visible {
+            match key.code {
+                KeyCode::Esc => {
+                    self.free_mode_dialog.close();
+                }
+                KeyCode::Tab | KeyCode::Down | KeyCode::Up => {
+                    self.free_mode_dialog.switch_field();
+                }
+                KeyCode::Enter => {
+                    if self.free_mode_dialog.can_submit() {
+                        let (zen_key, or_key) = self.free_mode_dialog.take_values();
+                        if !zen_key.is_empty() {
+                            self.auth_store.set(
+                                claurst_core::ProviderId::OPENCODE_ZEN,
+                                claurst_core::StoredCredential::ApiKey { key: zen_key },
+                            );
+                        }
+                        if !or_key.is_empty() {
+                            self.auth_store.set(
+                                claurst_core::ProviderId::OPENROUTER,
+                                claurst_core::StoredCredential::ApiKey { key: or_key },
+                            );
+                        }
+                        self.activate_provider(
+                            "free".to_string(),
+                            "Free Mode".to_string(),
+                            "Connected to",
+                        );
+                    } else {
+                        self.free_mode_dialog.switch_field();
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.free_mode_dialog.backspace();
+                }
+                KeyCode::Char(c) => {
+                    let c = normalize_char_with_shift(c, key.modifiers);
+                    self.free_mode_dialog.insert_char(c);
                 }
                 _ => {}
             }
@@ -2888,6 +3142,7 @@ impl App {
                     self.custom_provider_dialog.backspace();
                 }
                 KeyCode::Char(c) => {
+                    let c = normalize_char_with_shift(c, key.modifiers);
                     self.custom_provider_dialog.insert_char(c);
                 }
                 _ => {}
@@ -2915,6 +3170,21 @@ impl App {
                             // Local providers — activate immediately, no key needed
                             "ollama" | "lmstudio" | "llamacpp" => {
                                 self.activate_provider(selected.id.clone(), selected.title.clone(), "Switched to");
+                            }
+                            // "Free" composite mode — collects two keys (Zen + OpenRouter)
+                            // with a warning about context-management caveats.
+                            "free" => {
+                                let zen_existing = self
+                                    .auth_store
+                                    .api_key_for(claurst_core::ProviderId::OPENCODE_ZEN)
+                                    .or_else(|| {
+                                        self.auth_store
+                                            .api_key_for(claurst_core::ProviderId::OPENCODE_GO)
+                                    });
+                                let or_existing = self
+                                    .auth_store
+                                    .api_key_for(claurst_core::ProviderId::OPENROUTER);
+                                self.free_mode_dialog.open(zen_existing, or_existing);
                             }
                             "anthropic" => {
                                 // Anthropic: use API key from console.anthropic.com
@@ -3057,8 +3327,14 @@ impl App {
                         }
                         // Store explicit selections in the canonical
                         // "provider/model" form for non-Anthropic providers.
+                        // The "free" composite's picker entries already carry
+                        // a routing prefix (`free/…`, `zen/…`, `openrouter/…`)
+                        // so re-prefixing would produce nonsense like
+                        // `free/free/auto`.
                         let provider = self.config.provider.as_deref().unwrap_or("anthropic");
                         let full_model = if provider == "anthropic" {
+                            model_id.clone()
+                        } else if provider == "free" {
                             model_id.clone()
                         } else {
                             format!("{}/{}", provider, model_id)
@@ -3318,11 +3594,6 @@ impl App {
         }
 
         // Privacy screen intercepts keys
-        if self.privacy_screen.visible {
-            crate::privacy_screen::handle_privacy_key(&mut self.privacy_screen, key);
-            return false;
-        }
-
         // Rewind flow overlay intercepts keys first
         if self.rewind_flow.visible {
             return self.handle_rewind_flow_key(key);
@@ -3466,6 +3737,7 @@ impl App {
                     return false;
                 }
                 KeyCode::Char(c) => {
+                    let c = normalize_char_with_shift(c, key.modifiers);
                     self.elicitation.insert_char(c);
                     return false;
                 }
@@ -3567,11 +3839,12 @@ impl App {
             return false;
         }
 
-        // ---- Ctrl+V — clipboard paste (image first, then text fallback) ----
+        // ---- Ctrl+V / Cmd+V — clipboard paste (image first, then text fallback) ----
         // Only fires when NOT in vim Normal/Visual/VisualBlock mode (where \x16 is
         // already consumed by the vim handler above to enter VisualBlock mode).
         if key.code == KeyCode::Char('v')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && (key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.modifiers.contains(KeyModifiers::SUPER))
             && !matches!(
                 self.prompt_input.vim_mode,
                 crate::prompt_input::VimMode::Normal
@@ -3591,7 +3864,7 @@ impl App {
                 };
                 self.notifications.push(NotificationKind::Info, msg, Some(3));
             } else if let Some(text) = read_clipboard_text().or_else(read_primary_text) {
-                self.prompt_input.paste(&text);
+                self.handle_paste_data(text);
                 self.refresh_prompt_input();
             }
             return false;
@@ -3648,7 +3921,9 @@ impl App {
             }
 
             // ---- Quit / cancel ----------------------------------------
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Accept both 'c' and 'C' so Shift+Ctrl+C also triggers copy
+            // (issue #149 follow-up).
+            KeyCode::Char(c) if (c == 'c' || c == 'C') && key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // If text is selected, copy it to clipboard instead of quitting.
                 let sel_text = self.selection_text.borrow().clone();
                 if self.selection_anchor.is_some() && !sel_text.is_empty() {
@@ -3666,6 +3941,10 @@ impl App {
                     self.streaming_thinking.clear();
                     self.tool_use_blocks.clear();
                     self.status_message = Some("Cancelled.".to_string());
+                } else if !self.prompt_input.is_empty() {
+                    // Non-empty prompt — clear it (matches bash/readline Ctrl+C).
+                    self.prompt_input.clear();
+                    self.refresh_prompt_input();
                 } else {
                     self.should_quit = true;
                 }
@@ -3711,48 +3990,67 @@ impl App {
                 self.show_help = !self.show_help;
                 self.help_overlay.toggle();
             }
+            // With the kitty keyboard protocol, Shift+/ is reported as Char('/') with
+            // SHIFT rather than Char('?'), so also accept that form for the help toggle.
+            KeyCode::Char('/')
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    && !self.is_streaming
+                    && self.prompt_input.is_empty()
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !key.modifiers.contains(KeyModifiers::SUPER) =>
+            {
+                self.show_help = !self.show_help;
+                self.help_overlay.toggle();
+            }
 
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.prompt_input.kill_line_backward();
                 self.refresh_prompt_input();
             }
-            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.prompt_input.kill_word_backward();
                 self.refresh_prompt_input();
             }
-            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.prompt_input.yank();
                 self.refresh_prompt_input();
             }
 
             // ---- Alt/Meta key text editing operations -------------------
-            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.prompt_input.yank_pop();
                 self.refresh_prompt_input();
             }
-            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.prompt_input.delete_word_backward();
                 self.refresh_prompt_input();
             }
-            KeyCode::Delete if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.prompt_input.delete_word_backward();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Delete if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.prompt_input.delete_word_forward();
                 self.refresh_prompt_input();
             }
-            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.prompt_input.move_word_backward();
                 self.sync_legacy_prompt_fields();
             }
-            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.prompt_input.move_word_forward();
                 self.sync_legacy_prompt_fields();
             }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.prompt_input.delete_word_at_cursor();
                 self.refresh_prompt_input();
             }
 
-            // ---- Text entry (blocked while streaming) ------------------
-            KeyCode::Char(c) if !self.is_streaming => {
+            // ---- Text entry (allowed while streaming so users can queue
+            // the next message; submission queues via Enter at the CLI layer).
+            KeyCode::Char(c) => {
+                let c = normalize_char_with_shift(c, key.modifiers);
                 if self.prompt_input.vim_enabled && self.prompt_input.vim_mode != VimMode::Insert {
                     self.prompt_input.vim_command(&c.to_string());
                 } else {
@@ -3760,27 +4058,39 @@ impl App {
                 }
                 self.refresh_prompt_input();
             }
-            KeyCode::Backspace if !self.is_streaming => {
+            KeyCode::Backspace => {
                 self.prompt_input.backspace();
                 self.refresh_prompt_input();
             }
-            KeyCode::Delete if !self.is_streaming => {
+            KeyCode::Delete if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.prompt_input.delete();
                 self.refresh_prompt_input();
             }
-            KeyCode::Left if !self.is_streaming => {
-                self.prompt_input.move_left();
+            KeyCode::Delete if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.prompt_input.delete_word_forward();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Left => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.prompt_input.move_word_backward();
+                } else {
+                    self.prompt_input.move_left();
+                }
                 self.sync_legacy_prompt_fields();
             }
-            KeyCode::Right if !self.is_streaming => {
-                self.prompt_input.move_right();
+            KeyCode::Right => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.prompt_input.move_word_forward();
+                } else {
+                    self.prompt_input.move_right();
+                }
                 self.sync_legacy_prompt_fields();
             }
-            KeyCode::Home if !self.is_streaming => {
+            KeyCode::Home => {
                 self.prompt_input.cursor = 0;
                 self.sync_legacy_prompt_fields();
             }
-            KeyCode::End if !self.is_streaming => {
+            KeyCode::End => {
                 self.prompt_input.cursor = self.prompt_input.text.len();
                 self.sync_legacy_prompt_fields();
             }
@@ -3820,6 +4130,18 @@ impl App {
             }
 
             // ---- Submit ------------------------------------------------
+            // Shift+Enter / Alt+Enter / Ctrl+Enter insert a literal newline
+            // so users can compose multi-line prompts before sending
+            // (issue #149 follow-up).
+            KeyCode::Enter
+                if !self.is_streaming
+                    && (key.modifiers.contains(KeyModifiers::SHIFT)
+                        || key.modifiers.contains(KeyModifiers::ALT)
+                        || key.modifiers.contains(KeyModifiers::CONTROL)) =>
+            {
+                self.prompt_input.insert_newline();
+                self.refresh_prompt_input();
+            }
             KeyCode::Enter if !self.is_streaming => {
                 // If a slash-command suggestion is selected, accept it instead of submitting.
                 if !self.prompt_input.suggestions.is_empty()
@@ -3854,19 +4176,35 @@ impl App {
             }
 
             // ---- Input history navigation ------------------------------
+            // For multi-line / wrapped prompts: Up/Down move the cursor by
+            // one visual row first, only falling through to history recall
+            // when the cursor is already on the first/last visual row
+            // (issue #149 follow-up).
             KeyCode::Up => {
                 if !self.prompt_input.suggestions.is_empty() && self.prompt_input.text.starts_with('/') {
                     self.prompt_input.suggestion_prev();
-                } else if !self.prompt_input.history.is_empty() {
-                    self.prompt_input.history_up();
+                } else {
+                    let area = self.last_input_area.get();
+                    let width = area.width.saturating_sub(4) as usize;
+                    let moved = !self.prompt_input.text.is_empty()
+                        && self.prompt_input.move_visual_up(width);
+                    if !moved && !self.prompt_input.history.is_empty() {
+                        self.prompt_input.history_up();
+                    }
                 }
                 self.refresh_prompt_input();
             }
             KeyCode::Down => {
                 if !self.prompt_input.suggestions.is_empty() && self.prompt_input.text.starts_with('/') {
                     self.prompt_input.suggestion_next();
-                } else if self.prompt_input.history_pos.is_some() {
-                    self.prompt_input.history_down();
+                } else {
+                    let area = self.last_input_area.get();
+                    let width = area.width.saturating_sub(4) as usize;
+                    let moved = !self.prompt_input.text.is_empty()
+                        && self.prompt_input.move_visual_down(width);
+                    if !moved && self.prompt_input.history_pos.is_some() {
+                        self.prompt_input.history_down();
+                    }
                 }
                 self.refresh_prompt_input();
             }
@@ -3888,29 +4226,7 @@ impl App {
             }
 
             // ---- Toggle last thinking block (t key) -------------------
-            KeyCode::Char('t') if !self.is_streaming => {
-                // Find the last thinking block in the message list and toggle it
-                use claurst_core::types::ContentBlock;
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                'outer: for msg in self.messages.iter().rev() {
-                    let blocks = msg.content_blocks();
-                    for block in blocks.iter().rev() {
-                        if let ContentBlock::Thinking { thinking, .. } = block {
-                            let mut h = DefaultHasher::new();
-                            thinking.hash(&mut h);
-                            let hash = h.finish();
-                            if self.thinking_expanded.contains(&hash) {
-                                self.thinking_expanded.remove(&hash);
-                            } else {
-                                self.thinking_expanded.insert(hash);
-                            }
-                            self.invalidate_transcript();
-                            break 'outer;
-                        }
-                    }
-                }
-            }
+            // (Removed: shadowed by KeyCode::Char(c) prompt input handler.)
 
             _ => {}
         }
@@ -4014,6 +4330,7 @@ impl App {
                     }
                 }
                 KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let ch = normalize_char_with_shift(ch, key.modifiers);
                     self.agents_menu.editor_insert_char(ch);
                 }
                 _ => {}
@@ -4152,6 +4469,7 @@ impl App {
                 self.history_search_overlay.toggle_pin();
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let c = normalize_char_with_shift(c, key.modifiers);
                 let history = self.prompt_input.history.clone();
                 self.history_search_overlay.push_char(c, &history);
                 if let Some(hs) = self.history_search.as_mut() {
@@ -4223,6 +4541,7 @@ impl App {
                 self.refresh_global_search();
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let c = normalize_char_with_shift(c, key.modifiers);
                 self.global_search.push_char(c);
                 self.refresh_global_search();
             }
@@ -4684,21 +5003,78 @@ impl App {
         }
     }
 
-    /// Find word boundaries for the character at (col, row) in the selection text.
-    /// Returns (start_col, end_col) for the word containing the given position.
-    fn find_word_boundaries(&self, col: u16, _row: u16) -> Option<(u16, u16)> {
-        // Get the current selection text to determine word boundaries
-        let text = self.selection_text.borrow();
-        if text.is_empty() {
+    /// Find word boundaries for the character at (col, row) in the rendered
+    /// transcript buffer. Returns absolute (start_col, end_col) for the word
+    /// containing the click. A "word" is a run of non-whitespace characters.
+    fn find_word_boundaries(&self, col: u16, row: u16) -> Option<(u16, u16)> {
+        let cache = self.last_row_text.borrow();
+        let line = cache.get(&row)?;
+        if line.is_empty() {
             return None;
         }
+        let selectable_area = self.last_selectable_area.get();
+        if col < selectable_area.x {
+            return None;
+        }
+        let local = (col - selectable_area.x) as usize;
+        let chars: Vec<char> = line.chars().collect();
+        if local >= chars.len() {
+            return None;
+        }
+        let is_word = |c: char| !c.is_whitespace();
+        if !is_word(chars[local]) {
+            return None;
+        }
+        let mut start = local;
+        while start > 0 && is_word(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = local;
+        while end + 1 < chars.len() && is_word(chars[end + 1]) {
+            end += 1;
+        }
+        Some((selectable_area.x + start as u16, selectable_area.x + end as u16))
+    }
 
-        // For simplicity, we'll find the word based on whitespace and punctuation
-        // In a full implementation, we'd map visual positions back to text offsets
-        // For now, return a reasonable range around the click position
-        let start = col.saturating_sub(10).max(0);
-        let end = col.saturating_add(10);
-        Some((start, end))
+    /// Find paragraph boundaries (run of non-blank rows) around `row` and
+    /// return (start_row, end_row, end_col) where end_col is the trimmed end
+    /// of the last row's content. Used by triple-click selection so a
+    /// "paragraph" — a contiguous block of text rows — is selected as a unit
+    /// instead of a single visual row.
+    fn find_paragraph_boundaries(&self, row: u16) -> Option<(u16, u16, u16)> {
+        let cache = self.last_row_text.borrow();
+        let selectable_area = self.last_selectable_area.get();
+        if selectable_area.width == 0 || selectable_area.height == 0 {
+            return None;
+        }
+        let row_text = cache.get(&row)?;
+        if row_text.trim().is_empty() {
+            return None;
+        }
+        let max_row = selectable_area
+            .y
+            .saturating_add(selectable_area.height)
+            .saturating_sub(1);
+        let mut start = row;
+        while start > selectable_area.y {
+            let prev = start - 1;
+            if cache.get(&prev).map(|s| s.trim().is_empty()).unwrap_or(true) {
+                break;
+            }
+            start = prev;
+        }
+        let mut end = row;
+        while end < max_row {
+            let next = end + 1;
+            if cache.get(&next).map(|s| s.trim().is_empty()).unwrap_or(true) {
+                break;
+            }
+            end = next;
+        }
+        let last_text = cache.get(&end)?;
+        let trimmed = last_text.trim_end();
+        let end_col = selectable_area.x + trimmed.chars().count().saturating_sub(1) as u16;
+        Some((start, end, end_col))
     }
 
     /// Find line boundaries for the row containing the click.
@@ -4862,6 +5238,134 @@ impl App {
         }
 
         false
+    }
+
+    /// Handle a paste data string (from `Event::Paste` or Ctrl+V text fallback).
+    ///
+    /// If the pasted text resolves to an existing filesystem path:
+    ///   - image files (png/jpg/gif/webp/bmp) → added as an image attachment pill
+    ///   - other files → inserted as `@path` mention text
+    /// Otherwise the text goes through the normal `prompt_input.paste()` path
+    /// which applies the multi-line summary placeholder for large pastes.
+    fn handle_paste_data(&mut self, data: String) {
+        use crate::prompt_input::detect_pasted_path;
+        use crate::image_paste::PastedImage;
+
+        if let Some(path) = detect_pasted_path(&data) {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase());
+            let is_image = matches!(
+                ext.as_deref(),
+                Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("webp") | Some("bmp")
+            );
+            if is_image {
+                let label = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("image")
+                    .to_string();
+                let img = PastedImage { path, label: label.clone(), dimensions: None };
+                self.prompt_input.add_image(img);
+                self.notifications.push(
+                    crate::notifications::NotificationKind::Info,
+                    format!("Image attached: {}", label),
+                    Some(3),
+                );
+            } else {
+                // Non-image file: insert as an @mention so the path is visible
+                // but clearly marked as a file reference.
+                let mention = format!("@{}", path.display());
+                self.prompt_input.paste(&mention);
+            }
+        } else {
+            self.prompt_input.paste(&data);
+        }
+    }
+
+    /// Returns `true` when the app is in a state where the prompt can accept
+    /// regular text input — used to gate paste-burst detection.
+    fn prompt_is_accepting_text(&self) -> bool {
+        !self.is_streaming
+            && self.permission_request.is_none()
+            && !self.ask_user_dialog.visible
+            && !self.history_search_overlay.visible
+            && self.history_search.is_none()
+            && !self.settings_screen.visible
+            && !self.theme_screen.visible
+            && self.prompt_input.vim_mode == crate::prompt_input::VimMode::Insert
+    }
+
+    /// Drain any immediately-available key events from the crossterm event
+    /// queue (zero-timeout poll) and return them alongside `first` as a single
+    /// pasted string if the burst is large enough to be a paste.
+    ///
+    /// On Windows Terminal, Ctrl+V causes the terminal emulator to write the
+    /// clipboard content directly to stdin as raw character events — every
+    /// newline becomes an Enter keypress and stray `v` characters trigger
+    /// voice PTT.  Because a paste dumps ALL characters into the queue at
+    /// once, a zero-timeout drain immediately after the first character
+    /// reliably yields 3+ chars for any non-trivial paste, while normal
+    /// keyboard typing (even at 120 WPM) almost never queues more than one
+    /// char in the same 50 ms window.
+    ///
+    /// Returns `Some(text)` when a paste burst is detected (caller should
+    /// route through `handle_paste_data`).  Returns `None` for a normal
+    /// single keystroke.  If a non-character key is encountered while
+    /// draining, it is stored in `self.pending_key` and will be replayed at
+    /// the top of the next event-loop iteration.
+    fn try_detect_paste_burst(
+        &mut self,
+        first: char,
+    ) -> Option<String> {
+        use crossterm::event::{Event, KeyCode, KeyEventKind};
+
+        // Minimum number of chars (including `first`) to classify as a paste.
+        // Two or more is enough: at 120 WPM the inter-key interval is ~60 ms,
+        // so a second char in the same zero-timeout drain is extremely unlikely
+        // from a human typist but guaranteed from a clipboard paste.
+        const BURST_THRESHOLD: usize = 2;
+
+        // Quick exit: don't bother if nothing is queued immediately.
+        if !crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+            return None;
+        }
+
+        let mut buf = String::new();
+        buf.push(first);
+
+        loop {
+            match crossterm::event::poll(std::time::Duration::ZERO) {
+                Ok(true) => {
+                    match crossterm::event::read() {
+                        Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+                            match k.code {
+                                KeyCode::Char(c) => buf.push(c),
+                                KeyCode::Enter => buf.push('\n'),
+                                _ => {
+                                    // Non-character key — save it for replay.
+                                    self.pending_key = Some(k);
+                                    break;
+                                }
+                            }
+                        }
+                        // Non-key event (mouse, resize, …) — leave in queue by
+                        // not reading it; we already checked poll() so it will
+                        // be re-read next iteration. But we already read it, so
+                        // we just break (the event is consumed but benign).
+                        _ => break,
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        if buf.chars().count() >= BURST_THRESHOLD {
+            Some(buf)
+        } else {
+            None
+        }
     }
 
     /// Process mouse events (trackpad scroll, text selection, etc.).
@@ -5095,15 +5599,24 @@ impl App {
                     if self.is_double_click(current_pos) {
                         self.click_count += 1;
                         if self.click_count >= 3 {
-                            // Triple-click: select entire line
-                            self.selection_anchor = Some((selectable_area.x, current_pos.1));
-                            self.selection_focus = Some((
-                                selectable_area
-                                    .x
-                                    .saturating_add(selectable_area.width)
-                                    .saturating_sub(1),
-                                current_pos.1,
-                            ));
+                            // Triple-click: select the paragraph (run of
+                            // non-blank rows) containing the click. Falls back
+                            // to a single line if no paragraph is detected.
+                            if let Some((start_row, end_row, end_col)) =
+                                self.find_paragraph_boundaries(current_pos.1)
+                            {
+                                self.selection_anchor = Some((selectable_area.x, start_row));
+                                self.selection_focus = Some((end_col, end_row));
+                            } else {
+                                self.selection_anchor = Some((selectable_area.x, current_pos.1));
+                                self.selection_focus = Some((
+                                    selectable_area
+                                        .x
+                                        .saturating_add(selectable_area.width)
+                                        .saturating_sub(1),
+                                    current_pos.1,
+                                ));
+                            }
                             self.click_count = 0; // Reset for next click sequence
                         } else {
                             // Double-click: select word
@@ -5151,6 +5664,19 @@ impl App {
                 // Clear if no actual drag (single click = no selection)
                 if self.selection_anchor == self.selection_focus {
                     self.clear_selection();
+                } else if self.settings_screen.auto_copy_enabled {
+                    // Auto-copy finalized selection to clipboard.
+                    let sel_text = self.selection_text.borrow().clone();
+                    if !sel_text.is_empty() {
+                        let copied = crate::image_paste::write_clipboard_text(&sel_text);
+                        if copied {
+                            self.notifications.push(
+                                NotificationKind::Info,
+                                "Copied to clipboard".to_string(),
+                                Some(1),
+                            );
+                        }
+                    }
                 }
             }
             _ => {}
@@ -5475,9 +6001,21 @@ impl App {
             // Draw the frame
             terminal.draw(|f| render::render_app(f, self))?;
 
+            // Replay a key that was saved by try_detect_paste_burst in a
+            // previous iteration (e.g. a modifier key that terminated a burst).
+            let pending = self.pending_key.take();
+
             // Poll for events with a short timeout so we can redraw for animation
-            if event::poll(std::time::Duration::from_millis(50))? {
-                match event::read()? {
+            let got_event = pending.is_some()
+                || event::poll(std::time::Duration::from_millis(50))?;
+
+            if got_event {
+                let event = if let Some(k) = pending {
+                    Event::Key(k)
+                } else {
+                    event::read()?
+                };
+                match event {
                     Event::Key(key) => {
                         // On Windows crossterm fires both Press and Release events.
                         // We normally skip non-press events, but when voice PTT mode
@@ -5495,6 +6033,30 @@ impl App {
                             }
                             continue;
                         }
+
+                        // ---- Paste-burst detection -----------------------------------------
+                        // On Windows Terminal, Ctrl+V causes the terminal to write clipboard
+                        // content as raw character events (not as Event::Paste).  Every `\n`
+                        // fires as Enter (submitting the prompt) and stray `v` chars trigger
+                        // voice PTT.  We detect this by draining the event queue with a
+                        // zero-timeout immediately after the first character arrives — a paste
+                        // dumps every character at once while normal typing rarely queues more
+                        // than one char in the same 50 ms window.
+                        if key.modifiers == KeyModifiers::NONE
+                            || key.modifiers == KeyModifiers::SHIFT
+                        {
+                            if let KeyCode::Char(c) = key.code {
+                                if self.prompt_is_accepting_text() {
+                                    if let Some(burst) = self.try_detect_paste_burst(c) {
+                                        self.handle_paste_data(burst);
+                                        self.refresh_prompt_input();
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        // -------------------------------------------------------------------
+
                         let should_submit = self.handle_key_event(key);
                         // Honour `:q`/`:wq` from vim command-line mode
                         if self.prompt_input.vim_quit_requested {
@@ -5527,7 +6089,7 @@ impl App {
                             && !self.history_search_overlay.visible
                             && self.history_search.is_none() =>
                     {
-                        self.prompt_input.paste(&data);
+                        self.handle_paste_data(data);
                         self.refresh_prompt_input();
                     }
                     Event::Mouse(mouse_event) => {
@@ -5598,6 +6160,50 @@ impl App {
     }
 }
 
+// Helper function to open a file in the user's external editor
+fn open_file_externally(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    // Try to open with the system's default application
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(&["/C", "start", ""])
+            .arg(path)
+            .spawn()?;
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        // Fallback for other systems: try common editors in order
+        for editor in &["nano", "vi", "vim", "emacs"] {
+            match std::process::Command::new(editor)
+                .arg(path)
+                .spawn()
+            {
+                Ok(_) => return Ok(()),
+                Err(_) => continue,
+            }
+        }
+        Err("No suitable editor found".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5616,6 +6222,80 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    // ---- normalize_char_with_shift tests ----
+
+    #[test]
+    fn test_normalize_char_no_shift_returns_unchanged() {
+        assert_eq!(normalize_char_with_shift('a', KeyModifiers::NONE), 'a');
+        assert_eq!(normalize_char_with_shift('1', KeyModifiers::NONE), '1');
+        assert_eq!(normalize_char_with_shift('!', KeyModifiers::NONE), '!');
+    }
+
+    #[test]
+    fn test_normalize_char_shift_uppercase_letters() {
+        assert_eq!(normalize_char_with_shift('a', KeyModifiers::SHIFT), 'A');
+        assert_eq!(normalize_char_with_shift('z', KeyModifiers::SHIFT), 'Z');
+        assert_eq!(normalize_char_with_shift('m', KeyModifiers::SHIFT), 'M');
+    }
+
+    #[test]
+    fn test_normalize_char_shift_numbers() {
+        assert_eq!(normalize_char_with_shift('1', KeyModifiers::SHIFT), '!');
+        assert_eq!(normalize_char_with_shift('2', KeyModifiers::SHIFT), '@');
+        assert_eq!(normalize_char_with_shift('3', KeyModifiers::SHIFT), '#');
+        assert_eq!(normalize_char_with_shift('4', KeyModifiers::SHIFT), '$');
+        assert_eq!(normalize_char_with_shift('5', KeyModifiers::SHIFT), '%');
+        assert_eq!(normalize_char_with_shift('6', KeyModifiers::SHIFT), '^');
+        assert_eq!(normalize_char_with_shift('7', KeyModifiers::SHIFT), '&');
+        assert_eq!(normalize_char_with_shift('8', KeyModifiers::SHIFT), '*');
+        assert_eq!(normalize_char_with_shift('9', KeyModifiers::SHIFT), '(');
+        assert_eq!(normalize_char_with_shift('0', KeyModifiers::SHIFT), ')');
+    }
+
+    #[test]
+    fn test_normalize_char_shift_symbols() {
+        assert_eq!(normalize_char_with_shift('-', KeyModifiers::SHIFT), '_');
+        assert_eq!(normalize_char_with_shift('=', KeyModifiers::SHIFT), '+');
+        assert_eq!(normalize_char_with_shift('[', KeyModifiers::SHIFT), '{');
+        assert_eq!(normalize_char_with_shift(']', KeyModifiers::SHIFT), '}');
+        assert_eq!(normalize_char_with_shift(';', KeyModifiers::SHIFT), ':');
+        assert_eq!(normalize_char_with_shift('\'', KeyModifiers::SHIFT), '"');
+        assert_eq!(normalize_char_with_shift(',', KeyModifiers::SHIFT), '<');
+        assert_eq!(normalize_char_with_shift('.', KeyModifiers::SHIFT), '>');
+        assert_eq!(normalize_char_with_shift('/', KeyModifiers::SHIFT), '?');
+        assert_eq!(normalize_char_with_shift('\\', KeyModifiers::SHIFT), '|');
+        assert_eq!(normalize_char_with_shift('`', KeyModifiers::SHIFT), '~');
+    }
+
+    #[test]
+    fn test_normalize_char_shift_already_shifted_chars_unchanged() {
+        // Characters that don't have shift equivalents remain unchanged
+        assert_eq!(normalize_char_with_shift('!', KeyModifiers::SHIFT), '!');
+        assert_eq!(normalize_char_with_shift('@', KeyModifiers::SHIFT), '@');
+        assert_eq!(normalize_char_with_shift('A', KeyModifiers::SHIFT), 'A');
+    }
+
+    #[test]
+    fn test_normalize_char_other_modifiers_ignored() {
+        // CTRL or ALT without SHIFT should not shift the character
+        assert_eq!(normalize_char_with_shift('a', KeyModifiers::CONTROL), 'a');
+        assert_eq!(normalize_char_with_shift('1', KeyModifiers::ALT), '1');
+        assert_eq!(normalize_char_with_shift('a', KeyModifiers::CONTROL | KeyModifiers::ALT), 'a');
+    }
+
+    #[test]
+    fn test_normalize_char_shift_with_other_modifiers() {
+        // SHIFT + CTRL should still apply shift transformation
+        assert_eq!(
+            normalize_char_with_shift('a', KeyModifiers::SHIFT | KeyModifiers::CONTROL),
+            'A'
+        );
+        assert_eq!(
+            normalize_char_with_shift('1', KeyModifiers::SHIFT | KeyModifiers::ALT),
+            '!'
+        );
     }
 
     #[test]

@@ -1,8 +1,14 @@
+<div align="center">
+
 # Claurst
+
+<img src="../public/Ship.png" alt="Rustle on the ship" width="350" />
 
 Claurst is a high-performance Rust reimplementation of Claude Code — a terminal-native AI coding agent with streaming responses, 40+ built-in tools, 15+ LLM provider integrations, a full ratatui TUI, and an extensible plugin system.
 
-> **Version:** 0.0.9 · **License:** GPL-3.0 · [GitHub](https://github.com/Kuberwastaken/claurst)
+**Version:** 0.1.0 (Beta) · **License:** GPL-3.0 · [GitHub](https://github.com/Kuberwastaken/claurst)
+
+</div>
 
 ---
 
@@ -44,20 +50,34 @@ Extend Claurst with TOML-manifest plugins that add custom slash commands, MCP se
 ### Multi-agent orchestration
 Run named agents (`build`, `plan`, `explore`) or spawn parallel sub-agents in coordinator mode. Agents communicate via a shared task registry and message channels.
 
+### Goal system
+Set a durable objective with `/goal` and Claurst works autonomously across turns until the goal is verified complete — using the `GoalCompleteTool` for audited completion rather than just stopping.
+
+### Managed agents (preview)
+Configure a manager-executor architecture with `/managed-agents` where a manager model delegates subtasks to parallel executor agents with full budget split controls.
+
+### Speech modes
+Activate `/caveman` or `/rocky` to compress model responses by 40–85%, saving tokens in long sessions. Deactivate with `/normal`.
+
 ---
 
 ## Quick start
 
-**1. Download and install**
+**1. Install**
 
 ```bash
-# macOS (Apple Silicon)
-curl -Lo claurst.tar.gz \
-  https://github.com/Kuberwastaken/claurst/releases/latest/download/claurst-macos-aarch64.tar.gz
-tar xzf claurst.tar.gz && chmod +x claurst && sudo mv claurst /usr/local/bin/
+# Linux / macOS
+curl -fsSL https://github.com/Kuberwastaken/claurst/releases/latest/download/install.sh | bash
 ```
 
-See [Installation](installation) for all platforms.
+```powershell
+# Windows (PowerShell)
+irm https://github.com/Kuberwastaken/claurst/releases/latest/download/install.ps1 | iex
+```
+
+The installer auto-detects your platform/arch, drops `claurst` into
+`~/.claurst/bin/`, and adds it to your `PATH`. See
+[Installation](installation) for flags, manual download, and uninstall steps.
 
 **2. Set your API key**
 
@@ -132,10 +152,21 @@ Inside the interactive TUI, type `/` to see all available commands. Common ones:
 |---------|-------------|
 | `/help` | Show all commands |
 | `/model` | Switch model or provider |
+| `/goal <objective>` | Set an autonomous multi-turn goal |
+| `/managed-agents` | Configure manager-executor agents |
 | `/compact` | Compress conversation history |
 | `/cost` | Token usage and cost for this session |
+| `/insights` | Session statistics and tool usage report |
+| `/caveman` | Activate telegraphic speech mode (save tokens) |
+| `/rocky` | Activate Rocky (Project Hail Mary) speech mode |
+| `/normal` | Deactivate speech modes |
 | `/rewind` | Go back to a previous message |
+| `/copy` | Copy last response to clipboard |
 | `/export` | Save session transcript |
+| `/think-back` | View thinking traces from previous responses |
+| `/ultrareview` | Exhaustive multi-dimensional code review |
+| `/advisor <model>` | Set a secondary advisor model |
+| `/sandbox-toggle` | Toggle sandboxed shell execution |
 | `/update` | Check for and download updates |
 | `/exit` | Quit |
 

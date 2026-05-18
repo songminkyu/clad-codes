@@ -2,6 +2,7 @@ import figures from 'figures'
 import * as React from 'react'
 import { DEFAULT_CODEX_BASE_URL } from '../services/api/providerConfig.js'
 import { Box, Text } from '../ink.js'
+import { useTerminalSize } from '../hooks/useTerminalSize.js'
 import { useKeybinding } from '../keybindings/useKeybinding.js'
 import { useSetAppState } from '../state/AppState.js'
 import type { ProviderProfile } from '../utils/config.js'
@@ -24,13 +25,18 @@ import {
 import {
   getProviderPresetUiMetadata,
   getRouteProviderTypeLabel,
+  getRouteDescriptor,
   ORDERED_PROVIDER_PRESETS,
   routeSupportsApiFormatSelection,
   routeSupportsAuthHeaders,
   routeSupportsCustomHeaders,
+  routeShowsAuthHeader,
+  routeShowsAuthHeaderValue,
+  routeShowsCustomHeaders,
   resolveProfileRoute,
   resolveRouteIdFromBaseUrl,
 } from '../integrations/index.js'
+import { openAIShimSupportsApiFormatForModel } from '../integrations/runtimeMetadata.js'
 import { probeRouteReadiness } from '../integrations/discoveryService.js'
 import {
   addProviderProfile,
@@ -90,6 +96,8 @@ type Screen =
   | 'select-atomic-chat-model'
   | 'codex-oauth'
   | 'form'
+  | 'preset-model'
+  | 'preset-api-key'
   | 'select-active'
   | 'select-edit'
   | 'select-delete'
@@ -210,6 +218,28 @@ function toDraft(profile: ProviderProfile): ProviderDraft {
   }
 }
 
+function getPresetLabel(preset: ProviderPreset, label: string): React.ReactNode {
+  if (preset === 'gitlawb-opengateway') {
+    return (
+      <Text>
+        <Text>{label} </Text>
+        <Text color="success" bold>[FREE]</Text>
+      </Text>
+    )
+  }
+
+  if (preset === 'xiaomi-mimo') {
+    return (
+      <Text>
+        <Text>{label} </Text>
+        <Text color="success" bold>[Sponsor]</Text>
+      </Text>
+    )
+  }
+
+  return label
+}
+
 function presetToDraft(preset: ProviderPreset): ProviderDraft {
   const defaults = getProviderPresetDefaults(preset)
   return {
@@ -222,6 +252,16 @@ function presetToDraft(preset: ProviderPreset): ProviderDraft {
     authHeaderValue: '',
     customHeaders: '',
   }
+}
+
+function isSetupPlaceholder(value: string): boolean {
+  return /\bYOUR[-_\s]/i.test(value) || /<[^>]+>/.test(value)
+}
+
+function canUseStreamlinedPresetFlow(draft: ProviderDraft): boolean {
+  // Descriptor placeholder defaults mean the endpoint/model are user-specific,
+  // so those presets still need the full setup form.
+  return !isSetupPlaceholder(draft.baseUrl) && !isSetupPlaceholder(draft.model)
 }
 
 function profileSummary(profile: ProviderProfile, isActive: boolean): string {
@@ -264,6 +304,25 @@ function resolveProviderEditorRouteId(
   }
 
   return resolveRouteIdFromBaseUrl(baseUrl) ?? route
+}
+
+function routeSupportsResponsesModel(routeId: string, model: string): boolean {
+  return openAIShimSupportsApiFormatForModel(
+    getRouteDescriptor(routeId)?.transportConfig.openaiShim,
+    'responses',
+    getPrimaryModel(model),
+  )
+}
+
+function getResponsesApiModelSetLabel(routeId: string): string {
+  const prefixes =
+    getRouteDescriptor(routeId)?.transportConfig.openaiShim
+      ?.responsesApiModelPrefixes
+  if (!prefixes || prefixes.length === 0) {
+    return "this provider's configured model set"
+  }
+
+  return `${prefixes.join(', ')} models`
 }
 
 async function resolveGithubCredentialSource(
@@ -459,6 +518,8 @@ function CodexOAuthSetup({
 }
 
 export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
+  const { columns: terminalColumns } = useTerminalSize()
+  const inputColumns = Math.max(20, Math.min(80, terminalColumns - 4))
   const setAppState = useSetAppState()
   const initialGithubCredentialSource = getGithubCredentialSourceFromEnv()
   const initialIsGithubActive = isEnvTruthy(process.env.CLAUDE_CODE_USE_GITHUB)
@@ -491,6 +552,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
   const [draft, setDraft] = React.useState<ProviderDraft>(() =>
     presetToDraft('ollama'),
   )
+  const [presetRequiresApiKey, setPresetRequiresApiKey] = React.useState(false)
   const [formStepIndex, setFormStepIndex] = React.useState(0)
   const [cursorOffset, setCursorOffset] = React.useState(0)
   const [statusMessage, setStatusMessage] = React.useState<string | undefined>()
@@ -536,16 +598,21 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
   const formSteps = React.useMemo(
     () => {
       const routeId = resolveProviderEditorRouteId(draftProvider, draft.baseUrl)
-      const supportsCustomHeaders = routeSupportsCustomHeaders(routeId)
+      const showsAuthHeader = routeShowsAuthHeader(routeId)
+      const showsAuthHeaderValue = routeShowsAuthHeaderValue(routeId)
+      const showsCustomHeaders = routeShowsCustomHeaders(routeId)
       return FORM_STEPS.filter(step => {
         if (step.key === 'apiFormat') {
           return routeSupportsApiFormatSelection(routeId)
         }
-        if (step.key === 'authHeader' || step.key === 'authHeaderValue') {
-          return routeSupportsAuthHeaders(routeId)
+        if (step.key === 'authHeader') {
+          return showsAuthHeader
+        }
+        if (step.key === 'authHeaderValue') {
+          return showsAuthHeaderValue
         }
         if (step.key === 'customHeaders') {
-          return supportsCustomHeaders
+          return showsCustomHeaders
         }
         return true
       })
@@ -959,7 +1026,13 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
   }
 
   function closeWithCancelled(message: string): void {
-    onDone({ action: 'cancelled', message })
+    onDone({
+      action: 'cancelled',
+      message:
+        message === 'Provider manager closed' && statusMessage
+          ? statusMessage
+          : message,
+    })
   }
 
   function activateGithubProvider(): string | null {
@@ -1051,6 +1124,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
 
   function startCreateFromPreset(preset: ProviderPreset): void {
     const defaults = getProviderPresetDefaults(preset)
+    const provider = defaults.provider ?? 'openai'
     const nextDraft = {
       name: defaults.name,
       baseUrl: defaults.baseUrl,
@@ -1062,8 +1136,9 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
       customHeaders: '',
     }
     setEditingProfileId(null)
-    setDraftProvider(defaults.provider ?? 'openai')
+    setDraftProvider(provider)
     setDraft(nextDraft)
+    setPresetRequiresApiKey(defaults.requiresApiKey)
     setFormStepIndex(0)
     setCursorOffset(nextDraft.name.length)
     setErrorMessage(undefined)
@@ -1080,7 +1155,13 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
       return
     }
 
-    setScreen('form')
+    if (preset === 'custom' || !canUseStreamlinedPresetFlow(nextDraft)) {
+      setScreen('form')
+      return
+    }
+
+    setCursorOffset(nextDraft.model.length)
+    setScreen('preset-model')
   }
 
   function startEditProfile(profileId: string): void {
@@ -1093,55 +1174,65 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     setEditingProfileId(profileId)
     setDraftProvider(existing.provider ?? 'openai')
     setDraft(nextDraft)
+    setPresetRequiresApiKey(false)
     setFormStepIndex(0)
     setCursorOffset(nextDraft.name.length)
     setErrorMessage(undefined)
     setScreen('form')
   }
 
-  function persistDraft(nextDraft: ProviderDraft = draft): void {
+  function persistDraft(
+    nextDraft: ProviderDraft = draft,
+    provider: ProviderProfile['provider'] = draftProvider,
+    profileId: string | null = editingProfileId,
+  ): void {
+    const routeId = resolveProviderEditorRouteId(provider, nextDraft.baseUrl)
+    const supportsApiFormat = routeSupportsApiFormatSelection(routeId)
+    const showsAuthHeader = routeShowsAuthHeader(routeId)
+    const showsAuthHeaderValue = routeShowsAuthHeaderValue(routeId)
+    const showsCustomHeaders = routeShowsCustomHeaders(routeId)
     const parsedCustomHeaders = parseProfileCustomHeadersInput(
-      nextDraft.customHeaders,
+      showsCustomHeaders ? nextDraft.customHeaders : '',
     )
     if (parsedCustomHeaders.error) {
       setErrorMessage(parsedCustomHeaders.error)
       return
     }
 
-    const routeId = resolveProviderEditorRouteId(draftProvider, nextDraft.baseUrl)
-    const supportsApiFormat = routeSupportsApiFormatSelection(routeId)
-    const supportsAuthHeaders = routeSupportsAuthHeaders(routeId)
+    const requestedResponses =
+      supportsApiFormat && nextDraft.apiFormat === 'responses'
+    const shouldUseChatCompletions =
+      !supportsApiFormat ||
+      nextDraft.apiFormat !== 'responses' ||
+      !routeSupportsResponsesModel(routeId, nextDraft.model)
     const payload: ProviderProfileInput = {
-      provider: draftProvider,
+      provider,
       name: nextDraft.name,
       baseUrl: nextDraft.baseUrl,
       model: nextDraft.model,
       apiKey: nextDraft.apiKey,
-      apiFormat:
-        supportsApiFormat && nextDraft.apiFormat === 'responses'
-          ? 'responses'
-          : 'chat_completions',
+      apiFormat: shouldUseChatCompletions ? 'chat_completions' : 'responses',
       authHeader:
-        supportsAuthHeaders && nextDraft.authHeader
+        showsAuthHeader && nextDraft.authHeader
           ? nextDraft.authHeader
           : undefined,
       authScheme:
-        supportsAuthHeaders && nextDraft.authHeader
+        showsAuthHeader && nextDraft.authHeader
           ? (nextDraft.authHeader.toLowerCase() === 'authorization' ? 'bearer' : 'raw')
           : undefined,
       authHeaderValue:
-        supportsAuthHeaders && nextDraft.authHeaderValue
+        showsAuthHeaderValue && nextDraft.authHeaderValue
           ? nextDraft.authHeaderValue
           : undefined,
       customHeaders:
-        routeSupportsCustomHeaders(routeId) &&
+        showsCustomHeaders &&
         Object.keys(parsedCustomHeaders.headers).length > 0
           ? parsedCustomHeaders.headers
           : undefined,
     }
 
-    const saved = editingProfileId
-      ? updateProviderProfile(editingProfileId, payload)
+    const saved = profileId
+      ? updateProviderProfile(profileId, payload)
       : addProviderProfile(payload, { makeActive: true })
 
     if (!saved) {
@@ -1163,20 +1254,29 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
 
     refreshProfiles()
     const successMessage =
-      editingProfileId
+      profileId
         ? `Updated provider: ${saved.name}`
         : `Added provider: ${saved.name} (now active)`
+    const adjustedApiFormat =
+      requestedResponses && saved.apiFormat !== 'responses'
+    const routeLabel =
+      getRouteDescriptor(routeId)?.label ?? getRouteProviderTypeLabel(routeId)
+    const responseModelSetLabel = getResponsesApiModelSetLabel(routeId)
+    const apiFormatMessage = adjustedApiFormat
+      ? `. ${routeLabel} only supports the Responses API for ${responseModelSetLabel}, so this profile was saved using Chat Completions.`
+      : ''
+    const finalSuccessMessage = `${successMessage}${apiFormatMessage}`
     setStatusMessage(
       settingsOverrideError
-        ? `${successMessage}. Warning: could not clear startup provider override (${settingsOverrideError}).`
-        : successMessage,
+        ? `${finalSuccessMessage}. Warning: could not clear startup provider override (${settingsOverrideError}).`
+        : finalSuccessMessage,
     )
 
     if (mode === 'first-run') {
       onDone({
         action: 'saved',
         activeProfileId: saved.id,
-        message: `Provider configured: ${saved.name}`,
+        message: `Provider configured: ${saved.name}${apiFormatMessage}`,
       })
       return
     }
@@ -1185,6 +1285,23 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     setFormStepIndex(0)
     setErrorMessage(undefined)
     returnToMenu()
+  }
+
+  function applyPresetApiFormat(
+    nextDraft: ProviderDraft,
+    provider: ProviderProfile['provider'],
+  ): ProviderDraft {
+    const routeId = resolveProviderEditorRouteId(provider, nextDraft.baseUrl)
+    const apiFormat =
+      routeSupportsApiFormatSelection(routeId) &&
+      routeSupportsResponsesModel(routeId, nextDraft.model)
+        ? 'responses'
+        : 'chat_completions'
+
+    return {
+      ...nextDraft,
+      apiFormat,
+    }
   }
 
   function renderAtomicChatSelection(): React.ReactNode {
@@ -1395,21 +1512,49 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     isActive: screen === 'form',
   })
 
+  function handleBackFromPresetModel(): void {
+    setErrorMessage(undefined)
+    setScreen('select-preset')
+  }
+
+  useKeybinding('confirm:no', handleBackFromPresetModel, {
+    context: 'Settings',
+    isActive: screen === 'preset-model',
+  })
+
+  function handleBackFromPresetApiKey(): void {
+    setErrorMessage(undefined)
+    setCursorOffset(draft.model.length)
+    setScreen('preset-model')
+  }
+
+  useKeybinding('confirm:no', handleBackFromPresetApiKey, {
+    context: 'Settings',
+    isActive: screen === 'preset-api-key',
+  })
+
   function renderPresetSelection(): React.ReactNode {
     const canUseCodexOAuth = !isBareMode()
     const options: OptionWithDescription<string>[] = ORDERED_PROVIDER_PRESETS.map(preset => {
       const metadata = getProviderPresetUiMetadata(preset)
       return {
         value: preset,
-        label: metadata.label,
+        label: getPresetLabel(preset, metadata.label),
         description: metadata.description,
       }
     })
 
     if (canUseCodexOAuth) {
-      options.splice(6, 0, {
+      // Insert after DeepSeek so Codex OAuth keeps its established position
+      // in the picker even with Gitlawb Opengateway pinned at the top.
+      options.splice(7, 0, {
         value: 'codex-oauth',
-        label: 'Codex OAuth',
+        label: (
+          <Text>
+            <Text>Codex OAuth </Text>
+            <Text color="success" bold>★ Recommended</Text>
+          </Text>
+        ),
         description:
           'Sign in with ChatGPT in your browser and store Codex credentials securely',
       })
@@ -1429,7 +1574,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
           {mode === 'first-run' ? 'Set up provider' : 'Choose provider preset'}
         </Text>
         <Text dimColor>
-          Pick a preset, then confirm base URL, model, and API key.
+          Pick a preset, then complete the details it needs.
         </Text>
         <Select
           options={options}
@@ -1522,7 +1667,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
                   ? '*'
                   : undefined
               }
-              columns={80}
+              columns={inputColumns}
               cursorOffset={cursorOffset}
               onChangeCursorOffset={setCursorOffset}
             />
@@ -1531,6 +1676,136 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
         {errorMessage && <Text color="error">{errorMessage}</Text>}
         <Text dimColor>
           Press Enter to continue. Press Esc to go back.
+        </Text>
+      </Box>
+    )
+  }
+
+  function renderPresetModel(): React.ReactNode {
+    const needsApiKey = presetRequiresApiKey && !draft.apiKey.trim()
+
+    return (
+      <Box flexDirection="column" gap={1}>
+        <Text color="remember" bold>
+          Create provider profile
+        </Text>
+        <Text dimColor>
+          Choose the default model for {draft.name}. Endpoint and advanced
+          details are already configured by the preset.
+        </Text>
+        <Text dimColor>
+          Provider type:{' '}
+          {getRouteProviderTypeLabel(resolveProfileRoute(draftProvider).routeId)}
+        </Text>
+        <Text dimColor>
+          Step 1 of {needsApiKey ? 2 : 1}: Default model
+        </Text>
+        <Box flexDirection="row" gap={1}>
+          <Text>{figures.pointer}</Text>
+          <TextInput
+            value={draft.model}
+            onChange={value =>
+              setDraft(prev => ({
+                ...prev,
+                model: value,
+              }))
+            }
+            onSubmit={value => {
+              const model = value.trim()
+              if (!model) {
+                setErrorMessage('Default model is required.')
+                return
+              }
+
+              const nextDraft = applyPresetApiFormat(
+                {
+                  ...draft,
+                  model,
+                },
+                draftProvider,
+              )
+              setDraft(nextDraft)
+              setErrorMessage(undefined)
+
+              if (needsApiKey) {
+                setCursorOffset(0)
+                setScreen('preset-api-key')
+                return
+              }
+
+              persistDraft(nextDraft, draftProvider, null)
+            }}
+            focus={true}
+            showCursor={true}
+            placeholder={`Enter model${figures.ellipsis}`}
+            columns={inputColumns}
+            cursorOffset={cursorOffset}
+            onChangeCursorOffset={setCursorOffset}
+          />
+        </Box>
+        {errorMessage && <Text color="error">{errorMessage}</Text>}
+        <Text dimColor>
+          Press Enter to continue. Press Esc to go back.
+        </Text>
+      </Box>
+    )
+  }
+
+  function renderPresetApiKey(): React.ReactNode {
+    return (
+      <Box flexDirection="column" gap={1}>
+        <Text color="remember" bold>
+          Create provider profile
+        </Text>
+        <Text dimColor>
+          Enter the API key for {draft.name}. Other preset details are already
+          configured.
+        </Text>
+        <Text dimColor>
+          Provider type:{' '}
+          {getRouteProviderTypeLabel(resolveProfileRoute(draftProvider).routeId)}
+        </Text>
+        <Text dimColor>Step 2 of 2: API key</Text>
+        <Box flexDirection="row" gap={1}>
+          <Text>{figures.pointer}</Text>
+          <TextInput
+            value={draft.apiKey}
+            onChange={value =>
+              setDraft(prev => ({
+                ...prev,
+                apiKey: value,
+              }))
+            }
+            onSubmit={value => {
+              const apiKey = value.trim()
+              if (!apiKey) {
+                setErrorMessage(`API key is required for ${draft.name}.`)
+                return
+              }
+
+              const nextDraft = applyPresetApiFormat(
+                {
+                  ...draft,
+                  apiKey,
+                },
+                draftProvider,
+              )
+              setDraft(nextDraft)
+              setErrorMessage(undefined)
+              persistDraft(nextDraft, draftProvider, null)
+            }}
+            focus={true}
+            showCursor={true}
+            placeholder={`Enter API key${figures.ellipsis}`}
+            mask="*"
+            columns={inputColumns}
+            cursorOffset={cursorOffset}
+            onChangeCursorOffset={setCursorOffset}
+          />
+        </Box>
+        {errorMessage && <Text color="error">{errorMessage}</Text>}
+        <Text dimColor>
+          Press Enter to save. Press Esc to go back.
         </Text>
       </Box>
     )
@@ -1759,9 +2034,9 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
             }
 
             const active =
-              existing && activeProfileId !== saved.id
-                ? setActiveProviderProfile(saved.id)
-                : saved
+              activeProfileId === saved.id
+                ? saved
+                : setActiveProviderProfile(saved.id)
             if (!active) {
               setErrorMessage(
                 'Codex OAuth login finished, but the provider could not be set as the startup provider.',
@@ -1807,6 +2082,12 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
       break
     case 'form':
       content = renderForm()
+      break
+    case 'preset-model':
+      content = renderPresetModel()
+      break
+    case 'preset-api-key':
+      content = renderPresetApiKey()
       break
     case 'select-active':
       content = renderProfileSelection(

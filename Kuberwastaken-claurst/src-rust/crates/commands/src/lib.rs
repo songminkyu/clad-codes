@@ -198,6 +198,7 @@ pub struct VersionCommand;
 pub struct ResumeCommand;
 pub struct StatusCommand;
 pub struct DiffCommand;
+pub struct GoalCommand;
 pub struct MemoryCommand;
 pub struct BugCommand;
 pub struct UsageCommand;
@@ -265,6 +266,9 @@ pub struct UltrareviewCommand;
 pub struct AdvisorCommand;
 pub struct InstallSlackAppCommand;
 pub struct UndoCommand;
+pub struct RevertCommand;
+pub struct CheckpointsCommand;
+pub struct SnapshotDiffCommand;
 pub struct ProvidersCommand;
 pub struct ConnectCommand;
 pub struct AgentCommand;
@@ -1220,23 +1224,14 @@ impl SlashCommand for ResumeCommand {
             if sessions.is_empty() {
                 return CommandResult::Message("No previous sessions found.".to_string());
             }
-            let mut output = String::from("Recent sessions:\n\n");
-            for (i, session) in sessions.iter().take(10).enumerate() {
-                let title = session
-                    .title
-                    .as_deref()
-                    .unwrap_or("(untitled)");
-                let id_short = &session.id[..session.id.len().min(8)];
-                output.push_str(&format!(
-                    "  {}. {} - {} ({} messages)\n",
-                    i + 1,
-                    id_short,
-                    title,
-                    session.messages.len()
-                ));
+            let last = &sessions[0];
+            match claurst_core::history::load_session(&last.id).await {
+                Ok(session) => CommandResult::ResumeSession(session),
+                Err(e) => CommandResult::Error(format!(
+                    "Failed to load session {}: {}",
+                    last.id, e
+                )),
             }
-            output.push_str("\nUse /resume <id> to resume a session.");
-            CommandResult::Message(output)
         } else {
             match claurst_core::history::load_session(args.trim()).await {
                 Ok(session) => CommandResult::ResumeSession(session),
@@ -1405,6 +1400,222 @@ impl SlashCommand for DiffCommand {
                 ))
             }
             Err(e) => CommandResult::Error(format!("Failed to run git diff: {}", e)),
+        }
+    }
+}
+
+// ---- /goal ---------------------------------------------------------------
+
+/// Parse a soft token budget from strings like "250K", "1M", "500000".
+fn parse_token_budget(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num_str, multiplier) = if let Some(n) = s.strip_suffix('K').or_else(|| s.strip_suffix('k')) {
+        (n, 1_000u64)
+    } else if let Some(n) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
+        (n, 1_000_000u64)
+    } else {
+        (s, 1u64)
+    };
+    num_str.trim().parse::<u64>().ok().map(|n| n * multiplier)
+}
+
+#[async_trait]
+impl SlashCommand for GoalCommand {
+    fn name(&self) -> &str { "goal" }
+    fn description(&self) -> &str { "Set or manage a durable long-running goal for autonomous work" }
+    fn help(&self) -> &str {
+        "Usage:\n\
+         /goal <objective>              — set a new goal and begin working autonomously\n\
+         /goal --tokens 250K <text>     — set a goal with a soft token budget\n\
+         /goal                          — show current goal status\n\
+         /goal status                   — show current goal status\n\
+         /goal pause                    — pause the active goal\n\
+         /goal resume                   — resume a paused goal\n\
+         /goal clear                    — delete the current goal\n\
+         /goal complete                 — request a completion audit\n\n\
+         Goals let Claurst work autonomously across turns toward a single\n\
+         verifiable objective. Claurst will keep iterating until the goal is\n\
+         complete, you pause it, or the 200-turn runaway guard fires.\n\n\
+         Examples:\n\
+         /goal Migrate the project from Express to Fastify, keeping all routes passing\n\
+         /goal --tokens 500K Fix all TypeScript errors in src/ without breaking tests"
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        if !claurst_core::goals_enabled() {
+            return CommandResult::Message(
+                "Goals are disabled. Unset CLAURST_GOALS=0 (or remove it) to re-enable.".to_string(),
+            );
+        }
+
+        let args = args.trim();
+        let session_id = &ctx.session_id;
+
+        // Parse subcommands with no objective
+        match args {
+            "" | "status" => return goal_status(session_id),
+            "pause" => {
+                let store = match open_goal_store() {
+                    Some(s) => s,
+                    None => return CommandResult::Error("Could not open goal store.".to_string()),
+                };
+                match store.get_goal(session_id) {
+                    None => return CommandResult::Message("No active goal.".to_string()),
+                    Some(g) if g.status == claurst_core::GoalStatus::Complete => {
+                        return CommandResult::Message("Goal is already complete.".to_string());
+                    }
+                    Some(g) if g.status == claurst_core::GoalStatus::Paused => {
+                        return CommandResult::Message(
+                            "Goal is already paused. Use /goal resume to continue.".to_string(),
+                        );
+                    }
+                    _ => {}
+                }
+                if let Err(e) = store.set_status(session_id, claurst_core::GoalStatus::Paused) {
+                    return CommandResult::Error(format!("Failed to pause goal: {}", e));
+                }
+                return CommandResult::Message("Goal paused. Use /goal resume to continue.".to_string());
+            }
+            "resume" => {
+                let store = match open_goal_store() {
+                    Some(s) => s,
+                    None => return CommandResult::Error("Could not open goal store.".to_string()),
+                };
+                match store.get_goal(session_id) {
+                    None => return CommandResult::Message("No goal to resume.".to_string()),
+                    Some(g) if g.status == claurst_core::GoalStatus::Active => {
+                        return CommandResult::Message("Goal is already active.".to_string());
+                    }
+                    Some(g) if g.status == claurst_core::GoalStatus::Complete => {
+                        return CommandResult::Message(
+                            "Goal is complete. Use /goal <objective> to set a new one.".to_string(),
+                        );
+                    }
+                    _ => {}
+                }
+                if let Err(e) = store.set_status(session_id, claurst_core::GoalStatus::Active) {
+                    return CommandResult::Error(format!("Failed to resume goal: {}", e));
+                }
+                return CommandResult::Message("Goal resumed. Claurst will continue on the next message.".to_string());
+            }
+            "clear" => {
+                let store = match open_goal_store() {
+                    Some(s) => s,
+                    None => return CommandResult::Error("Could not open goal store.".to_string()),
+                };
+                store.clear_goal(session_id).unwrap_or_default();
+                return CommandResult::Message("Goal cleared.".to_string());
+            }
+            "complete" => {
+                // Inject a completion-audit user message.
+                let store = match open_goal_store() {
+                    Some(s) => s,
+                    None => return CommandResult::Error("Could not open goal store.".to_string()),
+                };
+                match store.get_active_goal(session_id) {
+                    None => {
+                        return CommandResult::Message(
+                            "No active goal. Set one with /goal <objective>.".to_string(),
+                        );
+                    }
+                    Some(goal) => {
+                        let audit_msg = format!(
+                            "[User requested goal completion audit]\n\
+                             Please review your active goal:\n\
+                             <objective>\n{}\n</objective>\n\n\
+                             Run through the completion audit:\n\
+                             1. Restate the objective as concrete deliverables.\n\
+                             2. Check that all deliverables have been achieved.\n\
+                             3. Run any tests or validation commands.\n\
+                             4. If fully complete, call GoalComplete with audit_summary and evidence.\n\
+                             5. If not complete, describe what remains.",
+                            goal.objective
+                        );
+                        return CommandResult::UserMessage(audit_msg);
+                    }
+                }
+            }
+            _ => {} // fall through to parse as objective (possibly with --tokens)
+        }
+
+        // Parse optional --tokens flag
+        let (token_budget, objective) = if args.starts_with("--tokens") {
+            // Expected: --tokens <budget> <objective>
+            let rest = args.trim_start_matches("--tokens").trim();
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let budget_str = parts.next().unwrap_or("");
+            let obj = parts.next().unwrap_or("").trim();
+            let budget = parse_token_budget(budget_str);
+            (budget, obj)
+        } else {
+            (None, args)
+        };
+
+        if objective.is_empty() {
+            return CommandResult::Message(
+                "Usage: /goal <objective> [--tokens 250K]\n\
+                 Or: /goal status|pause|resume|clear|complete"
+                    .to_string(),
+            );
+        }
+
+        let store = match open_goal_store() {
+            Some(s) => s,
+            None => return CommandResult::Error("Could not open goal store.".to_string()),
+        };
+
+        match store.set_goal(session_id, objective, token_budget) {
+            Err(claurst_core::GoalError::ObjectiveTooLong { len, max }) => {
+                CommandResult::Error(format!(
+                    "Objective too long ({} chars). Max {} chars.",
+                    len, max
+                ))
+            }
+            Err(e) => CommandResult::Error(format!("Failed to set goal: {}", e)),
+            Ok(goal) => {
+                // Return UserMessage so the query loop fires immediately and the
+                // model begins working toward the goal without user needing to
+                // send another message.
+                CommandResult::UserMessage(claurst_core::goal_kickoff_message(&goal))
+            }
+        }
+    }
+}
+
+fn open_goal_store() -> Option<claurst_core::GoalStore> {
+    claurst_core::GoalStore::open_default()
+}
+
+fn goal_status(session_id: &str) -> CommandResult {
+    let store = match open_goal_store() {
+        Some(s) => s,
+        None => return CommandResult::Error("Could not open goal store.".to_string()),
+    };
+    match store.get_goal(session_id) {
+        None => CommandResult::Message(
+            "No active goal. Set one with:\n  /goal <objective>".to_string(),
+        ),
+        Some(g) => {
+            let budget_line = g
+                .budget_display()
+                .map(|b| format!("\nBudget:  {}", b))
+                .unwrap_or_default();
+            CommandResult::Message(format!(
+                "Goal status\n\
+                 ───────────\n\
+                 Status:  {}\n\
+                 Turns:   {}\n\
+                 Elapsed: {}{}\n\
+                 Objective:\n  {}",
+                g.status.as_str(),
+                g.turns_used,
+                g.elapsed_display(),
+                budget_line,
+                g.objective,
+            ))
         }
     }
 }
@@ -5601,7 +5812,7 @@ impl SlashCommand for UpgradeCommand {
 
                 if tag == current || tag == "unknown" {
                     CommandResult::Message(format!(
-                        "Claurst v{current} — you are up to date.\n\
+                        "Claurst v{current} - you are up to date.\n\
                          Release page: {url}"
                     ))
                 } else {
@@ -5610,8 +5821,8 @@ impl SlashCommand for UpgradeCommand {
                          Current version:  v{current}\n\
                          Latest version:   v{tag}\n\
                          Release page:     {url}\n\n\
-                         Download the latest release:\n\
-                           {url}\n\n\
+                         Upgrade in place (recommended):\n\
+                           claurst upgrade\n\n\
                          Or build from source:\n\
                            cargo install claurst --force"
                     ))
@@ -7500,80 +7711,251 @@ impl SlashCommand for NamedCommandAdapter {
     }
 }
 
-// ---- /undo ---------------------------------------------------------------
+// ---- /undo (alias for /revert targeting the most recent assistant turn) ----
 
 #[async_trait]
 impl SlashCommand for UndoCommand {
     fn name(&self) -> &str { "undo" }
-    fn description(&self) -> &str { "Revert file changes made by a tool call in this session" }
+    fn aliases(&self) -> Vec<&str> { vec![] }
+    fn description(&self) -> &str { "Revert all file changes from the last assistant turn (alias: /revert)" }
     fn help(&self) -> &str {
-        "Usage: /undo [<tool_use_id>]\n\n\
-         Without an argument, lists all tool calls that modified files in this session.\n\n\
-         With a tool_use_id argument, reverts all file changes made by that specific tool\n\
-         call (restoring files to their state before the tool ran).\n\n\
+        "Usage: /undo\n\nReverts all file changes made during the most recent assistant turn.\n\
+         For finer control use /revert. To list what changed, use /checkpoints."
+    }
+
+    async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
+        RevertCommand.execute("", ctx).await
+    }
+}
+
+// ---- /revert ---------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for RevertCommand {
+    fn name(&self) -> &str { "revert" }
+    fn description(&self) -> &str { "Revert file changes from an assistant turn back to pre-turn state" }
+    fn help(&self) -> &str {
+        "Usage: /revert [<n>|<uuid>]\n\n\
+         Without args: revert the most recent assistant turn.\n\
+         With a number n: revert the n-th most recent assistant turn (1 = latest).\n\
+         With a uuid: revert the turn whose message id starts with that string.\n\n\
+         This uses the shadow-git snapshot to restore all files that were\n\
+         changed during the target turn, and removes that turn (and any later\n\
+         turns) from the session transcript.\n\n\
          Examples:\n\
-           /undo                   — list recent edits\n\
-           /undo toolu_01XYZ...    — revert that specific tool call"
+           /revert        — revert last turn\n\
+           /revert 2      — revert the second-to-last turn\n\
+           /revert abc123 — revert the turn with uuid starting 'abc123'"
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        // Retrieve the SnapshotManager from the per-session registry.
-        let session_id = ctx.session_id.clone();
-        let snap = claurst_tools::session_snapshot(&session_id);
-        let snap = snap.lock();
+        let snap = match claurst_core::snapshot::get_or_create(&ctx.working_dir) {
+            Some(s) => s,
+            None => return CommandResult::Error(
+                "Snapshot system unavailable (git not found or not a git repo).".into()
+            ),
+        };
+
+        // Collect assistant messages that have a snapshot patch (newest last).
+        let checkpoints: Vec<&claurst_core::types::Message> = ctx.messages.iter()
+            .filter(|m| {
+                m.role == claurst_core::types::Role::Assistant
+                    && m.snapshot_patch.is_some()
+            })
+            .collect();
+
+        if checkpoints.is_empty() {
+            return CommandResult::Message(
+                "No revertible turns found. Run /checkpoints to see recorded file changes.".into()
+            );
+        }
+
+        // Select the target turn.
+        let args = args.trim();
+        let target = if args.is_empty() {
+            checkpoints.last().copied()
+        } else if let Ok(n) = args.parse::<usize>() {
+            if n == 0 || n > checkpoints.len() {
+                return CommandResult::Error(format!(
+                    "Turn {} out of range (1–{}).", n, checkpoints.len()
+                ));
+            }
+            Some(checkpoints[checkpoints.len() - n])
+        } else {
+            checkpoints.iter().copied()
+                .find(|m| m.uuid.as_deref().map_or(false, |u| u.starts_with(args)))
+        };
+
+        let target = match target {
+            Some(m) => m,
+            None => return CommandResult::Error(format!("No turn found matching '{args}'.")),
+        };
+
+        // Collect all patches from this turn onward to revert.
+        let target_uuid = match target.uuid.clone() {
+            Some(u) => u,
+            None => return CommandResult::Error("Target turn has no uuid; cannot revert.".into()),
+        };
+
+        let patches: Vec<claurst_core::snapshot::Patch> = ctx.messages.iter()
+            .skip_while(|m| m.uuid.as_deref() != Some(&target_uuid))
+            .filter_map(|m| m.snapshot_patch.clone())
+            .collect();
+
+        if patches.is_empty() {
+            return CommandResult::Message("No file changes recorded for that turn.".into());
+        }
+
+        // Revert files.
+        snap.revert(&patches).await;
+
+        // Truncate the session transcript at the target turn.
+        let project_root = claurst_core::git_utils::get_repo_root(&ctx.working_dir)
+            .unwrap_or_else(|| ctx.working_dir.clone());
+        let path = claurst_core::session_storage::transcript_path(&project_root, &ctx.session_id);
+        if path.exists() {
+            if let Err(e) = claurst_core::session_storage::truncate_after(&path, &target_uuid).await {
+                return CommandResult::Error(format!("Reverted files but could not trim transcript: {e}"));
+            }
+        }
+
+        let file_count: usize = patches.iter().map(|p| p.files.len()).sum();
+        CommandResult::Message(format!(
+            "Reverted {} file(s) changed during turn {}. Transcript trimmed.",
+            file_count,
+            &target_uuid[..target_uuid.len().min(8)],
+        ))
+    }
+}
+
+// ---- /checkpoints ----------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for CheckpointsCommand {
+    fn name(&self) -> &str { "checkpoints" }
+    fn description(&self) -> &str { "List assistant turns that have recorded file changes" }
+    fn help(&self) -> &str {
+        "Usage: /checkpoints\n\nShows all assistant turns in this session that modified files,\n\
+         with file counts.  Use /revert <n> to roll back to a specific turn."
+    }
+
+    async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let checkpoints: Vec<(usize, &claurst_core::types::Message)> = ctx.messages.iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                m.role == claurst_core::types::Role::Assistant
+                    && m.snapshot_patch.is_some()
+            })
+            .collect();
+
+        if checkpoints.is_empty() {
+            return CommandResult::Message(
+                "No file-change checkpoints recorded yet for this session.\n\
+                 Checkpoints are created automatically when the assistant modifies files.".into()
+            );
+        }
+
+        let total = checkpoints.len();
+        let mut lines = vec![format!("{} checkpoint(s):", total)];
+        for (rank, (_, msg)) in checkpoints.iter().rev().enumerate() {
+            let uuid_short = msg.uuid.as_deref()
+                .map(|u| &u[..u.len().min(8)])
+                .unwrap_or("?");
+            let file_count = msg.snapshot_patch.as_ref().map_or(0, |p| p.files.len());
+            let preview: Vec<String> = msg.snapshot_patch.as_ref()
+                .map(|p| {
+                    p.files.iter().take(3)
+                        .map(|f| f.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let preview_str = if preview.len() == file_count {
+                preview.join(", ")
+            } else {
+                format!("{}, …", preview.join(", "))
+            };
+            lines.push(format!(
+                "  [{}] {} — {} file(s): {}",
+                rank + 1, uuid_short, file_count, preview_str
+            ));
+        }
+        lines.push(String::new());
+        lines.push("Use /revert <n> to revert to before turn [n].".into());
+        CommandResult::Message(lines.join("\n"))
+    }
+}
+
+// ---- /snapshot (show snapshot diff for a recorded turn) ------------------
+
+#[async_trait]
+impl SlashCommand for SnapshotDiffCommand {
+    fn name(&self) -> &str { "snapshot" }
+    fn description(&self) -> &str { "Show shadow-git diff of file changes from an assistant turn" }
+    fn help(&self) -> &str {
+        "Usage: /snapshot [<n>|<hash>]\n\n\
+         Without args: show unified diff for the most recent assistant turn.\n\
+         With a number: show diff for the n-th most recent turn (1 = latest).\n\
+         With a hash: show diff against that explicit snapshot tree hash.\n\n\
+         See also: /checkpoints (list turns), /revert (roll back files)."
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let snap = match claurst_core::snapshot::get_or_create(&ctx.working_dir) {
+            Some(s) => s,
+            None => return CommandResult::Error(
+                "Snapshot system unavailable (git not found or not a git repo).".into()
+            ),
+        };
 
         let args = args.trim();
 
-        if args.is_empty() {
-            // List mode: show all recorded tool calls and the files they touched.
-            let changes = snap.list_changes();
-            if changes.is_empty() {
+        // If a raw hash was passed, use it directly.
+        let hash = if !args.is_empty() && args.chars().all(|c| c.is_ascii_hexdigit()) && args.len() >= 8 {
+            args.to_string()
+        } else {
+            // Otherwise find the n-th most recent checkpoint.
+            let checkpoints: Vec<&claurst_core::snapshot::Patch> = ctx.messages.iter()
+                .filter_map(|m| {
+                    if m.role == claurst_core::types::Role::Assistant {
+                        m.snapshot_patch.as_ref()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if checkpoints.is_empty() {
                 return CommandResult::Message(
-                    "No file changes recorded for this session yet.".to_string(),
+                    "No snapshot checkpoints recorded yet. File changes will appear here after the next assistant turn.".into()
                 );
             }
 
-            let mut lines = vec!["Recorded file changes this session:".to_string()];
-            for (id, paths) in &changes {
-                lines.push(format!("  {} ({} file(s)):", id, paths.len()));
-                for p in paths {
-                    lines.push(format!("      {}", p));
+            let idx = if args.is_empty() {
+                0
+            } else {
+                match args.parse::<usize>() {
+                    Ok(n) if n >= 1 && n <= checkpoints.len() => n - 1,
+                    _ => return CommandResult::Error(format!(
+                        "Turn '{}' out of range (1–{}).", args, checkpoints.len()
+                    )),
                 }
-            }
-            lines.push(String::new());
-            lines.push("Run /undo <tool_use_id> to revert a specific set of changes.".to_string());
-            return CommandResult::Message(lines.join("\n"));
-        }
+            };
+            // Reverse so idx=0 is newest.
+            let patch = checkpoints[checkpoints.len() - 1 - idx];
+            patch.hash.clone()
+        };
 
-        // Revert mode.
-        let tool_use_id = args;
-        let (reverted, errors) = snap.revert(tool_use_id);
-
-        if reverted.is_empty() && errors.is_empty() {
-            return CommandResult::Error(format!(
-                "No changes found for tool_use_id '{}'. Use /undo with no arguments to list available IDs.",
-                tool_use_id
-            ));
+        let diff = snap.diff(&hash).await;
+        if diff.is_empty() {
+            CommandResult::Message(format!("No changes since snapshot {}.", &hash[..hash.len().min(8)]))
+        } else {
+            CommandResult::Message(diff)
         }
-
-        let mut msg = format!(
-            "Reverted {} file(s) for tool call '{}':",
-            reverted.len(),
-            tool_use_id
-        );
-        for p in &reverted {
-            msg.push_str(&format!("\n  {}", p));
-        }
-        if !errors.is_empty() {
-            msg.push_str("\n\nErrors:");
-            for e in &errors {
-                msg.push_str(&format!("\n  {}", e));
-            }
-        }
-
-        CommandResult::Message(msg)
     }
 }
+
 
 // ---- /providers -------------------------------------------------------------
 
@@ -7709,7 +8091,7 @@ impl SlashCommand for AgentCommand {
                 output.push_str(&format!("\nSystem prompt prefix:\n  {}\n", prompt));
             }
             output.push_str(&format!(
-                "\nTo activate: claude --agent {}", agent_name
+                "\nTo activate: claurst --agent {}", agent_name
             ));
             CommandResult::Message(output)
         } else {
@@ -8183,8 +8565,11 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(HeapdumpCommand),
         Box::new(InsightsCommand),
         Box::new(UltrareviewCommand),
-        // Undo / snapshot
+        // Snapshot / revert system
         Box::new(UndoCommand),
+        Box::new(RevertCommand),
+        Box::new(CheckpointsCommand),
+        Box::new(SnapshotDiffCommand),
         // Multi-provider support
         Box::new(ProvidersCommand),
         Box::new(ConnectCommand),
@@ -8194,6 +8579,8 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(SearchCommand),
         // Managed agent (manager-executor) architecture
         Box::new(ManagedAgentsCommand),
+        // Durable long-running goals
+        Box::new(GoalCommand),
     ]
 }
 

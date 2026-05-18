@@ -9,6 +9,12 @@ import {
   refreshAndGetAwsCredentials,
   refreshGcpCredentialsIfNeeded,
 } from 'src/utils/auth.js'
+import {
+  convertEffortValueToLevel,
+  type EffortValue,
+  standardEffortToOpenAI,
+  type OpenAIEffortLevel,
+} from 'src/utils/effort.js'
 import { getUserAgent } from 'src/utils/http.js'
 import { getSmallFastModel } from 'src/utils/model/model.js'
 import {
@@ -33,6 +39,7 @@ import {
   getRouteDefaultBaseUrl,
   getRouteDefaultModel,
   getXaiBaseUrlOverride,
+  getXiaomiMimoBaseUrlOverride,
   resolveEnvOnlyProviderRouteId,
 } from '../../integrations/routeMetadata.js'
 import {
@@ -117,6 +124,14 @@ function isXaiModelName(value: string | undefined): boolean {
   )
 }
 
+function isXiaomiMimoModelName(value: string | undefined): boolean {
+  const normalized = value?.trim().toLowerCase()
+  return Boolean(
+    normalized &&
+      (normalized.startsWith('mimo-') || normalized.startsWith('mimo/')),
+  )
+}
+
 function applyMiniMaxEnvOnlyDefaults(): void {
   const baseUrlOverride = getMiniMaxBaseUrlOverride()
   const hasMiniMaxBaseOverride = baseUrlOverride !== undefined
@@ -131,6 +146,26 @@ function applyMiniMaxEnvOnlyDefaults(): void {
       : undefined) ??
     getRouteDefaultModel('minimax')
   process.env.OPENAI_API_KEY = process.env.MINIMAX_API_KEY
+  delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AUTH_HEADER
+  delete process.env.OPENAI_AUTH_SCHEME
+  delete process.env.OPENAI_AUTH_HEADER_VALUE
+}
+
+function applyXiaomiMimoEnvOnlyDefaults(): void {
+  const baseUrlOverride = getXiaomiMimoBaseUrlOverride()
+  const hasBaseOverride = baseUrlOverride !== undefined
+  const modelOverride = process.env.OPENAI_MODEL?.trim() || undefined
+
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL =
+    baseUrlOverride ?? getRouteDefaultBaseUrl('xiaomi-mimo')
+  process.env.OPENAI_MODEL =
+    (hasBaseOverride || isXiaomiMimoModelName(modelOverride)
+      ? modelOverride
+      : undefined) ??
+    getRouteDefaultModel('xiaomi-mimo')
+  process.env.OPENAI_API_KEY = process.env.MIMO_API_KEY
   delete process.env.OPENAI_API_FORMAT
   delete process.env.OPENAI_AUTH_HEADER
   delete process.env.OPENAI_AUTH_SCHEME
@@ -164,6 +199,7 @@ export async function getAnthropicClient({
   fetchOverride,
   source,
   providerOverride,
+  effortValue,
 }: {
   apiKey?: string
   maxRetries: number
@@ -171,7 +207,14 @@ export async function getAnthropicClient({
   fetchOverride?: ClientOptions['fetch']
   source?: string
   providerOverride?: ProviderOverride
+  effortValue?: EffortValue
 }): Promise<Anthropic> {
+  // Convert the runtime effort value to the OpenAI-shaped enum the shim
+  // expects. Undefined → shim falls back to descriptor/alias defaults.
+  const shimReasoningEffort: OpenAIEffortLevel | undefined =
+    effortValue !== undefined
+      ? standardEffortToOpenAI(convertEffortValueToLevel(effortValue))
+      : undefined
   const containerId = process.env.CLAUDE_CODE_CONTAINER_ID
   const remoteSessionId = process.env.CLAUDE_CODE_REMOTE_SESSION_ID
   const clientApp = process.env.CLAUDE_AGENT_SDK_CLIENT_APP
@@ -248,6 +291,7 @@ export async function getAnthropicClient({
       maxRetries,
       timeout: parseInt(process.env.API_TIMEOUT_MS || String(600 * 1000), 10),
       providerOverride,
+      reasoningEffort: shimReasoningEffort,
     }) as unknown as Anthropic
   }
   // GitHub provider in native Anthropic API mode: send requests in Anthropic
@@ -270,10 +314,14 @@ export async function getAnthropicClient({
     return new Anthropic(nativeArgs)
   }
   const envOnlyProviderRouteId = resolveEnvOnlyProviderRouteId(process.env)
+  const useXiaomiMimoEnvOnlyProvider = envOnlyProviderRouteId === 'xiaomi-mimo'
   const useXaiEnvOnlyProvider = envOnlyProviderRouteId === 'xai'
   const useMiniMaxEnvOnlyProvider = envOnlyProviderRouteId === 'minimax'
   if (useMiniMaxEnvOnlyProvider) {
     applyMiniMaxEnvOnlyDefaults()
+  }
+  if (useXiaomiMimoEnvOnlyProvider) {
+    applyXiaomiMimoEnvOnlyDefaults()
   }
   if (useXaiEnvOnlyProvider) {
     applyXaiEnvOnlyDefaults()
@@ -281,6 +329,7 @@ export async function getAnthropicClient({
 
   if (
     useMiniMaxEnvOnlyProvider ||
+    useXiaomiMimoEnvOnlyProvider ||
     useXaiEnvOnlyProvider ||
     isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENAI) ||
     isEnvTruthy(process.env.CLAUDE_CODE_USE_GITHUB) ||
@@ -292,6 +341,7 @@ export async function getAnthropicClient({
       defaultHeaders,
       maxRetries,
       timeout: parseInt(process.env.API_TIMEOUT_MS || String(600 * 1000), 10),
+      reasoningEffort: shimReasoningEffort,
     }) as unknown as Anthropic
   }
   if (isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK)) {

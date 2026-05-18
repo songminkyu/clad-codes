@@ -1,8 +1,13 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from 'bun:test'
 
 const actualSettings = await import('../utils/settings/settings.js')
+import {
+  acquireSharedMutationLock,
+  releaseSharedMutationLock,
+} from '../test/sharedMutationLock.js'
 
-beforeAll(() => {
+beforeAll(async () => {
+  await acquireSharedMutationLock('StartupScreen.test.ts')
   mock.module('../utils/settings/settings.js', () => ({
     ...actualSettings,
     getSettings_DEPRECATED: () => ({}),
@@ -10,12 +15,16 @@ beforeAll(() => {
 })
 
 afterAll(() => {
-  mock.restore()
+  try {
+    mock.restore()
+  } finally {
+    releaseSharedMutationLock()
+  }
 })
 
 import stripAnsi from 'strip-ansi'
 import { detectProvider, printStartupScreen } from './StartupScreen.js'
-import { saveGlobalConfig } from '../utils/config.js'
+import { getGlobalConfig, saveGlobalConfig } from '../utils/config.js'
 import {
   resetSettingsCache,
   setSessionSettingsCache,
@@ -38,12 +47,18 @@ const ENV_KEYS = [
   'CLAUDE_MODEL',
   'NVIDIA_NIM',
   'MINIMAX_API_KEY',
+  'XAI_API_KEY',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'ANTHROPIC_BASE_URL',
 ]
 
 const originalEnv: Record<string, string | undefined> = {}
 const originalMacro = (globalThis as Record<string, unknown>).MACRO
 const originalIsTTY = process.stdout.isTTY
 const originalWrite = process.stdout.write
+const originalModel = getGlobalConfig().model
 
 beforeEach(() => {
   for (const key of ENV_KEYS) {
@@ -61,7 +76,7 @@ afterEach(() => {
   resetSettingsCache()
   saveGlobalConfig(current => ({
     ...current,
-    model: undefined,
+    model: originalModel,
   }))
   ;(globalThis as Record<string, unknown>).MACRO = originalMacro
   Object.defineProperty(process.stdout, 'isTTY', {
@@ -308,12 +323,14 @@ describe('detectProvider — modelOverride from --model flag', () => {
   })
 
   test('undefined modelOverride preserves default behavior', () => {
+    process.env.ANTHROPIC_MODEL = 'claude-sonnet-4-6'
     const result = detectProvider(undefined)
     expect(result.name).toBe('Anthropic')
     expect(result.model).toContain('sonnet')
   })
 
   test('no argument preserves default behavior', () => {
+    process.env.ANTHROPIC_MODEL = 'claude-sonnet-4-6'
     const result = detectProvider()
     expect(result.name).toBe('Anthropic')
     expect(result.model).toContain('sonnet')

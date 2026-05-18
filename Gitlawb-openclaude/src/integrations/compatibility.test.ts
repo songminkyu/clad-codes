@@ -25,6 +25,7 @@ const EXPECTED_PRESETS = [
   'mistral',
   'together',
   'groq',
+  'hicap',
   'azure-openai',
   'openrouter',
   'lmstudio',
@@ -34,9 +35,12 @@ const EXPECTED_PRESETS = [
   'nvidia-nim',
   'minimax',
   'xai',
+  'venice',
+  'xiaomi-mimo',
   'zai',
   'bankr',
   'atomic-chat',
+  'gitlawb-opengateway',
 ] as const satisfies readonly ProviderPreset[]
 
 describe('compatibility mappings', () => {

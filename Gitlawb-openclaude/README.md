@@ -17,27 +17,36 @@ OpenClaude is also mirrored to GitLawb:
 
 ## Sponsors
 
-<p align="center">
-  <a href="https://gitlawb.com">
-    <img src="https://gitlawb.com/logo.png" alt="GitLawb logo" width="96">
-  </a>
-  &nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://bankr.bot">
-    <img src="https://bankr.bot/favicon.svg" alt="Bankr.bot logo" width="96">
-  </a>
-  &nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://atomic.chat/">
-    <img src="docs/assets/atomic-chat-logo.png" alt="Atomic Chat logo" width="96">
-  </a>
-</p>
-
-<p align="center">
-  <a href="https://gitlawb.com"><strong>GitLawb</strong></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://bankr.bot"><strong>Bankr.bot</strong></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://atomic.chat/"><strong>Atomic Chat</strong></a>
-</p>
+<table align="center">
+  <tr>
+    <td align="center" width="150" height="80">
+      <a href="https://gitlawb.com">
+        <img src="https://gitlawb.com/logo.png" alt="GitLawb logo" width="72">
+      </a>
+    </td>
+    <td align="center" width="150" height="80">
+      <a href="https://bankr.bot">
+        <img src="https://bankr.bot/favicon.svg" alt="Bankr.bot logo" width="72">
+      </a>
+    </td>
+    <td align="center" width="150" height="80">
+      <a href="https://atomic.chat/">
+        <img src="docs/assets/atomic-chat-logo.png" alt="Atomic Chat logo" width="72">
+      </a>
+    </td>
+    <td align="center" width="150" height="80">
+      <a href="https://api.xiaomimimo.com/v1">
+        <img src="https://mimo.xiaomi.com/mimo-v2-pro/assets/logo.svg" alt="Xiaomi MiMo logo" width="136">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><a href="https://gitlawb.com"><strong>GitLawb</strong></a></td>
+    <td align="center"><a href="https://bankr.bot"><strong>Bankr.bot</strong></a></td>
+    <td align="center"><a href="https://atomic.chat/"><strong>Atomic Chat</strong></a></td>
+    <td align="center"><a href="https://api.xiaomimimo.com/v1"><strong>Xiaomi MiMo</strong></a></td>
+  </tr>
+</table>
 
 ## Star History
 
@@ -116,16 +125,6 @@ $env:OPENAI_MODEL="qwen2.5-coder:7b"
 openclaude
 ```
 
-### Using Ollama's launch command
-
-If you have [Ollama](https://ollama.com) installed, you can skip the env var setup entirely:
-
-```bash
-ollama launch openclaude --model qwen2.5-coder:7b
-```
-
-This automatically sets `ANTHROPIC_BASE_URL`, model routing, and auth so all API traffic goes through your local Ollama instance. Works with any model you have pulled — local or cloud.
-
 ## Setup Guides
 
 Beginner-friendly guides:
@@ -144,11 +143,14 @@ Advanced and source-build guides:
 | Provider | Setup Path | Notes |
 | --- | --- | --- |
 | OpenAI-compatible | `/provider` or env vars | Works with OpenAI, OpenRouter, DeepSeek, Groq, Mistral, LM Studio, and other compatible `/v1` servers |
-| Gemini | `/provider` or env vars | Supports API key, access token, or local ADC workflow on current `main` |
+| Hicap | `/provider` or OpenAI-compatible env vars | Uses `api-key` auth, discovers models from unauthenticated `/models`, and supports Responses mode for `gpt-` models |
+| Gemini | `/provider` or env vars | Supports API key only |
 | GitHub Models | `/onboard-github` | Interactive onboarding with saved credentials |
 | Codex OAuth | `/provider` | Opens ChatGPT sign-in in your browser and stores Codex credentials securely |
 | Codex | `/provider` | Uses existing Codex CLI auth, OpenClaude secure storage, or env credentials |
-| Ollama | `/provider`, env vars, or `ollama launch` | Local inference with no API key |
+| Gitlawb Opengateway | `/provider` or zero-config fallback | Free smart gateway at `https://opengateway.gitlawb.com/v1`; routes Xiaomi MiMo and GMI Cloud partner models by `OPENAI_MODEL` |
+| Xiaomi MiMo | `/provider` or env vars | OpenAI-compatible API at `https://api.xiaomimimo.com/v1`; uses `MIMO_API_KEY` and defaults to `mimo-v2.5-pro` |
+| Ollama | `/provider` or env vars | Local inference with no API key |
 | Atomic Chat | `/provider`, env vars, or `bun run dev:atomic-chat` | Local Model Provider; auto-detects loaded models |
 | Bedrock / Vertex / Foundry | env vars | Additional provider integrations for supported environments |
 
@@ -158,7 +160,7 @@ Advanced and source-build guides:
 - **Streaming responses**: Real-time token output and tool progress
 - **Tool calling**: Multi-step tool loops with model calls, tool execution, and follow-up responses
 - **Images**: URL and base64 image inputs for providers that support vision
-- **Provider profiles**: Guided setup plus saved `.openclaude-profile.json` support
+- **Provider profiles**: Guided setup plus saved user-level provider profile support
 - **Local and remote model backends**: Cloud APIs, local servers, and Apple Silicon local inference
 
 ## Provider Notes
@@ -169,6 +171,8 @@ OpenClaude supports multiple providers, but behavior is not identical across all
 - Tool quality depends heavily on the selected model
 - Smaller local models can struggle with long multi-step tool flows
 - Some providers impose lower output caps than the CLI defaults, and OpenClaude adapts where possible
+- Gitlawb Opengateway uses one OpenAI-compatible base URL. Switch between `mimo-*` and `google/gemini-3.1-flash-lite-preview` with `/model`; do not pin the base URL to `/v1/xiaomi-mimo`.
+- Xiaomi MiMo uses `api-key` header auth on the direct OpenAI-compatible route and currently does not support `/usage` reporting in OpenClaude
 
 For best results, use models with strong tool/function calling support.
 
