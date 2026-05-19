@@ -1,11 +1,11 @@
 {
   "name": "claurst",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Open-source, multi-provider terminal coding agent built in Rust",
   "license": "GPL-3.0-only",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kuberwastaken/claurst.git"
+    "url": "git+https://github.com/Kuberwastaken/claurst.git"
   },
   "homepage": "https://claurst.kuber.studio",
   "bugs": {

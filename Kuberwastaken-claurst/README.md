@@ -6,7 +6,7 @@
 
 <p>
     <a href="https://github.com/kuberwastaken/claurst"><img src="https://img.shields.io/badge/Built_with-Rust-CE4D2B?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust"></a>
-    <a href="https://github.com/kuberwastaken/claurst"><img src="https://img.shields.io/badge/Version-0.1.1-2E8B57?style=for-the-badge" alt="Version 0.1.1"></a>
+    <a href="https://github.com/kuberwastaken/claurst"><img src="https://img.shields.io/badge/Version-0.1.2-2E8B57?style=for-the-badge" alt="Version 0.1.2"></a>
     <a href="https://github.com/kuberwastaken/claurst/blob/main/LICENSE.md"><img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=for-the-badge" alt="GPL-3.0 License"></a>
 </p>
 
@@ -24,7 +24,7 @@ It's fast, it's memory-efficient, it's yours to run however you want, and there'
 ---
 
 > [!IMPORTANT]
-> **Claurst is now officially in Beta (v0.1.1).** The core agent, multi-provider routing, and TUI are stable enough for daily driving — expect rough edges around experimental features (flagged below). Bug reports and PRs welcome.
+> **Claurst is now officially in Beta (v0.1.2).** The core agent, multi-provider routing, and TUI are stable enough for daily driving — expect rough edges around experimental features (flagged below). Bug reports and PRs welcome.
 
 > [!NOTE]
 > **Recent Updates:**
@@ -197,6 +197,7 @@ For more info on how to configure Claurst, [head over to our docs](https://claur
 ## Contributing
 
 Claurst is built for the community, by the community and we'd love your help making it better.
+Please see and include AGENTS.md for project-specific rules (for both humans and agents).
 
 [Open an issue](https://github.com/Kuberwastaken/claurst/issues/new) for bugs, ideas, or questions, or [Raise a PR](https://github.com/Kuberwastaken/claurst/pulls/new) to fix bugs, add features, or improve documentation.
 
