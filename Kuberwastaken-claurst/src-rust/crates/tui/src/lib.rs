@@ -53,6 +53,8 @@ pub mod app;
 pub mod input;
 /// All ratatui rendering logic.
 pub mod render;
+/// Post-paint OSC 8 hyperlink emission — makes URLs Ctrl/Cmd-clickable.
+pub mod osc8;
 /// Permission dialogs and confirmation dialogs.
 pub mod dialogs;
 /// Notification / banner system.
@@ -171,6 +173,7 @@ pub use dialog_select::{DialogSelectState, SelectItem, render_dialog_select};
 pub use key_input_dialog::{KeyInputDialogState, render_key_input_dialog};
 pub use custom_provider_dialog::{CustomProviderDialogState, CustomProviderField, render_custom_provider_dialog};
 pub use free_mode_dialog::{FreeModeDialogState, FreeModeField, render_free_mode_dialog};
+// (FreeModeField type is now per-provider; legacy callers may still import both names.)
 pub use device_auth_dialog::{DeviceAuthDialogState, DeviceAuthStatus, DeviceAuthEvent, render_device_auth_dialog};
 pub use file_injection::{parse_at_refs, build_file_blocks, AtFileRef, AtFileIssue};
 pub use file_injection_dialog::{FileInjectionDialogState, FileInjectionOutcome, render_file_injection_dialog};
@@ -397,13 +400,13 @@ mod tests {
     fn test_stats_slash_command_opens_dialog_and_closes_other_views() {
         let mut app = make_app();
         app.mcp_view.open(vec![]);
-        app.agents_menu.open = true;
+        app.agents_menu.visible = true;
 
         assert!(app.intercept_slash_command("stats"));
-        assert!(app.stats_dialog.open);
-        assert!(!app.mcp_view.open);
-        assert!(!app.agents_menu.open);
-        assert!(!app.diff_viewer.open);
+        assert!(app.stats_dialog.visible);
+        assert!(!app.mcp_view.visible);
+        assert!(!app.agents_menu.visible);
+        assert!(!app.diff_viewer.visible);
     }
 
     #[test]
@@ -416,7 +419,7 @@ mod tests {
         ];
 
         assert!(app.intercept_slash_command("agents"));
-        assert!(app.agents_menu.open);
+        assert!(app.agents_menu.visible);
         assert_eq!(app.agents_menu.active_agents.len(), 3);
         assert_eq!(app.agents_menu.active_agents[0].status, AgentStatus::Running);
         assert_eq!(
@@ -476,7 +479,7 @@ mod tests {
         let mut app = make_app();
 
         assert!(app.intercept_slash_command("changes"));
-        assert!(app.diff_viewer.open);
+        assert!(app.diff_viewer.visible);
         assert_eq!(app.diff_viewer.diff_type, DiffType::TurnDiff);
     }
 
@@ -503,10 +506,61 @@ mod tests {
     }
 
     #[test]
-    fn test_ctrl_c_quits_when_idle() {
+    fn test_ctrl_c_requires_two_presses_to_exit() {
         let mut app = make_app();
+        // First Ctrl+C: shows warning, doesn't exit
         app.handle_key_event(ctrl(KeyCode::Char('c')));
-        assert!(app.should_quit);
+        assert!(!app.should_exit);
+        assert!(app.last_exit_key_warning.is_some());
+
+        // Second Ctrl+C within 1 second: exits
+        app.handle_key_event(ctrl(KeyCode::Char('c')));
+        assert!(app.should_exit);
+    }
+
+    #[test]
+    fn test_ctrl_c_clears_input_first_press() {
+        let mut app = make_app();
+        app.set_prompt_text("some text".to_string());
+        // First Ctrl+C: clears input
+        app.handle_key_event(ctrl(KeyCode::Char('c')));
+        assert!(app.prompt_input.is_empty());
+        assert!(!app.should_exit);
+        assert!(app.last_exit_key_warning.is_some());
+    }
+
+    #[test]
+    fn test_other_key_resets_exit_warning() {
+        let mut app = make_app();
+        // First Ctrl+C: shows warning
+        app.handle_key_event(ctrl(KeyCode::Char('c')));
+        assert!(app.last_exit_key_warning.is_some());
+
+        // Press a different key: resets warning
+        app.handle_key_event(key(KeyCode::Char('a')));
+        assert!(app.last_exit_key_warning.is_none());
+
+        // Now Ctrl+C starts over (doesn't exit)
+        app.handle_key_event(ctrl(KeyCode::Char('c')));
+        assert!(!app.should_exit);
+        assert!(app.last_exit_key_warning.is_some());
+    }
+
+    #[test]
+    fn test_ctrl_c_timeout_resets_after_two_seconds() {
+        let mut app = make_app();
+        // First Ctrl+C: shows warning
+        app.handle_key_event(ctrl(KeyCode::Char('c')));
+        assert!(app.last_exit_key_warning.is_some());
+
+        // Manually expire the timer by setting it to >2 seconds ago
+        app.last_exit_key_warning = Some(std::time::Instant::now()
+            - std::time::Duration::from_millis(2100));
+
+        // Second Ctrl+C after timeout: should show warning again, not exit
+        app.handle_key_event(ctrl(KeyCode::Char('c')));
+        assert!(!app.should_exit);
+        assert!(app.last_exit_key_warning.is_some());
     }
 
     #[test]
@@ -516,15 +570,21 @@ mod tests {
         app.streaming_text = "partial".to_string();
         app.handle_key_event(ctrl(KeyCode::Char('c')));
         assert!(!app.is_streaming);
-        assert!(!app.should_quit);
+        assert!(!app.should_exit);
         assert!(app.streaming_text.is_empty());
     }
 
     #[test]
-    fn test_ctrl_d_quits_on_empty_input() {
+    fn test_ctrl_d_requires_two_presses_to_exit() {
         let mut app = make_app();
+        // First Ctrl+D: shows warning, doesn't exit
         app.handle_key_event(ctrl(KeyCode::Char('d')));
-        assert!(app.should_quit);
+        assert!(!app.should_exit);
+        assert!(app.last_exit_key_warning.is_some());
+
+        // Second Ctrl+D within 2 seconds: exits
+        app.handle_key_event(ctrl(KeyCode::Char('d')));
+        assert!(app.should_exit);
     }
 
     #[test]
@@ -532,7 +592,43 @@ mod tests {
         let mut app = make_app();
         app.set_prompt_text("abc".to_string());
         app.handle_key_event(ctrl(KeyCode::Char('d')));
-        assert!(!app.should_quit);
+        assert!(!app.should_exit);
+    }
+
+    #[test]
+    fn test_ctrl_c_then_ctrl_d_then_ctrl_c_exits() {
+        let mut app = make_app();
+        // First Ctrl+C: shows warning, sets start_key = 'c'
+        app.handle_key_event(ctrl(KeyCode::Char('c')));
+        assert!(!app.should_exit);
+        assert_eq!(app.exit_key_sequence_start, Some('c'));
+
+        // Ctrl+D (wrong key): resets timer but keeps waiting for Ctrl+C
+        app.handle_key_event(ctrl(KeyCode::Char('d')));
+        assert!(!app.should_exit);
+        assert_eq!(app.exit_key_sequence_start, Some('c')); // Still waiting for Ctrl+C
+
+        // Ctrl+C again: exits
+        app.handle_key_event(ctrl(KeyCode::Char('c')));
+        assert!(app.should_exit);
+    }
+
+    #[test]
+    fn test_ctrl_d_then_ctrl_c_then_ctrl_d_exits() {
+        let mut app = make_app();
+        // First Ctrl+D: shows warning, sets start_key = 'd'
+        app.handle_key_event(ctrl(KeyCode::Char('d')));
+        assert!(!app.should_exit);
+        assert_eq!(app.exit_key_sequence_start, Some('d'));
+
+        // Ctrl+C (wrong key): resets timer but keeps waiting for Ctrl+D
+        app.handle_key_event(ctrl(KeyCode::Char('c')));
+        assert!(!app.should_exit);
+        assert_eq!(app.exit_key_sequence_start, Some('d')); // Still waiting for Ctrl+D
+
+        // Ctrl+D again: exits
+        app.handle_key_event(ctrl(KeyCode::Char('d')));
+        assert!(app.should_exit);
     }
 
     #[test]
@@ -616,7 +712,7 @@ mod tests {
     fn test_ctrl_p_opens_global_search() {
         let mut app = make_app();
         app.handle_key_event(ctrl(KeyCode::Char('p')));
-        assert!(app.global_search.open);
+        assert!(app.global_search.visible);
     }
 
     #[test]
@@ -633,7 +729,7 @@ mod tests {
         }];
         app.handle_key_event(key(KeyCode::Enter));
 
-        assert!(!app.global_search.open);
+        assert!(!app.global_search.visible);
         assert_eq!(app.input, "src/main.rs:42");
         assert_eq!(app.prompt_input.text, "src/main.rs:42");
     }
@@ -863,7 +959,7 @@ mod tests {
     #[test]
     fn test_render_diff_dialog_shows_turn_empty_state() {
         let mut state = DiffViewerState::new();
-        state.open = true;
+        state.visible = true;
         state.diff_type = DiffType::TurnDiff;
         let area = Rect { x: 0, y: 0, width: 80, height: 20 };
         let mut buf = Buffer::empty(area);
@@ -901,13 +997,13 @@ mod tests {
     #[test]
     fn test_stats_dialog_keys_switch_tab_and_close() {
         let mut app = make_app();
-        app.stats_dialog.open = true;
+        app.stats_dialog.visible = true;
 
         app.handle_key_event(key(KeyCode::Right));
         assert_eq!(app.stats_dialog.tab, StatsTab::DailyTokens);
 
         app.handle_key_event(key(KeyCode::Esc));
-        assert!(!app.stats_dialog.open);
+        assert!(!app.stats_dialog.visible);
     }
 
     #[test]
@@ -945,7 +1041,7 @@ mod tests {
         assert_eq!(app.mcp_view.tool_search, "");
 
         app.handle_key_event(key(KeyCode::Esc));
-        assert!(!app.mcp_view.open);
+        assert!(!app.mcp_view.visible);
     }
 
     #[test]
@@ -1010,7 +1106,7 @@ mod tests {
         assert!(!submit);
         assert_eq!(app.prompt_input.text, "");
         assert_eq!(app.take_pending_mcp_panel_auth().as_deref(), Some("mcphub"));
-        assert!(!app.mcp_view.open);
+        assert!(!app.mcp_view.visible);
         assert_eq!(app.mcp_view.tool_search, "");
     }
 
@@ -1021,7 +1117,7 @@ mod tests {
 
         let submit = app.handle_key_event(key(KeyCode::Char('a')));
         assert!(!submit);
-        assert!(app.mcp_view.open);
+        assert!(app.mcp_view.visible);
         assert_eq!(app.prompt_input.text, "");
         assert!(app.take_pending_mcp_panel_auth().is_none());
     }
@@ -1050,7 +1146,7 @@ mod tests {
 
         let submit = app.handle_key_event(key(KeyCode::Char('a')));
         assert!(!submit);
-        assert!(app.mcp_view.open);
+        assert!(app.mcp_view.visible);
         assert_eq!(app.mcp_view.tool_search, "a");
         assert!(app.take_pending_mcp_panel_auth().is_none());
     }

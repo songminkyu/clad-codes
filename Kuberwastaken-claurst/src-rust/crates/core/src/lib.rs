@@ -34,6 +34,8 @@ pub mod format_utils;
 pub mod crypto_utils;
 pub mod status_notices;
 pub mod auto_mode;
+pub mod spinner;
+pub use spinner::{SPINNER_VERBS, TURN_COMPLETION_VERBS, sample_spinner_verb, sample_completion_verb};
 
 // Remote session sync and cloud session API (T3-1, T3-2).
 pub mod remote_session;
@@ -69,6 +71,9 @@ pub use ide::{IdeKind, detect_ide};
 // Background update checker — compares running version against GitHub releases.
 pub mod update_check;
 pub use update_check::{check_for_updates, UpdateInfo};
+
+// Self-contained HTML export of a session, used by the `/share` slash command.
+pub mod share_export;
 
 // Re-export commonly used types at the crate root
 pub use error::{ClaudeError, Result};
@@ -1274,7 +1279,6 @@ pub mod config {
         }
 
 
-
         /// Resolve the effective max-tokens.
         pub fn effective_max_tokens(&self) -> u32 {
             self.max_tokens
@@ -1555,11 +1559,22 @@ pub mod config {
                     config.skills.urls.push(u.clone());
                 }
             }
-            // Copy file autocomplete and injection settings.
-            config.file_autocomplete_limit = self.file_autocomplete_limit;
-            config.file_autocomplete_show_hidden_files = self.file_autocomplete_show_hidden_files;
-            config.file_injection_enabled = self.file_injection_enabled;
-            config.file_injection_max_size = self.file_injection_max_size;
+            // Copy file autocomplete and injection settings from the top-level Settings
+            // fields, but only when they were explicitly set (differ from their defaults).
+            // If they're at defaults, the nested "config" section value (already in `config`
+            // via the clone above) takes precedence.
+            if self.file_autocomplete_limit != default_file_autocomplete_limit() {
+                config.file_autocomplete_limit = self.file_autocomplete_limit;
+            }
+            if self.file_autocomplete_show_hidden_files {
+                config.file_autocomplete_show_hidden_files = true;
+            }
+            if self.file_injection_enabled != default_true() {
+                config.file_injection_enabled = self.file_injection_enabled;
+            }
+            if self.file_injection_max_size != default_file_injection_max_size() {
+                config.file_injection_max_size = self.file_injection_max_size;
+            }
             config
         }
 
@@ -3201,8 +3216,36 @@ pub mod cost {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
+    /// Free upstream provider IDs used in the free provider system.
+    ///
+    /// These overlap with providers that appear in `api_key_env_vars_for_provider`.
+    /// When adding a provider to one, check whether it also belongs in the other.
+    const FREE_UPSTREAM_IDS: &[&str] = &[
+        "groq",
+        "cerebras",
+        "google",
+        "mistral",
+        "sambanova",
+        "nvidia",
+        "cohere",
+        "openrouter",
+        "opencode-zen",
+        "zai",
+        "zhipuai",
+    ];
+
+    /// Check if a model name is an upstream-prefixed free model (e.g., "groq/llama-3.3-70b-versatile").
+    fn is_free_upstream_model(model: &str) -> bool {
+        for upstream_id in FREE_UPSTREAM_IDS {
+            if model.starts_with(&format!("{}/", upstream_id)) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Per-model pricing tiers (USD per million tokens).
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, PartialEq)]
     pub struct ModelPricing {
         pub input_per_mtk: f64,
         pub output_per_mtk: f64,
@@ -3235,6 +3278,14 @@ pub mod cost {
             cache_read_per_mtk: 0.08,
         };
 
+        /// Free model pricing (no cost).
+        pub const FREE: Self = Self {
+            input_per_mtk: 0.0,
+            output_per_mtk: 0.0,
+            cache_creation_per_mtk: 0.0,
+            cache_read_per_mtk: 0.0,
+        };
+
         /// Default pricing is Opus (most capable, highest cost).
         pub fn default_pricing() -> Self {
             Self::OPUS
@@ -3242,7 +3293,12 @@ pub mod cost {
 
         /// Pick pricing based on model name substring matching.
         pub fn for_model(model: &str) -> Self {
-            if model.contains("opus") {
+            // Check for free models first (those with "-free" suffix, "free/" prefix, or upstream-prefixed free model)
+            if model.ends_with("-free") || model.starts_with("free/") {
+                Self::FREE
+            } else if is_free_upstream_model(model) {
+                Self::FREE
+            } else if model.contains("opus") {
                 Self::OPUS
             } else if model.contains("haiku") {
                 Self::HAIKU
@@ -3345,7 +3401,9 @@ pub mod cost {
         pub fn summary(&self) -> String {
             let cost = self.total_cost_usd();
             let total = self.total_tokens();
-            if cost < 0.01 {
+            if cost == 0.0 {
+                format!("{} tokens ($0.00)", total)
+            } else if cost < 0.01 {
                 format!("{} tokens (<$0.01)", total)
             } else {
                 format!("{} tokens (${:.2})", total, cost)
@@ -3493,9 +3551,10 @@ pub mod oauth {
 
     // ---- Production OAuth endpoints & constants ----
 
-    // NOTE: This client ID is registered to Anthropic's official Claude Code CLI.
-    // It will NOT work for Claurst. Users should use an API key from console.anthropic.com.
-    pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"; // Anthropic's — will not work for Claurst
+    // Claude Code client ID, used in stealth-impersonation mode (see
+    // `claurst_core::oauth_config` for the matching request-time headers and
+    // system-prompt prefix wired into `claurst_api::AnthropicClient`).
+    pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
     pub const CONSOLE_AUTHORIZE_URL: &str = "https://platform.claude.com/oauth/authorize";
     pub const CLAUDE_AI_AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
     pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
@@ -4326,6 +4385,43 @@ mod tests {
         assert_eq!(tracker.input_tokens(), 0);
         assert_eq!(tracker.output_tokens(), 0);
         assert_eq!(tracker.total_cost_usd(), 0.0);
+    }
+
+    #[test]
+    fn test_cost_tracker_free_model() {
+        let tracker = CostTracker::with_model("deepseek-v4-flash-free");
+        tracker.add_usage(1000, 500, 200, 100);
+        // Free models should have zero cost even with token usage
+        assert_eq!(tracker.total_cost_usd(), 0.0);
+    }
+
+    #[test]
+    fn test_model_pricing_free_variants() {
+        // Test that models ending with -free use FREE pricing
+        assert_eq!(cost::ModelPricing::for_model("deepseek-v4-flash-free"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("zen/minimax-m2.5-free"), cost::ModelPricing::FREE);
+
+        // Test that models starting with free/ use FREE pricing
+        assert_eq!(cost::ModelPricing::for_model("free/auto"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("free/some-model"), cost::ModelPricing::FREE);
+
+        // Test that upstream-prefixed free models use FREE pricing
+        assert_eq!(cost::ModelPricing::for_model("groq/llama-3.3-70b-versatile"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("cerebras/qwen-3-235b-a22b-instruct-2507"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("google/gemini-2.5-flash"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("mistral/mistral-large-latest"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("sambanova/Meta-Llama-3.3-70B-Instruct"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("nvidia/meta/llama-3.3-70b-instruct"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("cohere/command-r-plus"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("openrouter/free"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("opencode-zen/minimax-m2.5-free"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("zai/glm-4.6"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("zhipuai/glm-4.5"), cost::ModelPricing::FREE);
+
+        // Test that other models use their appropriate pricing
+        assert_eq!(cost::ModelPricing::for_model("claude-opus"), cost::ModelPricing::OPUS);
+        assert_eq!(cost::ModelPricing::for_model("claude-haiku"), cost::ModelPricing::HAIKU);
+        assert_eq!(cost::ModelPricing::for_model("claude-sonnet"), cost::ModelPricing::SONNET);
     }
 
     #[test]

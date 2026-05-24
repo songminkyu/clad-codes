@@ -340,10 +340,29 @@ fn resolve_bridge_config(
     bridge_config.is_active().then_some(bridge_config)
 }
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
+fn handle_exit_key(app: &mut claurst_tui::app::App, key: crossterm::event::KeyEvent, cancel: &Option<tokio_util::sync::CancellationToken>) -> bool {
+    if !key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        return false;
+    }
 
+    match key.code {
+        crossterm::event::KeyCode::Char('c') => {
+            // Cancel background task first, then let app handle state cleanup
+            if app.is_streaming {
+                if let Some(ref ct) = cancel {
+                    ct.cancel();
+                }
+            }
+            app.handle_key_event(key);
+            true
+        }
+        crossterm::event::KeyCode::Char('d') => {
+            app.handle_key_event(key);
+            true
+        }
+        _ => false,
+    }
+}
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Fast-path: handle --version before parsing everything
@@ -426,7 +445,10 @@ async fn main() -> anyhow::Result<()> {
     let base_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(log_level));
     let log_filter = base_filter
-        .add_directive("rmcp::service::client=error".parse().expect("valid rmcp directive"));
+        .add_directive("rmcp::service::client=error".parse().expect("valid rmcp directive"))
+        // Suppress error/warn logs from providers and query — errors are already shown as error modals
+        .add_directive("claurst_api::providers::free=off".parse().expect("valid directive"))
+        .add_directive("claurst_query=off".parse().expect("valid directive"));
     tracing_subscriber::fmt()
         .with_env_filter(log_filter)
         .with_target(false)
@@ -1928,7 +1950,7 @@ async fn run_interactive(
         app.notifications.tick();
 
         // Process file injection dialog outcome (if any)
-        if let Some((outcome, pending_input, _pending_imgs)) = app.file_injection_dialog.take_outcome() {
+        if let Some((outcome, pending_input, pending_imgs)) = app.file_injection_dialog.take_outcome() {
             use claurst_tui::FileInjectionOutcome;
 
             if matches!(outcome, FileInjectionOutcome::Abort) {
@@ -1936,9 +1958,14 @@ async fn run_interactive(
                 continue;
             }
 
-            // InjectAll or SkipOversized: restore input to prompt for resubmission
-            // Images attached when dialog was shown are discarded; user can re-attach if needed
+            // InjectAll: bypass size limit on resubmission, restore stashed input+images,
+            // then synthesize Enter to send immediately.
+            app.file_injection_force = true;
+            for img in pending_imgs {
+                app.prompt_input.add_image(img);
+            }
             app.set_prompt_text(pending_input);
+            app.pending_auto_submit = true;
         }
 
         // Draw the UI
@@ -1974,79 +2001,17 @@ async fn run_interactive(
                         continue;
                     }
 
-                    // Ctrl+C: copy selected text if there's a selection, otherwise cancel/quit
-                    if key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                    {
-                        // Check if there's an active text selection — copy instead of cancel/quit
-                        let has_selection = app.selection_anchor.is_some() && !app.selection_text.borrow().is_empty();
-                        if has_selection {
-                            // Let the app handle the copy via its normal key handler
-                            app.handle_key_event(key);
-                            continue;
-                        }
-
-                        // No selection — handle as cancel (if streaming) or
-                        // clear-prompt (if non-empty) or quit.
-                        if app.is_streaming {
-                            if let Some(ref ct) = cancel {
-                                ct.cancel();
-                            }
-                            app.is_streaming = false;
-                            app.status_message = Some("Cancelled.".to_string());
-                            continue;
-                        } else if !app.prompt_input.is_empty() {
-                            // Non-empty prompt — let the app clear it via Ctrl+C
-                            // handler instead of quitting (matches readline).
-                            app.handle_key_event(key);
-                            continue;
-                        } else {
+                    // Ctrl+C and Ctrl+D: exit confirmation handling
+                    if handle_exit_key(&mut app, key, &cancel) {
+                        if app.should_exit {
                             break 'main;
                         }
-                    }
-
-                    // Ctrl+D on empty input => quit
-                    if key.code == KeyCode::Char('d')
-                        && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                        && app.prompt_input.is_empty()
-                    {
-                        break 'main;
+                        continue;
                     }
 
                     // Enter => submit input (but NOT when ANY dialog/overlay is open —
                     // dialogs handle their own Enter in handle_key_event).
-                    let any_dialog_open = app.connect_dialog.visible
-                        || app.import_config_picker.visible
-                        || app.import_config_dialog.visible
-                        || app.key_input_dialog.visible
-                        || app.custom_provider_dialog.visible
-                        || app.device_auth_dialog.visible
-                        || app.command_palette.visible
-                        || app.model_picker.visible
-                        || app.onboarding_dialog.visible
-                        || app.bypass_permissions_dialog.visible
-                        || app.file_injection_dialog.visible
-                        || app.ask_user_dialog.visible
-                        || app.settings_screen.visible
-                        || app.export_dialog.visible
-                        || app.theme_screen.visible
-                        || app.stats_dialog.open
-                        || app.invalid_config_dialog.visible
-                        || app.context_viz.visible
-                        || app.mcp_approval.visible
-                        || app.session_browser.visible
-                        || app.session_branching.visible
-                        || app.tasks_overlay.visible
-                        || app.mcp_view.open
-                        || app.agents_menu.open
-                        || app.diff_viewer.open
-                        || app.help_overlay.visible
-                        || app.history_search_overlay.visible
-                        || app.rewind_flow.visible
-                        || app.show_help
-                        || app.context_menu_state.is_some()
-                        || app.permission_request.is_some()
-                        || app.global_search.open;
+                    let any_dialog_open = app.any_modal_open();
                     if key.code == KeyCode::Enter && app.is_streaming && !any_dialog_open {
                         // Queue the message: it will auto-submit once the
                         // current turn finishes (issue #149).
@@ -2064,6 +2029,18 @@ async fn run_interactive(
                         continue;
                     }
                     if key.code == KeyCode::Enter && !app.is_streaming && !any_dialog_open {
+                        // If a file-ref suggestion is active, accept it instead of submitting.
+                        if !app.prompt_input.suggestions.is_empty()
+                            && app.prompt_input.suggestion_index.is_some()
+                            && app.prompt_input.suggestions.get(app.prompt_input.suggestion_index.unwrap())
+                                .map(|s| s.source == claurst_tui::prompt_input::TypeaheadSource::FileRef)
+                                .unwrap_or(false)
+                        {
+                            app.prompt_input.accept_suggestion();
+                            app.prompt_input.insert_char(' ');
+                            app.refresh_prompt_input();
+                            continue;
+                        }
                         // If a slash-command suggestion is active, accept and execute immediately.
                         if !app.prompt_input.suggestions.is_empty()
                             && app.prompt_input.suggestion_index.is_some()
@@ -2124,7 +2101,7 @@ async fn run_interactive(
                             }
 
                             // Honour exit/quit triggered by TUI intercept immediately.
-                            if app.should_quit {
+                            if app.should_exit {
                                 break 'main;
                             }
 
@@ -2442,7 +2419,7 @@ async fn run_interactive(
                         }
 
                         // Fire UserPromptSubmit hook (non-blocking)
-                        if !config.hooks.is_empty() {
+                        if !cmd_ctx.config.hooks.is_empty() {
                             let hook_ctx = claurst_core::hooks::HookContext {
                                 event: "UserPromptSubmit".to_string(),
                                 tool_name: None,
@@ -2452,7 +2429,7 @@ async fn run_interactive(
                                 session_id: Some(tool_ctx.session_id.clone()),
                             };
                             claurst_core::hooks::run_hooks(
-                                &config.hooks,
+                                &cmd_ctx.config.hooks,
                                 claurst_core::config::HookEvent::UserPromptSubmit,
                                 &hook_ctx,
                                 &tool_ctx.working_dir,
@@ -2464,27 +2441,46 @@ async fn run_interactive(
                         let pending_imgs = app.prompt_input.clear_images();
 
                         // Check for file injection if enabled
-                        if config.file_injection_enabled {
+                        if app.config.file_injection_enabled {
                             use claurst_tui::file_injection::parse_at_refs;
 
-                            let (within_limit, oversized) = parse_at_refs(&input, &tool_ctx.working_dir, config.file_injection_max_size);
+                            // file_injection_force is set when user chose "inject anyways" in the
+                            // warning dialog — pass limit 0 so all files are treated as within
+                            // limit. Also drop any directory refs silently on force re-submit so
+                            // they don't loop back to the directory warning.
+                            let was_force = app.file_injection_force;
+                            let effective_limit = if app.file_injection_force {
+                                app.file_injection_force = false;
+                                0
+                            } else {
+                                app.config.file_injection_max_size
+                            };
+                            let (within_limit, mut oversized) = parse_at_refs(&input, &tool_ctx.working_dir, effective_limit);
+                            if was_force {
+                                oversized.retain(|f| !matches!(f.issue, Some(claurst_tui::AtFileIssue::IsDirectory)));
+                            }
 
                             if !oversized.is_empty() {
-                                // Show dialog with oversized files
-                                let oversized_summaries: Vec<(String, usize, String)> = oversized
+                                // Show either the directory warning or the file warning, never both.
+                                // Directories take precedence: if any are present, show only those.
+                                let has_dirs = oversized.iter().any(|f| matches!(f.issue, Some(claurst_tui::AtFileIssue::IsDirectory)));
+                                let oversized_summaries: Vec<(String, usize, claurst_tui::AtFileIssue)> = oversized
                                     .iter()
-                                    .map(|f| {
-                                        let issue_str = match &f.issue {
-                                            Some(claurst_tui::AtFileIssue::TooLarge(kb)) => format!("TooLarge: {} KB", kb),
-                                            Some(claurst_tui::AtFileIssue::Binary) => "Binary".to_string(),
-                                            Some(claurst_tui::AtFileIssue::Unreadable(e)) => e.clone(),
-                                            None => "Unknown".to_string(),
-                                        };
-                                        (f.path.display().to_string(), f.size_kb, issue_str)
+                                    .filter(|f| {
+                                        let is_dir = matches!(f.issue, Some(claurst_tui::AtFileIssue::IsDirectory));
+                                        if has_dirs { is_dir } else { !is_dir }
                                     })
+                                    .filter_map(|f| f.issue.clone().map(|issue| (f.path.display().to_string(), f.size_kb, issue)))
                                     .collect();
 
-                                app.file_injection_dialog.show(input.clone(), pending_imgs, oversized_summaries);
+                                app.file_injection_dialog.show(
+                                    input.clone(),
+                                    pending_imgs,
+                                    oversized_summaries,
+                                    app.config.file_injection_max_size,
+                                    Some(tool_ctx.working_dir.clone()),
+                                );
+                                app.set_prompt_text(input);
                                 continue;
                             }
 
@@ -3499,8 +3495,17 @@ async fn run_interactive(
 
         if task_finished {
             if let Some((handle, msgs_arc)) = current_query.take() {
-                // Get the outcome (ignore errors for now)
-                let _ = handle.await;
+                // Get the outcome and handle errors
+                if let Ok(QueryOutcome::Error(err)) = handle.await {
+                    while app.notifications.current_is_error() {
+                        app.notifications.dismiss_current();
+                    }
+                    app.notifications.push(
+                        claurst_tui::notifications::NotificationKind::Error,
+                        err.to_string(),
+                        None,
+                    );
+                }
                 // Sync the updated conversation back to our local vector
                 messages = msgs_arc.lock().await.clone();
                 session.messages = messages.clone();
@@ -3714,7 +3719,7 @@ async fn run_interactive(
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
             tools_arc = build_tools_with_mcp(new_mcp_manager.clone());
-            if app.mcp_view.open {
+            if app.mcp_view.visible {
                 app.refresh_mcp_view();
             }
 
@@ -3733,7 +3738,7 @@ async fn run_interactive(
             });
         }
 
-        if app.should_quit {
+        if app.should_exit {
             break 'main;
         }
     }

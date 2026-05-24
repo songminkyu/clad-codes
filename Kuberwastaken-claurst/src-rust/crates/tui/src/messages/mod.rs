@@ -189,30 +189,23 @@ fn apply_block_style(mut line: Line<'static>, width: u16) -> Line<'static> {
 fn empty_block_line(width: u16) -> Line<'static> {
     apply_block_style(Line::from(""), width)
 }
-
-fn short_model_name(model: &str) -> String {
-    model
-        .split_once('/')
-        .map(|(_, model)| model)
-        .unwrap_or(model)
-        .to_string()
-}
-
-fn title_case_mode(mode: &str) -> String {
-    let mut chars = mode.chars();
-    match chars.next() {
-        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
-        None => String::new(),
-    }
-}
-
 fn render_attachment_chip(kind: &str, label: String) -> Line<'static> {
+    render_attachment_chip_colored(kind, label, CLAUDE_ORANGE, Color::Black)
+}
+
+fn render_file_chip(label: String) -> Line<'static> {
+    // Use a steel-blue badge with white text for file injections — distinct from
+    // the orange img/doc chips and readable on dark terminal backgrounds.
+    render_attachment_chip_colored("file", label, Color::Rgb(51, 102, 170), Color::White)
+}
+
+fn render_attachment_chip_colored(kind: &str, label: String, badge_bg: Color, badge_fg: Color) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!(" {} ", kind),
             Style::default()
-                .fg(Color::Black)
-                .bg(CLAUDE_ORANGE)
+                .fg(badge_fg)
+                .bg(badge_bg)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -231,47 +224,24 @@ fn user_metadata_line(_meta: Option<&TurnMetadata>) -> Option<Line<'static>> {
 pub fn render_transcript_assistant_meta(meta: Option<&TurnMetadata>, accent: Color) -> Option<Line<'static>> {
     let meta = meta?;
 
-    // Always show at least mode — matches OpenCode's "Build · Model · Duration"
-    let mode = meta
-        .agent_mode
-        .as_deref()
-        .filter(|m| !m.is_empty())
-        .map(title_case_mode)
-        .unwrap_or_else(|| "Build".to_string());
+    // Only show interrupted status — mode, model, and duration are already
+    // displayed in the status line above the prompt.
+    if !meta.interrupted {
+        return None;
+    }
 
-    let mut spans = vec![
+    let spans = vec![
         Span::styled(
             "   \u{25a3} ",
             Style::default()
                 .fg(accent)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(mode, Style::default().fg(TRANSCRIPT_TEXT)),
-    ];
-
-    if let Some(model) = meta.model_name.as_deref().filter(|m| !m.is_empty()) {
-        spans.push(Span::styled(" \u{00b7} ", Style::default().fg(TRANSCRIPT_SUBTLE)));
-        spans.push(Span::styled(
-            short_model_name(model),
-            Style::default().fg(TRANSCRIPT_MUTED),
-        ));
-    }
-
-    if let Some(duration) = meta.duration.as_deref().filter(|d| !d.is_empty()) {
-        spans.push(Span::styled(" \u{00b7} ", Style::default().fg(TRANSCRIPT_SUBTLE)));
-        spans.push(Span::styled(
-            duration.to_string(),
-            Style::default().fg(TRANSCRIPT_MUTED),
-        ));
-    }
-
-    if meta.interrupted {
-        spans.push(Span::styled(" \u{00b7} ", Style::default().fg(TRANSCRIPT_SUBTLE)));
-        spans.push(Span::styled(
+        Span::styled(
             "interrupted",
             Style::default().fg(TRANSCRIPT_MUTED),
-        ));
-    }
+        ),
+    ];
 
     Some(Line::from(spans))
 }
@@ -285,22 +255,138 @@ pub fn render_transcript_live_text(text: &str, width: u16) -> Vec<Line<'static>>
     )
 }
 
+/// Segments of a potentially file-injected text block.
+enum TextSegment {
+    Plain(String),
+    FileBlock(String), // path attribute value
+}
+
+/// Normalize `@token` references in user text when those files were already shown
+/// as chips. Replaces `@long/absolute/path/file.rs` with just `@file.rs` so the
+/// text stays readable ("Delete @file.rs" still makes sense) without showing the
+/// full path noise.
+fn normalize_at_tokens(
+    text: &str,
+    injected: &std::collections::HashSet<String>,
+) -> String {
+    let mut result = String::with_capacity(text.len());
+    for word in text.split_inclusive(|c: char| c.is_whitespace()) {
+        let trimmed = word.trim_end_matches(|c: char| c.is_whitespace());
+        let trailing: &str = &word[trimmed.len()..];
+
+        if trimmed.starts_with('@') && trimmed.len() > 1 {
+            let mut path_part = trimmed[1..].to_string();
+            // Strip trailing punctuation (same logic as parse_at_refs)
+            while path_part.len() > 0 && path_part.ends_with(|c: char| c.is_ascii_punctuation()) && !path_part.ends_with('/') {
+                path_part.pop();
+            }
+            let punct_suffix = &trimmed[1 + path_part.len()..];
+
+            let basename = std::path::Path::new(&path_part)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path_part.clone());
+
+            let matches = injected.iter().any(|p| {
+                p == &path_part
+                    || std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().as_ref() == path_part.as_str()).unwrap_or(false)
+                    || p.ends_with(&format!("/{}", path_part))
+            });
+
+            if matches && basename != path_part {
+                // Shorten to just the filename
+                result.push('@');
+                result.push_str(&basename);
+                result.push_str(punct_suffix);
+                result.push_str(trailing);
+                continue;
+            }
+        }
+        result.push_str(word);
+    }
+    result
+}
+
+/// Split text that may contain `<file path="...">...</file>` injection blocks
+/// into alternating Plain and FileBlock segments.
+fn extract_file_segments(text: &str) -> Vec<TextSegment> {
+    let mut result = Vec::new();
+    let mut remaining = text;
+    const OPEN: &str = "<file path=\"";
+    const CLOSE: &str = "</file>";
+
+    while let Some(start) = remaining.find(OPEN) {
+        if start > 0 {
+            result.push(TextSegment::Plain(remaining[..start].to_string()));
+        }
+        let after = &remaining[start + OPEN.len()..];
+        if let Some(path_end) = after.find('"') {
+            let path = after[..path_end].to_string();
+            let after_open_tag = &remaining[start..];
+            if let Some(close_pos) = after_open_tag.find(CLOSE) {
+                let consumed = start + close_pos + CLOSE.len();
+                // skip one trailing newline if present
+                let consumed = if remaining[consumed..].starts_with('\n') { consumed + 1 } else { consumed };
+                result.push(TextSegment::FileBlock(path));
+                remaining = &remaining[consumed..];
+            } else {
+                result.push(TextSegment::Plain(remaining[start..].to_string()));
+                remaining = "";
+                break;
+            }
+        } else {
+            result.push(TextSegment::Plain(remaining[start..].to_string()));
+            remaining = "";
+            break;
+        }
+    }
+
+    if !remaining.is_empty() {
+        result.push(TextSegment::Plain(remaining.to_string()));
+    }
+    result
+}
+
 pub fn render_transcript_user_message(
     msg: &Message,
     meta: Option<&TurnMetadata>,
     width: u16,
 ) -> Vec<Line<'static>> {
     // Goal-event messages injected by the /goal machinery render as a compact
-    // event block, not as a user input bubble.
+    // event block, not as a user input bubble. The same applies to the user's
+    // own `/goal <objective>` typing — replace it with the yellow GOAL ACTIVE
+    // badge so the raw slash command doesn't sit next to the `[Goal started]`
+    // event the machinery injects right after.
     if let Some(ContentBlock::Text { text }) = msg.content_blocks().into_iter().next() {
         if is_goal_event_message(&text) {
             return render_goal_event(&text, width);
+        }
+        if let Some(objective) = extract_goal_slash_objective(&text) {
+            return render_goal_active_block(&objective);
         }
     }
 
     let inner_width = width.saturating_sub(4).max(10);
     let mut lines = Vec::new();
     let mut pending_text = String::new();
+
+    // Collect the absolute paths of every injected file so we can strip the
+    // corresponding @token references from the user's original text block.
+    let injected_paths: std::collections::HashSet<String> = msg.content_blocks()
+        .iter()
+        .filter_map(|b| {
+            if let ContentBlock::Text { text } = b {
+                if text.contains("<file path=\"") { Some(text) } else { None }
+            } else {
+                None
+            }
+        })
+        .flat_map(|text| {
+            extract_file_segments(text).into_iter().filter_map(|s| {
+                if let TextSegment::FileBlock(p) = s { Some(p) } else { None }
+            })
+        })
+        .collect();
 
     let flush_text = |buffer: &mut String, target: &mut Vec<Line<'static>>| {
         if buffer.is_empty() {
@@ -316,10 +402,44 @@ pub fn render_transcript_user_message(
     for block in msg.content_blocks() {
         match block {
             ContentBlock::Text { text } => {
-                if !pending_text.is_empty() {
-                    pending_text.push('\n');
+                if text.contains("<file path=\"") {
+                    flush_text(&mut pending_text, &mut lines);
+                    for segment in extract_file_segments(&text) {
+                        match segment {
+                            TextSegment::FileBlock(path) => {
+                                let label = std::path::Path::new(&path)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or(path);
+                                lines.push(render_file_chip(label));
+                            }
+                            TextSegment::Plain(t) => {
+                                if !t.trim().is_empty() {
+                                    if !pending_text.is_empty() {
+                                        pending_text.push('\n');
+                                    }
+                                    pending_text.push_str(&t);
+                                }
+                            }
+                        }
+                    }
+                } else if !injected_paths.is_empty() {
+                    // Shorten @long/path/file.rs → @file.rs since the chips already
+                    // show the full path context.
+                    let cleaned = normalize_at_tokens(&text, &injected_paths);
+                    let trimmed = cleaned.trim();
+                    if !trimmed.is_empty() {
+                        if !pending_text.is_empty() {
+                            pending_text.push('\n');
+                        }
+                        pending_text.push_str(trimmed);
+                    }
+                } else {
+                    if !pending_text.is_empty() {
+                        pending_text.push('\n');
+                    }
+                    pending_text.push_str(&text);
                 }
-                pending_text.push_str(&text);
             }
             ContentBlock::Image { source } => {
                 flush_text(&mut pending_text, &mut lines);
@@ -1615,7 +1735,18 @@ pub fn render_system_api_error(msg: &str, retry_secs: Option<u32>) -> Vec<Line<'
 
 /// Render a user command invocation (skill invocation display).
 /// Shows: `▸ ` in cyan bold + command name in cyan bold + " " + args in white.
+///
+/// Special case: `/goal <objective>` is replaced with a yellow `GOAL ACTIVE /
+/// Objective: <obj>` badge so the raw slash command doesn't sit next to the
+/// `[Goal started]` event the machinery injects right after it. Subcommands
+/// (`/goal status`, `pause`, `resume`, `clear`, `complete`) keep the normal
+/// rendering.
 pub fn render_user_command(name: &str, args: &str) -> Vec<Line<'static>> {
+    if name == "goal" {
+        if let Some(objective) = extract_goal_objective_from_args(args) {
+            return render_goal_active_block(&objective);
+        }
+    }
     vec![Line::from(vec![
         Span::styled(
             "\u{25b8} ",
@@ -1628,6 +1759,92 @@ pub fn render_user_command(name: &str, args: &str) -> Vec<Line<'static>> {
         Span::styled(" ".to_string(), Style::default()),
         Span::styled(args.to_string(), Style::default().fg(Color::White)),
     ])]
+}
+
+/// Recognizes a raw `/goal <objective>` user message. Returns the objective
+/// string when the first line is `/goal …` with actual objective text;
+/// returns `None` for subcommand forms, no-args, or anything that isn't a
+/// `/goal` slash command (including the case where the user pastes a
+/// multi-line message with `/goal …` somewhere in the middle).
+fn extract_goal_slash_objective(text: &str) -> Option<String> {
+    let first_line = text.lines().next()?;
+    let rest = first_line
+        .trim_start()
+        .strip_prefix("/goal")?
+        .strip_prefix(|c: char| c.is_whitespace())
+        .unwrap_or("");
+    let objective = extract_goal_objective_from_args(rest)?;
+    // Reject bare `/goal` (no following body) — strip_prefix above returned
+    // empty `rest`, which extract_goal_objective_from_args already handles.
+    if text.lines().count() > 1 {
+        // If the user typed more than just `/goal …`, fold the rest of the
+        // message into the objective so nothing is silently dropped.
+        let trailing: String = text.lines().skip(1).collect::<Vec<_>>().join("\n");
+        let trailing = trailing.trim();
+        if !trailing.is_empty() {
+            return Some(format!("{}\n{}", objective, trailing));
+        }
+    }
+    Some(objective)
+}
+
+/// Pulls the objective text out of the `args` portion of a `/goal …` slash
+/// command. Returns `None` for empty args or for the subcommand forms
+/// (`status`, `pause`, `resume`, `clear`, `complete`).
+fn extract_goal_objective_from_args(args: &str) -> Option<String> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Strip an optional `--tokens <budget>` prefix so the objective shown
+    // doesn't include the budget flag.
+    let rest = if let Some(after_flag) = trimmed.strip_prefix("--tokens") {
+        let after_flag = after_flag.trim_start();
+        after_flag
+            .splitn(2, char::is_whitespace)
+            .nth(1)
+            .unwrap_or("")
+            .trim()
+    } else {
+        trimmed
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let first = rest
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(
+        first.as_str(),
+        "status" | "pause" | "resume" | "clear" | "complete"
+    ) {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+/// Render the yellow `GOAL ACTIVE / Objective: …` badge that replaces the
+/// `/goal <objective>` user-input line in the transcript.
+fn render_goal_active_block(objective: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![Span::styled(
+            "  GOAL ACTIVE".to_string(),
+            Style::default()
+                .fg(GOAL_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![
+            Span::styled(
+                "  Objective: ".to_string(),
+                Style::default()
+                    .fg(GOAL_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(objective.to_string(), Style::default().fg(GOAL_BODY)),
+        ]),
+    ]
 }
 
 /// Render a user memory input line.
@@ -1798,18 +2015,6 @@ pub fn is_goal_event_message(text: &str) -> bool {
         || text.starts_with("[Goal continuation -")         // fallback
 }
 
-/// Extract the objective text between `<objective>` and `</objective>` tags.
-fn extract_goal_objective(text: &str) -> Option<String> {
-    let tag = "<objective>";
-    let start = text.find(tag)? + tag.len();
-    let end = text.find("</objective>")?;
-    if end > start {
-        Some(text[start..end].trim().to_string())
-    } else {
-        None
-    }
-}
-
 /// Extract the turn number from a "[Goal continuation — turn N]" header.
 fn extract_goal_turn(text: &str) -> Option<u32> {
     // Find the first [...] bracket, search inside for "turn <N>"
@@ -1824,9 +2029,12 @@ fn extract_goal_turn(text: &str) -> Option<u32> {
 
 /// Render a goal-event message block.
 ///
-/// `[Goal started]` shows the ◎ badge and the objective text.
+/// `[Goal started]` renders as nothing — the user's typed `/goal …` line
+/// already produces the canonical GOAL ACTIVE block via
+/// `render_goal_active_block`, so showing the kickoff event too would
+/// duplicate it.
 /// `[Goal continuation — turn N]` shows a compact inline turn marker.
-pub fn render_goal_event(text: &str, width: u16) -> Vec<Line<'static>> {
+pub fn render_goal_event(text: &str, _width: u16) -> Vec<Line<'static>> {
     if text.starts_with("[Goal continuation —") {
         let turn = extract_goal_turn(text).unwrap_or(0);
         return vec![Line::from(vec![
@@ -1841,93 +2049,8 @@ pub fn render_goal_event(text: &str, width: u16) -> Vec<Line<'static>> {
         ])];
     }
 
-    // [Goal started] — header + wrapped objective
-    let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(
-            "  \u{25ce} ".to_string(),  // ◎
-            Style::default().fg(GOAL_ACCENT).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "goal started".to_string(),
-            Style::default().fg(GOAL_ACCENT).add_modifier(Modifier::BOLD),
-        ),
-    ]));
-
-    let objective = extract_goal_objective(text).unwrap_or_default();
-    if !objective.is_empty() {
-        let usable = (width as usize).saturating_sub(6).max(20);
-        for line in wrap_plain_text(&objective, usable) {
-            lines.push(Line::from(vec![
-                Span::styled("    ".to_string(), Style::default()),
-                Span::styled(line, Style::default().fg(GOAL_BODY)),
-            ]));
-        }
-    }
-
-    lines
-}
-
-/// Simple plain-text word-wrap (no markdown, no indent prefix).
-///
-/// Words longer than `max_width` (e.g. URLs) are hard-broken at character
-/// boundaries so they do not overflow the buffer (issue #149 follow-up:
-/// long URLs at end of message went off-screen).
-fn wrap_plain_text(text: &str, max_width: usize) -> Vec<String> {
-    if max_width == 0 {
-        return vec![text.to_string()];
-    }
-    let mut out = Vec::new();
-    for para in text.lines() {
-        if para.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        let mut current = String::new();
-        let mut current_len = 0usize;
-        for word in para.split_whitespace() {
-            let word_len = word.chars().count();
-            if word_len > max_width {
-                // Flush whatever we have, then hard-break the long word.
-                if !current.is_empty() {
-                    out.push(std::mem::take(&mut current));
-                    current_len = 0;
-                }
-                let chars: Vec<char> = word.chars().collect();
-                let mut i = 0;
-                while i < chars.len() {
-                    let end = (i + max_width).min(chars.len());
-                    let chunk: String = chars[i..end].iter().collect();
-                    if end == chars.len() {
-                        // Last fragment becomes the start of the next visual
-                        // line so following words can flow after it.
-                        current = chunk;
-                        current_len = end - i;
-                    } else {
-                        out.push(chunk);
-                    }
-                    i = end;
-                }
-                continue;
-            }
-            if current.is_empty() {
-                current.push_str(word);
-                current_len = word_len;
-            } else if current_len + 1 + word_len <= max_width {
-                current.push(' ');
-                current.push_str(word);
-                current_len += 1 + word_len;
-            } else {
-                out.push(std::mem::take(&mut current));
-                current.push_str(word);
-                current_len = word_len;
-            }
-        }
-        if !current.is_empty() {
-            out.push(current);
-        }
-    }
-    out
+    // [Goal started] — hidden.
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -2277,6 +2400,75 @@ mod tests {
     }
 
     #[test]
+    fn goal_objective_renders_goal_active_block_not_user_command() {
+        let result = render_user_command("goal", "Migrate to React");
+        let header = line_text(&result[0]);
+        let body = line_text(&result[1]);
+        assert!(header.contains("GOAL ACTIVE"));
+        assert!(!header.contains('\u{25b8}'), "should not show ▸ user-command prefix");
+        assert!(body.contains("Objective:"));
+        assert!(body.contains("Migrate to React"));
+    }
+
+    #[test]
+    fn goal_subcommands_render_as_normal_user_command() {
+        for sub in ["status", "pause", "resume", "clear", "complete"] {
+            let result = render_user_command("goal", sub);
+            let text = line_text(&result[0]);
+            assert!(text.contains('\u{25b8}'), "/goal {sub} should keep ▸ prefix");
+            assert!(text.contains(sub));
+        }
+    }
+
+    #[test]
+    fn goal_with_tokens_flag_strips_flag_from_objective() {
+        let result = render_user_command("goal", "--tokens 250K Migrate to React");
+        let body = line_text(&result[1]);
+        assert!(body.contains("Migrate to React"));
+        assert!(!body.contains("--tokens"), "flag should not appear in displayed objective");
+        assert!(!body.contains("250K"));
+    }
+
+    #[test]
+    fn extract_goal_objective_returns_none_for_subcommands_and_empty() {
+        assert!(extract_goal_objective_from_args("").is_none());
+        assert!(extract_goal_objective_from_args("   ").is_none());
+        assert!(extract_goal_objective_from_args("status").is_none());
+        assert!(extract_goal_objective_from_args("pause now").is_none()); // first token is subcommand
+        assert_eq!(
+            extract_goal_objective_from_args("Migrate to React").as_deref(),
+            Some("Migrate to React"),
+        );
+    }
+
+    #[test]
+    fn extract_goal_slash_objective_handles_typed_user_message() {
+        assert_eq!(
+            extract_goal_slash_objective("/goal build GPT 6 make no mistakes").as_deref(),
+            Some("build GPT 6 make no mistakes"),
+        );
+        assert_eq!(
+            extract_goal_slash_objective("/goal --tokens 250K Migrate to React").as_deref(),
+            Some("Migrate to React"),
+        );
+        // Subcommands fall through.
+        assert!(extract_goal_slash_objective("/goal status").is_none());
+        assert!(extract_goal_slash_objective("/goal").is_none());
+        // Not a /goal message.
+        assert!(extract_goal_slash_objective("just a normal message").is_none());
+        assert!(extract_goal_slash_objective("/goalbuild").is_none());
+    }
+
+    #[test]
+    fn extract_goal_slash_objective_folds_trailing_lines_into_objective() {
+        let text = "/goal Migrate to React\nwith strict typing\nand tests passing";
+        let extracted = extract_goal_slash_objective(text).unwrap();
+        assert!(extracted.starts_with("Migrate to React"));
+        assert!(extracted.contains("strict typing"));
+        assert!(extracted.contains("tests passing"));
+    }
+
+    #[test]
     fn test_render_user_memory_input() {
         let result = render_user_memory_input("project", "Claurst");
         assert_eq!(result.len(), 2);
@@ -2447,6 +2639,3 @@ mod tests {
         assert_eq!(a_text, b_text);
     }
 }
-
-
-

@@ -27,6 +27,7 @@ use crate::{agents_view::{AgentInfo, AgentStatus, AgentsMenuState, AgentsRoute},
 use claurst_core::config::{Config, Settings, Theme};
 use claurst_core::cost::CostTracker;
 use claurst_core::file_history::FileHistory;
+use claurst_core::{sample_completion_verb, sample_spinner_verb};
 use claurst_core::keybindings::{
     KeyContext, KeybindingResolver, KeybindingResult, ParsedKeystroke, UserKeybindings,
 };
@@ -70,6 +71,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("insights", "Generate a session analysis report with conversation statistics"),
     ("install-slack-app", "Install the Claurst Slack integration"),
     ("keybindings", "Show keybinding configuration"),
+    ("links", "Open URLs from this session in your browser"),
     ("login", "Log in to Claurst"),
     ("logout", "Log out of Claurst"),
     ("managed-agents", "Configure manager-executor managed agent system"),
@@ -82,7 +84,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("caveman", "Caveman speech mode — save big token"),
     ("rocky", "Rocky speech mode — amaze amaze amaze"),
     ("normal", "Deactivate speech mode"),
-    ("quit", "Quit Claurst"),
+    ("quit", "Exit Claurst"),
     ("refresh", "Clear saved provider auth and model caches"),
     ("rename", "Rename this session"),
     ("resume", "Resume a previous session"),
@@ -90,6 +92,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("rewind", "Rewind to an earlier turn"),
     ("session", "Browse and manage sessions"),
     ("settings", "Open settings"),
+    ("share", "Upload the current session as a secret gist and get a shareable URL"),
     ("stats", "Open token and cost stats"),
     ("survey", "Open session feedback survey"),
     ("theme", "Open the theme picker"),
@@ -103,7 +106,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
 fn help_command_category(name: &str) -> &'static str {
     match name {
         "connect" | "model" | "providers" | "refresh" | "fast" | "effort" | "voice" => "Model & Provider",
-        "changes" | "diff" | "review" | "rewind" | "export" | "copy" => "Review & History",
+        "changes" | "diff" | "review" | "rewind" | "export" | "copy" | "share" | "links" => "Review & History",
         "stats" | "cost" | "context" | "insights" | "heapdump" | "doctor" => "Diagnostics",
         "config" | "settings" | "theme" | "keybindings" | "hooks" | "mcp" | "import-config" => {
             "Workspace"
@@ -712,7 +715,7 @@ pub struct App {
     pub status_message: Option<String>,
     /// Randomly chosen thinking verb shown next to the spinner while streaming.
     pub spinner_verb: Option<String>,
-    pub should_quit: bool,
+    pub should_exit: bool,
     pub show_help: bool,
 
     // Extended state
@@ -804,6 +807,8 @@ pub struct App {
     pub bridge_state: BridgeConnectionState,
     /// Active notification queue.
     pub notifications: NotificationQueue,
+    /// Scroll offset for error modal text (in lines).
+    pub error_modal_scroll_offset: usize,
     /// Plugin hint banners.
     pub plugin_hints: Vec<PluginHintBanner>,
     /// Optional session title shown in the status bar.
@@ -887,6 +892,9 @@ pub struct App {
     /// File injection warning dialog.
     /// Shown when oversized or binary files are detected in @refs.
     pub file_injection_dialog: crate::file_injection_dialog::FileInjectionDialogState,
+    /// When true, the next file injection size check uses limit 0 (no limit),
+    /// letting files that were "allowed" through the warning dialog be injected.
+    pub file_injection_force: bool,
     /// First-launch onboarding welcome dialog.
     pub onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState,
     /// Effort-level picker (/effort with no args).
@@ -1015,6 +1023,8 @@ pub struct App {
     pub last_selectable_area: Cell<ratatui::layout::Rect>,
     /// The prompt input area from the last render frame (used for focus routing).
     pub last_input_area: Cell<ratatui::layout::Rect>,
+    /// The footer's right column area (where tips are shown) from the last render.
+    pub footer_right_column_area: Cell<ratatui::layout::Rect>,
     /// Which area of the TUI currently has keyboard focus.
     pub focus: FocusTarget,
     /// Maps virtual_row_index → thinking_block_hash for click detection.
@@ -1069,57 +1079,13 @@ pub struct App {
     pub managed_agent_cost_breakdown: Option<(f64, f64, f64)>,
     /// Whether managed agent mode is currently active.
     pub managed_agents_active: bool,
+    /// Timestamp of the first exit key press that showed confirmation (valid for ~2 seconds).
+    pub last_exit_key_warning: Option<std::time::Instant>,
+    /// Which exit key ('c' or 'd') started the current confirmation sequence.
+    pub exit_key_sequence_start: Option<char>,
 }
 
-const SPINNER_VERBS: &[&str] = &[
-    "Accomplishing", "Actioning", "Actualizing", "Architecting", "Baking", "Beaming",
-    "Beboppin'", "Befuddling", "Billowing", "Blanching", "Bloviating", "Boogieing",
-    "Boondoggling", "Booping", "Bootstrapping", "Brewing", "Bunning", "Burrowing",
-    "Calculating", "Canoodling", "Caramelizing", "Cascading", "Catapulting", "Cerebrating",
-    "Channeling", "Choreographing", "Churning", "Clauding", "Coalescing", "Cogitating",
-    "Combobulating", "Composing", "Computing", "Concocting", "Considering", "Contemplating",
-    "Cooking", "Crafting", "Creating", "Crunching", "Crystallizing", "Cultivating",
-    "Deciphering", "Deliberating", "Determining", "Dilly-dallying", "Discombobulating",
-    "Doing", "Doodling", "Drizzling", "Ebbing", "Effecting", "Elucidating", "Embellishing",
-    "Enchanting", "Envisioning", "Evaporating", "Fermenting", "Fiddle-faddling", "Finagling",
-    "Flambéing", "Flibbertigibbeting", "Flowing", "Flummoxing", "Fluttering", "Forging",
-    "Forming", "Frolicking", "Frosting", "Gallivanting", "Galloping", "Garnishing",
-    "Generating", "Gesticulating", "Germinating", "Gitifying", "Grooving", "Gusting",
-    "Harmonizing", "Hashing", "Hatching", "Herding", "Honking", "Hullaballooing",
-    "Hyperspacing", "Ideating", "Imagining", "Improvising", "Incubating", "Inferring",
-    "Infusing", "Ionizing", "Jitterbugging", "Julienning", "Kneading", "Leavening",
-    "Levitating", "Lollygagging", "Manifesting", "Marinating", "Meandering", "Metamorphosing",
-    "Misting", "Moonwalking", "Moseying", "Mulling", "Mustering", "Musing", "Nebulizing",
-    "Nesting", "Newspapering", "Noodling", "Nucleating", "Orbiting", "Orchestrating",
-    "Osmosing", "Perambulating", "Percolating", "Perusing", "Philosophising",
-    "Photosynthesizing", "Pollinating", "Pondering", "Pontificating", "Pouncing",
-    "Precipitating", "Prestidigitating", "Processing", "Proofing", "Propagating", "Puttering",
-    "Puzzling", "Quantumizing", "Razzle-dazzling", "Razzmatazzing", "Recombobulating",
-    "Reticulating", "Roosting", "Ruminating", "Sautéing", "Scampering", "Schlepping",
-    "Scurrying", "Seasoning", "Shenaniganing", "Shimmying", "Simmering", "Skedaddling",
-    "Sketching", "Slithering", "Smooshing", "Sock-hopping", "Spelunking", "Spinning",
-    "Sprouting", "Stewing", "Sublimating", "Swirling", "Swooping", "Symbioting",
-    "Synthesizing", "Tempering", "Thinking", "Thundering", "Tinkering", "Tomfoolering",
-    "Topsy-turvying", "Transfiguring", "Transmuting", "Twisting", "Undulating", "Unfurling",
-    "Unravelling", "Vibing", "Waddling", "Wandering", "Warping", "Whatchamacalliting",
-    "Whirlpooling", "Whirring", "Whisking", "Wibbling", "Working", "Wrangling", "Zesting",
-    "Zigzagging",
-];
-
-fn sample_spinner_verb(seed: usize) -> &'static str {
-    SPINNER_VERBS[seed % SPINNER_VERBS.len()]
-}
-
-/// Past-tense verbs shown in the status row after a turn completes.
-/// Mirrors `TURN_COMPLETION_VERBS` from `src/constants/turnCompletionVerbs.ts`.
-const TURN_COMPLETION_VERBS: &[&str] = &[
-    "Baked", "Brewed", "Churned", "Cogitated", "Cooked", "Crunched",
-    "Pondered", "Processed", "Worked",
-];
-
-fn sample_completion_verb(seed: usize) -> &'static str {
-    TURN_COMPLETION_VERBS[seed % TURN_COMPLETION_VERBS.len()]
-}
+// Spinner verbs are now imported from claurst_core::spinner
 
 /// Format a duration in milliseconds to a human-readable string.
 ///
@@ -1249,7 +1215,7 @@ impl App {
             streaming_thinking: String::new(),
             status_message: None,
             spinner_verb: None,
-            should_quit: false,
+            should_exit: false,
             show_help: false,
             tool_use_blocks: Vec::new(),
             permission_request: None,
@@ -1297,6 +1263,7 @@ impl App {
             rewind_flow: RewindFlowOverlay::new(),
             bridge_state: BridgeConnectionState::Disconnected,
             notifications: NotificationQueue::new(),
+            error_modal_scroll_offset: 0,
             plugin_hints: Vec::new(),
             session_title: None,
             remote_session_url: None,
@@ -1334,6 +1301,7 @@ impl App {
             bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
             bypass_permissions_dialog_shown: false,
             file_injection_dialog: crate::file_injection_dialog::FileInjectionDialogState::new(),
+            file_injection_force: false,
             onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState::new(),
             effort_picker: crate::effort_picker::EffortPickerState::new(),
             key_input_dialog: crate::key_input_dialog::KeyInputDialogState::new(),
@@ -1436,6 +1404,7 @@ impl App {
             last_msg_area: Cell::new(ratatui::layout::Rect::default()),
             last_selectable_area: Cell::new(ratatui::layout::Rect::default()),
             last_input_area: Cell::new(ratatui::layout::Rect::default()),
+            footer_right_column_area: Cell::new(ratatui::layout::Rect::default()),
             focus: FocusTarget::Input,
             thinking_row_map: RefCell::new(std::collections::HashMap::new()),
             message_row_map: RefCell::new(std::collections::HashMap::new()),
@@ -1455,6 +1424,8 @@ impl App {
             update_available: None,
             managed_agent_cost_breakdown: None,
             managed_agents_active: false,
+            last_exit_key_warning: None,
+            exit_key_sequence_start: None,
         }
     }
 
@@ -1652,6 +1623,8 @@ impl App {
     }
 
     fn open_model_picker_for_provider(&mut self, provider_id: &str, title: Option<String>) {
+        self.dismiss_error_notifications();
+
         let cache_path = dirs::cache_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join("claurst")
@@ -1986,6 +1959,7 @@ impl App {
 
     pub fn intercept_slash_command(&mut self, cmd: &str) -> bool {
         self.close_secondary_views();
+        self.dismiss_error_notifications();
         match cmd {
             "config" | "settings" => {
                 self.settings_screen.open();
@@ -2078,12 +2052,13 @@ impl App {
                 self.streaming_thinking.clear();
                 self.tool_use_blocks.clear();
                 self.turn_metadata.clear();
+                self.cost_usd = 0.0;
                 self.invalidate_transcript();
                 self.status_message = Some("Conversation cleared.".to_string());
                 true
             }
             "exit" | "quit" => {
-                self.should_quit = true;
+                self.should_exit = true;
                 true
             }
             "vim" => {
@@ -2128,20 +2103,20 @@ impl App {
                     // Try xclip/xsel/pbcopy/clip.exe for clipboard; fall back to notification.
                     let copied = try_copy_to_clipboard(&text);
                     if copied {
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Info,
                             "Copied to clipboard.".to_string(),
                             Some(3),
                         );
                     } else {
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Info,
                             format!("Last response: {} chars (clipboard unavailable)", text.len()),
                             Some(5),
                         );
                     }
                 } else {
-                    self.notifications.push(
+                    self.push_notification(
                         NotificationKind::Warning,
                         "No assistant message to copy.".to_string(),
                         Some(3),
@@ -2273,6 +2248,58 @@ impl App {
         self.device_auth_dialog.close();
         self.settings_screen.close();
         self.theme_screen.close();
+    }
+
+    pub fn any_modal_open(&self) -> bool {
+        self.permission_request.is_some()
+            || self.rewind_flow.visible
+            || self.tasks_overlay.visible
+            || self.help_overlay.visible
+            || self.show_help
+            || self.history_search_overlay.visible
+            || self.history_search.is_some()
+            || self.settings_screen.visible
+            || self.theme_screen.visible
+            || self.stats_dialog.visible
+            || self.mcp_view.visible
+            || self.agents_menu.visible
+            || self.diff_viewer.visible
+            || self.global_search.visible
+            || self.feedback_survey.visible
+            || self.memory_file_selector.visible
+            || self.hooks_config_menu.visible
+            || self.overage_upsell.visible
+            || self.voice_mode_notice.visible
+            || self.memory_update_notification.visible
+            || self.desktop_upsell.visible
+            || self.import_config_dialog.visible
+            || self.invalid_config_dialog.visible
+            || self.bypass_permissions_dialog.visible
+            || self.ask_user_dialog.visible
+            || self.onboarding_dialog.visible
+            || self.import_config_picker.visible
+            || self.connect_dialog.visible
+            || self.key_input_dialog.visible
+            || self.custom_provider_dialog.visible
+            || self.free_mode_dialog.visible
+            || self.device_auth_dialog.visible
+            || self.command_palette.visible
+            || self.elicitation.visible
+            || self.model_picker.visible
+            || self.session_browser.visible
+            || self.session_branching.visible
+            || self.export_dialog.visible
+            || self.context_viz.visible
+            || self.mcp_approval.visible
+            || self.file_injection_dialog.visible
+            || self.context_menu_state.is_some()
+    }
+
+    fn dismiss_error_notifications(&mut self) {
+        while self.notifications.current_is_error() {
+            self.notifications.dismiss_current();
+        }
+        self.error_modal_scroll_offset = 0;
     }
 
     /// Perform the export based on the selected format. Returns the path written.
@@ -2495,6 +2522,15 @@ impl App {
 
     /// Push a synthetic system annotation into the conversation pane.
     /// It will appear after the current last message.
+    /// Push a notification and, for Error-kind notifications, reset the error
+    /// modal scroll offset so a newly arrived error is always shown from the top.
+    pub fn push_notification(&mut self, kind: NotificationKind, msg: String, duration_secs: Option<u64>) {
+        if kind == NotificationKind::Error {
+            self.error_modal_scroll_offset = 0;
+        }
+        self.notifications.push(kind, msg, duration_secs);
+    }
+
     pub fn push_system_message(&mut self, text: String, style: SystemMessageStyle) {
         self.system_annotations.push(SystemAnnotation {
             after_index: self.messages.len(),
@@ -2534,21 +2570,21 @@ impl App {
         // Only escalate — never repeat a threshold already shown.
         if pct >= 100 && self.token_warning_threshold_shown < 100 {
             self.token_warning_threshold_shown = 100;
-            self.notifications.push(
+            self.push_notification(
                 NotificationKind::Error,
                 "Context window full. Running auto-compact\u{2026}".to_string(),
                 None,
             );
         } else if pct >= 95 && self.token_warning_threshold_shown < 95 {
             self.token_warning_threshold_shown = 95;
-            self.notifications.push(
+            self.push_notification(
                 NotificationKind::Error,
                 "Context window 95% full! Run /compact now.".to_string(),
                 None, // persistent until dismissed
             );
         } else if pct >= 80 && self.token_warning_threshold_shown < 80 {
             self.token_warning_threshold_shown = 80;
-            self.notifications.push(
+            self.push_notification(
                 NotificationKind::Warning,
                 "Context window 80% full. Consider /compact.".to_string(),
                 Some(30),
@@ -2639,9 +2675,16 @@ impl App {
         self.history_index = self.prompt_input.history_pos;
     }
 
-    fn refresh_prompt_input(&mut self) {
+    pub fn refresh_prompt_input(&mut self) {
         self.prompt_input.mode = self.prompt_mode();
-        self.prompt_input.update_suggestions(PROMPT_SLASH_COMMANDS);
+        if self.file_injection_dialog.visible {
+            // Don't update suggestions while the injection dialog is open.
+            self.sync_legacy_prompt_fields();
+            return;
+        }
+        let file_autocomplete_limit = self.config.file_autocomplete_limit;
+        let file_autocomplete_show_hidden = self.config.file_autocomplete_show_hidden_files;
+        self.prompt_input.update_suggestions(PROMPT_SLASH_COMMANDS, file_autocomplete_limit, file_autocomplete_show_hidden);
         self.sync_legacy_prompt_fields();
     }
 
@@ -2823,7 +2866,14 @@ impl App {
     /// Process a keyboard event. Returns `true` when the input should be
     /// submitted (Enter pressed with no blocking dialog).
     pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
-        if self.global_search.open {
+        // Dismiss error modal with Esc
+        if key.code == KeyCode::Esc && self.notifications.current_is_error() {
+            self.dismiss_error_notifications();
+            return false;
+        }
+
+
+        if self.global_search.visible {
             return self.handle_global_search_key(key);
         }
 
@@ -2852,7 +2902,7 @@ impl App {
             match key.code {
                 KeyCode::Char('1') | KeyCode::Esc => {
                     // "No, exit" — quit immediately
-                    self.should_quit = true;
+                    self.should_exit = true;
                 }
                 KeyCode::Char('2') => {
                     // "Yes, I accept" — dismiss and continue
@@ -2864,7 +2914,7 @@ impl App {
                     if self.bypass_permissions_dialog.is_accept_selected() {
                         self.bypass_permissions_dialog.dismiss();
                     } else {
-                        self.should_quit = true;
+                        self.should_exit = true;
                     }
                 }
                 _ => {}
@@ -2874,25 +2924,27 @@ impl App {
 
         // File injection dialog: shown when oversized files are detected in @refs.
         if self.file_injection_dialog.visible {
+            let is_directory_only = self.file_injection_dialog.is_directory_only();
             match key.code {
-                KeyCode::Char('i') | KeyCode::Char('I') => {
-                    self.file_injection_dialog.selected = 0; // InjectAll
-                }
-                KeyCode::Char('s') | KeyCode::Char('S') => {
-                    self.file_injection_dialog.selected = 1; // SkipOversized
-                }
-                KeyCode::Esc => {
-                    self.file_injection_dialog.selected = 2; // Abort
-                    self.file_injection_dialog.confirm();
-                    // Restore input to prompt when aborting
-                    if let Some(input) = &self.file_injection_dialog.pending_input {
-                        self.set_prompt_text(input.clone());
+                KeyCode::Enter => {
+                    if is_directory_only {
+                        // Directories can't be injected; Enter = abort, restore input.
+                        if let Some(input) = self.file_injection_dialog.pending_input.clone() {
+                            self.set_prompt_text(input);
+                        }
+                        self.file_injection_dialog.dismiss();
+                    } else {
+                        // Enter = inject (Allow).
+                        self.file_injection_dialog.selected = 0;
+                        self.file_injection_dialog.confirm();
                     }
                 }
-                KeyCode::Up | KeyCode::Char('k') => self.file_injection_dialog.select_prev(),
-                KeyCode::Down | KeyCode::Char('j') => self.file_injection_dialog.select_next(),
-                KeyCode::Enter => {
-                    self.file_injection_dialog.confirm();
+                KeyCode::Esc => {
+                    // Esc = abort, restore input.
+                    if let Some(input) = self.file_injection_dialog.pending_input.clone() {
+                        self.set_prompt_text(input);
+                    }
+                    self.file_injection_dialog.dismiss();
                 }
                 _ => {}
             }
@@ -3047,14 +3099,14 @@ impl App {
                 KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER) => {
                     if let Some(text) = crate::image_paste::read_clipboard_text() {
                         if text.is_empty() {
-                            self.notifications.push(NotificationKind::Warning, "Clipboard is empty".to_string(), Some(2));
+                            self.push_notification(NotificationKind::Warning, "Clipboard is empty".to_string(), Some(2));
                         } else {
                             for ch in text.chars() {
                                 self.key_input_dialog.insert_char(ch);
                             }
                         }
                     } else {
-                        self.notifications.push(NotificationKind::Warning, "Could not read clipboard".to_string(), Some(2));
+                        self.push_notification(NotificationKind::Warning, "Could not read clipboard".to_string(), Some(2));
                     }
                 }
                 KeyCode::Char(c) => {
@@ -3066,28 +3118,26 @@ impl App {
             return false;
         }
 
-        // "Free" composite-provider setup dialog (collects Zen + OpenRouter keys)
+        // "Free" composite-provider setup dialog (collects any subset of the
+        // free-tier upstream keys; min 1 to enable, more = better).
         if self.free_mode_dialog.visible {
             match key.code {
                 KeyCode::Esc => {
                     self.free_mode_dialog.close();
                 }
-                KeyCode::Tab | KeyCode::Down | KeyCode::Up => {
-                    self.free_mode_dialog.switch_field();
+                KeyCode::Tab | KeyCode::Down => {
+                    self.free_mode_dialog.move_next();
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    self.free_mode_dialog.move_prev();
                 }
                 KeyCode::Enter => {
                     if self.free_mode_dialog.can_submit() {
-                        let (zen_key, or_key) = self.free_mode_dialog.take_values();
-                        if !zen_key.is_empty() {
+                        let values = self.free_mode_dialog.take_values();
+                        for (provider_id, key) in values {
                             self.auth_store.set(
-                                claurst_core::ProviderId::OPENCODE_ZEN,
-                                claurst_core::StoredCredential::ApiKey { key: zen_key },
-                            );
-                        }
-                        if !or_key.is_empty() {
-                            self.auth_store.set(
-                                claurst_core::ProviderId::OPENROUTER,
-                                claurst_core::StoredCredential::ApiKey { key: or_key },
+                                provider_id,
+                                claurst_core::StoredCredential::ApiKey { key },
                             );
                         }
                         self.activate_provider(
@@ -3096,7 +3146,7 @@ impl App {
                             "Connected to",
                         );
                     } else {
-                        self.free_mode_dialog.switch_field();
+                        self.free_mode_dialog.move_next();
                     }
                 }
                 KeyCode::Backspace => {
@@ -3171,20 +3221,28 @@ impl App {
                             "ollama" | "lmstudio" | "llamacpp" => {
                                 self.activate_provider(selected.id.clone(), selected.title.clone(), "Switched to");
                             }
-                            // "Free" composite mode — collects two keys (Zen + OpenRouter)
-                            // with a warning about context-management caveats.
+                            // "Free" composite mode — collects any subset of the
+                            // free-tier upstreams (min 1; more = better availability).
                             "free" => {
-                                let zen_existing = self
-                                    .auth_store
-                                    .api_key_for(claurst_core::ProviderId::OPENCODE_ZEN)
-                                    .or_else(|| {
-                                        self.auth_store
-                                            .api_key_for(claurst_core::ProviderId::OPENCODE_GO)
-                                    });
-                                let or_existing = self
-                                    .auth_store
-                                    .api_key_for(claurst_core::ProviderId::OPENROUTER);
-                                self.free_mode_dialog.open(zen_existing, or_existing);
+                                let existing: Vec<(&'static str, String)> = claurst_api::FREE_CATALOG
+                                    .iter()
+                                    .filter_map(|upstream| {
+                                        let key = match upstream.id {
+                                            "opencode-zen" => self
+                                                .auth_store
+                                                .api_key_for(claurst_core::ProviderId::OPENCODE_ZEN)
+                                                .or_else(|| {
+                                                    self.auth_store.api_key_for(
+                                                        claurst_core::ProviderId::OPENCODE_GO,
+                                                    )
+                                                }),
+                                            other => self.auth_store.api_key_for(other),
+                                        };
+                                        key.filter(|k| !k.is_empty())
+                                            .map(|k| (upstream.id, k))
+                                    })
+                                    .collect();
+                                self.free_mode_dialog.open(&existing);
                             }
                             "anthropic" => {
                                 // Anthropic: use API key from console.anthropic.com
@@ -3465,13 +3523,13 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if let Some(path) = self.perform_export() {
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Info,
                             format!("Exported to {}", path),
                             Some(4),
                         );
                     } else {
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Warning,
                             "Export failed: could not write file.".to_string(),
                             Some(4),
@@ -3554,21 +3612,21 @@ impl App {
             return false;
         }
 
-        if self.diff_viewer.open {
+        if self.diff_viewer.visible {
             self.handle_diff_viewer_key(key);
             return false;
         }
 
-        if self.agents_menu.open {
+        if self.agents_menu.visible {
             self.handle_agents_menu_key(key);
             return false;
         }
 
-        if self.mcp_view.open {
+        if self.mcp_view.visible {
             return self.handle_mcp_view_key(key);
         }
 
-        if self.stats_dialog.open {
+        if self.stats_dialog.visible {
             self.handle_stats_dialog_key(key);
             return false;
         }
@@ -3609,7 +3667,7 @@ impl App {
             return self.handle_history_search_overlay_key(key);
         }
 
-        if self.global_search.open {
+        if self.global_search.visible {
             return self.handle_global_search_key(key);
         }
 
@@ -3753,9 +3811,11 @@ impl App {
                 KeybindingResult::Action(action) => {
                     return self.handle_keybinding_action(&action);
                 }
-                KeybindingResult::Unbound | KeybindingResult::Pending => return false,
+                KeybindingResult::Pending => return false,
                 KeybindingResult::NoMatch if had_pending_chord => return false,
-                KeybindingResult::NoMatch => {}
+                KeybindingResult::Unbound | KeybindingResult::NoMatch => {
+                    // Fall through to hardcoded keybinding handlers
+                }
             }
         } else {
             self.keybindings.cancel_chord();
@@ -3794,7 +3854,7 @@ impl App {
                         }
                     });
                 }
-                self.notifications.push(
+                self.push_notification(
                     NotificationKind::Info,
                     "Recording\u{2026} (Alt+V to transcribe · Esc to cancel)".to_string(),
                     None,
@@ -3813,7 +3873,7 @@ impl App {
                         }
                     });
                 }
-                self.notifications.push(
+                self.push_notification(
                     NotificationKind::Info,
                     "Transcribing\u{2026}".to_string(),
                     Some(10),
@@ -3862,7 +3922,7 @@ impl App {
                 } else {
                     format!("Image attached: {}", label)
                 };
-                self.notifications.push(NotificationKind::Info, msg, Some(3));
+                self.push_notification(NotificationKind::Info, msg, Some(3));
             } else if let Some(text) = read_clipboard_text().or_else(read_primary_text) {
                 self.handle_paste_data(text);
                 self.refresh_prompt_input();
@@ -3927,31 +3987,37 @@ impl App {
                 // If text is selected, copy it to clipboard instead of quitting.
                 let sel_text = self.selection_text.borrow().clone();
                 if self.selection_anchor.is_some() && !sel_text.is_empty() {
+                    // Text is selected: copy to clipboard.
                     let copied = crate::image_paste::write_clipboard_text(&sel_text);
                     self.selection_anchor = None;
                     self.selection_focus = None;
                     *self.selection_text.borrow_mut() = String::new();
                     if copied {
-                        self.notifications.push(NotificationKind::Info, "Copied to clipboard".to_string(), Some(2));
+                        self.push_notification(NotificationKind::Info, "Copied to clipboard".to_string(), Some(2));
                     }
                 } else if self.is_streaming {
+                    // Cancel streaming.
                     self.is_streaming = false;
                     self.spinner_verb = None;
                     self.streaming_text.clear();
                     self.streaming_thinking.clear();
                     self.tool_use_blocks.clear();
                     self.status_message = Some("Cancelled.".to_string());
-                } else if !self.prompt_input.is_empty() {
-                    // Non-empty prompt — clear it (matches bash/readline Ctrl+C).
-                    self.prompt_input.clear();
-                    self.refresh_prompt_input();
+                    self.complete_current_turn_snapshot(true);
                 } else {
-                    self.should_quit = true;
+                    // No text selected and not streaming: handle exit confirmation sequence.
+                    // Always clear the prompt input on Ctrl+C.
+                    if !self.prompt_input.is_empty() {
+                        self.prompt_input.clear();
+                        self.refresh_prompt_input();
+                    }
+                    self.handle_exit_key_confirmation('c');
                 }
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl+D on empty input: trigger two-press exit confirmation (like Ctrl+C).
                 if self.prompt_input.is_empty() {
-                    self.should_quit = true;
+                    self.handle_exit_key_confirmation('d');
                 }
             }
 
@@ -4071,7 +4137,9 @@ impl App {
                 self.refresh_prompt_input();
             }
             KeyCode::Left => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                if key.modifiers.contains(KeyModifiers::SUPER) {
+                    self.prompt_input.cursor = 0;
+                } else if key.modifiers.contains(KeyModifiers::CONTROL) {
                     self.prompt_input.move_word_backward();
                 } else {
                     self.prompt_input.move_left();
@@ -4079,7 +4147,9 @@ impl App {
                 self.sync_legacy_prompt_fields();
             }
             KeyCode::Right => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                if key.modifiers.contains(KeyModifiers::SUPER) {
+                    self.prompt_input.cursor = self.prompt_input.text.len();
+                } else if key.modifiers.contains(KeyModifiers::CONTROL) {
                     self.prompt_input.move_word_forward();
                 } else {
                     self.prompt_input.move_right();
@@ -4094,15 +4164,17 @@ impl App {
                 self.prompt_input.cursor = self.prompt_input.text.len();
                 self.sync_legacy_prompt_fields();
             }
-            KeyCode::Tab if !self.is_streaming => {
+            KeyCode::Tab => {
                 if !self.prompt_input.suggestions.is_empty() {
-                    // Accept slash-command suggestion
+                    // Accept slash-command suggestion. Allowed while streaming
+                    // so the typeahead popup is interactive even when a turn
+                    // is in flight — Enter then queues the completed command.
                     if self.prompt_input.suggestion_index.is_none() {
                         self.prompt_input.suggestion_index = Some(0);
                     }
                     self.prompt_input.accept_suggestion();
                     self.refresh_prompt_input();
-                } else if self.prompt_input.is_empty() {
+                } else if !self.is_streaming && self.prompt_input.is_empty() {
                     // Cycle agent mode: build → plan → explore → build
                     self.cycle_agent_mode();
                     self.rustle_look_down();
@@ -4143,15 +4215,22 @@ impl App {
                 self.refresh_prompt_input();
             }
             KeyCode::Enter if !self.is_streaming => {
-                // If a slash-command suggestion is selected, accept it instead of submitting.
+                // If a suggestion is selected, accept it instead of submitting.
                 if !self.prompt_input.suggestions.is_empty()
                     && self.prompt_input.suggestion_index.is_some()
-                    && self.prompt_input.text.starts_with('/')
                 {
+                    let is_file_ref = self.prompt_input.suggestions
+                        .get(self.prompt_input.suggestion_index.unwrap())
+                        .map_or(false, |s| s.source == crate::prompt_input::TypeaheadSource::FileRef);
                     self.prompt_input.accept_suggestion();
+                    if is_file_ref {
+                        self.prompt_input.insert_char(' ');
+                    }
                     self.refresh_prompt_input();
                     return false;
                 }
+                // Auto-dismiss all error notifications when user sends a message
+                self.dismiss_error_notifications();
                 // New user input: snap back to bottom.
                 self.auto_scroll = true;
                 self.new_messages_while_scrolled = 0;
@@ -4181,7 +4260,7 @@ impl App {
             // when the cursor is already on the first/last visual row
             // (issue #149 follow-up).
             KeyCode::Up => {
-                if !self.prompt_input.suggestions.is_empty() && self.prompt_input.text.starts_with('/') {
+                if !self.prompt_input.suggestions.is_empty() && (self.prompt_input.text.starts_with('/') || self.prompt_input.has_active_file_ref()) {
                     self.prompt_input.suggestion_prev();
                 } else {
                     let area = self.last_input_area.get();
@@ -4195,7 +4274,7 @@ impl App {
                 self.refresh_prompt_input();
             }
             KeyCode::Down => {
-                if !self.prompt_input.suggestions.is_empty() && self.prompt_input.text.starts_with('/') {
+                if !self.prompt_input.suggestions.is_empty() && (self.prompt_input.text.starts_with('/') || self.prompt_input.has_active_file_ref()) {
                     self.prompt_input.suggestion_next();
                 } else {
                     let area = self.last_input_area.get();
@@ -4230,13 +4309,21 @@ impl App {
 
             _ => {}
         }
+
+        // Reset exit confirmation sequence if user presses any key other than Ctrl+C or Ctrl+D.
+        let is_exit_key = key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char(c) if c == 'c' || c == 'd' || c == 'C' || c == 'D');
+        if !is_exit_key {
+            self.last_exit_key_warning = None;
+            self.exit_key_sequence_start = None;
+        }
+
         false
     }
 
     fn current_key_context(&self) -> KeyContext {
-        if self.diff_viewer.open {
+        if self.diff_viewer.visible {
             KeyContext::DiffDialog
-        } else if self.agents_menu.open || self.mcp_view.open || self.stats_dialog.open {
+        } else if self.agents_menu.visible || self.mcp_view.visible || self.stats_dialog.visible {
             KeyContext::Select
         } else if self.import_config_dialog.visible {
             KeyContext::Confirmation
@@ -4507,7 +4594,7 @@ impl App {
                         self.messages.truncate(idx);
                         // Remove system annotations placed after the truncation point.
                         self.system_annotations.retain(|a| a.after_index <= idx);
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Success,
                             format!("Rewound to message #{}", idx),
                             Some(4),
@@ -4550,6 +4637,38 @@ impl App {
         false
     }
 
+    fn handle_exit_key_confirmation(&mut self, mut key_char: char) {
+        fn exit_message(key: char) -> &'static str {
+            if key == 'c' {
+                "Press Ctrl+C again to exit"
+            } else {
+                "Press Ctrl+D again to exit"
+            }
+        }
+
+        // Check if we have an active warning within the timeout
+        if let Some(warning_time) = self.last_exit_key_warning {
+            if warning_time.elapsed().as_secs_f64() <= 2.0 {
+                if self.exit_key_sequence_start == Some(key_char) {
+                    // Matching key - exit
+                    self.should_exit = true;
+                    self.last_exit_key_warning = None;
+                    self.exit_key_sequence_start = None;
+                    return;
+                }
+                if let Some(other_key) = self.exit_key_sequence_start {
+                    // Wrong key pressed - show message for the original key and reset timer
+                    key_char = other_key;
+                }
+            }
+        }
+
+        // Start new sequence (or show message for wrong key)
+        self.push_notification(NotificationKind::Info, exit_message(key_char).to_string(), Some(2));
+        self.last_exit_key_warning = Some(std::time::Instant::now());
+        self.exit_key_sequence_start = Some(key_char);
+    }
+
     fn handle_keybinding_action(&mut self, action: &str) -> bool {
         match action {
             "interrupt" => {
@@ -4561,13 +4680,33 @@ impl App {
                     self.tool_use_blocks.clear();
                     self.status_message = Some("Cancelled.".to_string());
                 } else {
-                    self.should_quit = true;
+                    // Handle exit confirmation: require two exit key presses within 2 seconds.
+                    // Always clear the prompt input on Ctrl+C.
+                    if !self.prompt_input.is_empty() {
+                        self.prompt_input.clear();
+                        self.refresh_prompt_input();
+                    }
+
+                    let elapsed = self.last_exit_key_warning.map(|t| t.elapsed().as_secs_f64());
+                    let is_valid = elapsed.map(|e| e <= 2.0).unwrap_or(false);
+
+                    if self.last_exit_key_warning.is_some() && is_valid {
+                        // A warning is active and within 2 seconds: exit.
+                        self.should_exit = true;
+                        self.last_exit_key_warning = None;
+                        self.exit_key_sequence_start = None;
+                    } else {
+                        // First press or timeout expired: show exit confirmation.
+                        self.push_notification(NotificationKind::Info, "Press Ctrl+C again to exit".to_string(), Some(2));
+                        self.last_exit_key_warning = Some(std::time::Instant::now());
+                        self.exit_key_sequence_start = Some('c');
+                    }
                 }
                 false
             }
             "exit" => {
                 if self.prompt_input.is_empty() {
-                    self.should_quit = true;
+                    self.should_exit = true;
                 }
                 false
             }
@@ -4585,29 +4724,53 @@ impl App {
                 self.refresh_global_search();
                 false
             }
-            "submit" => !self.is_streaming,
+            "submit" => {
+                if !self.is_streaming {
+                    if !self.prompt_input.suggestions.is_empty()
+                        && self.prompt_input.suggestion_index.is_some()
+                    {
+                        self.prompt_input.accept_suggestion();
+                        self.refresh_prompt_input();
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                }
+            }
             "historyPrev" => {
-                // Slash-command suggestions take priority over history.
+                // Suggestions (slash commands or file refs) take priority over cursor/history.
                 if !self.prompt_input.suggestions.is_empty()
-                    && self.prompt_input.text.starts_with('/')
+                    && (self.prompt_input.text.starts_with('/') || self.prompt_input.has_active_file_ref())
                 {
                     self.prompt_input.suggestion_prev();
                     self.refresh_prompt_input();
-                } else if !self.prompt_input.history.is_empty() {
-                    self.prompt_input.history_up();
+                } else {
+                    let width = self.last_input_area.get().width.saturating_sub(4) as usize;
+                    let moved = !self.prompt_input.text.is_empty()
+                        && self.prompt_input.move_visual_up(width);
+                    if !moved && !self.prompt_input.history.is_empty() {
+                        self.prompt_input.history_up();
+                    }
                     self.refresh_prompt_input();
                 }
                 false
             }
             "historyNext" => {
-                // Slash-command suggestions take priority over history.
+                // Suggestions (slash commands or file refs) take priority over cursor/history.
                 if !self.prompt_input.suggestions.is_empty()
-                    && self.prompt_input.text.starts_with('/')
+                    && (self.prompt_input.text.starts_with('/') || self.prompt_input.has_active_file_ref())
                 {
                     self.prompt_input.suggestion_next();
                     self.refresh_prompt_input();
-                } else if self.prompt_input.history_pos.is_some() {
-                    self.prompt_input.history_down();
+                } else {
+                    let width = self.last_input_area.get().width.saturating_sub(4) as usize;
+                    let moved = !self.prompt_input.text.is_empty()
+                        && self.prompt_input.move_visual_down(width);
+                    if !moved && self.prompt_input.history_pos.is_some() {
+                        self.prompt_input.history_down();
+                    }
                     self.refresh_prompt_input();
                 }
                 false
@@ -4809,10 +4972,6 @@ impl App {
                     self.refresh_prompt_input();
                 }
                 false
-            }
-            "sendMessage" => {
-                // Ctrl+M: Send message (alternative to Enter)
-                !self.is_streaming
             }
             "newline" => {
                 // Shift+Enter: insert a literal newline into the prompt.
@@ -5183,13 +5342,13 @@ impl App {
 
                 if let Some(text) = text {
                     if crate::message_copy::copy_to_clipboard(&text) {
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Info,
                             format!("Copied {} chars to clipboard.", text.len()),
                             Some(3),
                         );
                     } else {
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Warning,
                             "Failed to copy to clipboard.".to_string(),
                             Some(3),
@@ -5268,7 +5427,7 @@ impl App {
                     .to_string();
                 let img = PastedImage { path, label: label.clone(), dimensions: None };
                 self.prompt_input.add_image(img);
-                self.notifications.push(
+                self.push_notification(
                     crate::notifications::NotificationKind::Info,
                     format!("Image attached: {}", label),
                     Some(3),
@@ -5414,7 +5573,7 @@ impl App {
             || self.model_picker.visible
             || self.export_dialog.visible
             || self.settings_screen.visible
-            || self.stats_dialog.open
+            || self.stats_dialog.visible
             || self.context_viz.visible
             || self.session_browser.visible;
 
@@ -5670,7 +5829,7 @@ impl App {
                     if !sel_text.is_empty() {
                         let copied = crate::image_paste::write_clipboard_text(&sel_text);
                         if copied {
-                            self.notifications.push(
+                            self.push_notification(
                                 NotificationKind::Info,
                                 "Copied to clipboard".to_string(),
                                 Some(1),
@@ -5697,6 +5856,14 @@ impl App {
 
     /// Process a query event from the agentic loop.
     pub fn handle_query_event(&mut self, event: QueryEvent) {
+        // Auto-dismiss error modal when assistant responds
+        match &event {
+            QueryEvent::Stream(_) | QueryEvent::TurnComplete { .. } => {
+                self.dismiss_error_notifications();
+            }
+            _ => {}
+        }
+
         match event {
             QueryEvent::Stream(stream_evt) => {
                 if !self.is_streaming {
@@ -5844,7 +6011,7 @@ impl App {
                 self.invalidate_transcript();
                 let err_msg = format!("Error: {}", msg);
                 self.push_assistant_message(err_msg.clone());
-                self.status_message = Some(err_msg);
+                self.push_notification(NotificationKind::Error, err_msg, None);
             }
             QueryEvent::TokenWarning { state, pct_used } => {
                 // Push a notification for context window warnings (notification + threshold tracking).
@@ -5858,7 +6025,7 @@ impl App {
                     }
                     TokenWarningState::Warning if self.token_warning_threshold_shown < 80 => {
                         self.token_warning_threshold_shown = 80;
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Warning,
                             format!("Context window {:.0}% full. Consider /compact.", pct_used * 100.0),
                             Some(30),
@@ -5866,7 +6033,7 @@ impl App {
                     }
                     TokenWarningState::Critical if self.token_warning_threshold_shown < 95 => {
                         self.token_warning_threshold_shown = 95;
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Error,
                             format!("Context window {:.0}% full! Run /compact now.", pct_used * 100.0),
                             None,
@@ -5988,7 +6155,7 @@ impl App {
                         VoiceEvent::Error(msg) => {
                             self.voice_recording = false;
                             self.voice_event_rx = None;
-                            self.notifications.push(
+                            self.push_notification(
                                 NotificationKind::Warning,
                                 format!("Voice: {}", msg),
                                 Some(8),
@@ -5998,8 +6165,24 @@ impl App {
                 }
             }
 
-            // Draw the frame
-            terminal.draw(|f| render::render_app(f, self))?;
+            // Draw the frame, and immediately scan the *just-rendered*
+            // buffer for URL runs. ratatui swaps its two buffers at the
+            // end of draw(), so by the time draw() returns,
+            // `terminal.current_buffer_mut()` points at the empty next-frame
+            // slot. `CompletedFrame.buffer` is the one we actually want.
+            let osc8_hits = {
+                let completed = terminal.draw(|f| render::render_app(f, self))?;
+                crate::osc8::scan_buffer_for_urls(completed.buffer)
+            };
+
+            // Post-paint OSC 8 overlay: re-emit URL cells wrapped in
+            // hyperlink escapes so terminals that support OSC 8 (Windows
+            // Terminal, iTerm2, WezTerm, Kitty, Konsole, VS Code, …) make
+            // them Ctrl/Cmd-clickable. Failure is non-fatal — we never want
+            // an overlay glitch to kill the TUI.
+            if let Err(err) = crate::osc8::emit_hits(&osc8_hits) {
+                tracing::debug!(target: "osc8", "hyperlink overlay write failed: {err}");
+            }
 
             // Replay a key that was saved by try_detect_paste_burst in a
             // previous iteration (e.g. a modifier key that terminated a burst).
@@ -6061,12 +6244,14 @@ impl App {
                         // Honour `:q`/`:wq` from vim command-line mode
                         if self.prompt_input.vim_quit_requested {
                             self.prompt_input.vim_quit_requested = false;
-                            self.should_quit = true;
+                            self.should_exit = true;
                         }
-                        if self.should_quit {
+                        if self.should_exit {
                             return Ok(None);
                         }
                         if should_submit {
+                            // Dismiss any active error modal when the user sends a message
+                            self.dismiss_error_notifications();
                             // Check if this is a slash command that should open a UI screen
                             if crate::input::is_slash_command(&self.prompt_input.text) {
                                 let slash_input = self.prompt_input.text.clone();
@@ -6302,7 +6487,7 @@ mod tests {
     fn test_mcp_subcommand_is_not_intercepted() {
         let mut app = make_app();
         assert!(!app.intercept_slash_command_with_args("mcp", "auth mcphub"));
-        assert!(!app.mcp_view.open);
+        assert!(!app.mcp_view.visible);
     }
 
     #[test]
@@ -6318,9 +6503,9 @@ mod tests {
     #[test]
     fn test_exit_slash_command_sets_quit_flag() {
         let mut app = make_app();
-        assert!(!app.should_quit);
+        assert!(!app.should_exit);
         assert!(app.intercept_slash_command("exit"));
-        assert!(app.should_quit);
+        assert!(app.should_exit);
     }
 
     #[test]
