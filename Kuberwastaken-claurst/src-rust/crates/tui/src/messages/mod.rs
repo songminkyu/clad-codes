@@ -27,7 +27,12 @@ pub use markdown_enhanced::{
 };
 
 /// Context passed to all renderers.
-pub struct RenderContext {
+///
+/// `tool_names` and `expanded_thinking` are borrowed rather than owned: the
+/// transcript builder holds a single copy of each per render pass and lends it
+/// to every message renderer, so the hot path no longer clones a `HashMap` and
+/// a `HashSet` for every assistant message (see issue #222).
+pub struct RenderContext<'a> {
     /// Current terminal width (for word-wrap decisions).
     pub width: u16,
     /// Whether syntax highlighting is enabled.
@@ -36,19 +41,26 @@ pub struct RenderContext {
     pub show_thinking: bool,
     /// Maps `tool_use_id` → `tool_name` so ToolResult blocks can dispatch to
     /// the correct specialized renderer (e.g. Bash output vs. generic result).
-    pub tool_names: HashMap<String, String>,
+    pub tool_names: &'a HashMap<String, String>,
     /// Set of thinking block content hashes that are expanded per-block.
-    pub expanded_thinking: std::collections::HashSet<u64>,
+    pub expanded_thinking: &'a std::collections::HashSet<u64>,
 }
 
-impl Default for RenderContext {
+/// Shared empty collections so `RenderContext::default()` can hand out
+/// `'static` borrows without allocating.
+static EMPTY_TOOL_NAMES: std::sync::LazyLock<HashMap<String, String>> =
+    std::sync::LazyLock::new(HashMap::new);
+static EMPTY_EXPANDED_THINKING: std::sync::LazyLock<std::collections::HashSet<u64>> =
+    std::sync::LazyLock::new(std::collections::HashSet::new);
+
+impl Default for RenderContext<'static> {
     fn default() -> Self {
         Self {
             width: 80,
             highlight: true,
             show_thinking: false,
-            tool_names: HashMap::new(),
-            expanded_thinking: std::collections::HashSet::new(),
+            tool_names: &EMPTY_TOOL_NAMES,
+            expanded_thinking: &EMPTY_EXPANDED_THINKING,
         }
     }
 }
@@ -277,7 +289,7 @@ fn normalize_at_tokens(
         if trimmed.starts_with('@') && trimmed.len() > 1 {
             let mut path_part = trimmed[1..].to_string();
             // Strip trailing punctuation (same logic as parse_at_refs)
-            while path_part.len() > 0 && path_part.ends_with(|c: char| c.is_ascii_punctuation()) && !path_part.ends_with('/') {
+            while !path_part.is_empty() && path_part.ends_with(|c: char| c.is_ascii_punctuation()) && !path_part.ends_with('/') {
                 path_part.pop();
             }
             let punct_suffix = &trimmed[1 + path_part.len()..];
@@ -1182,7 +1194,7 @@ pub fn render_tool_result_rejected(tool_name: &str, reason: &str) -> Vec<Line<'s
 pub fn render_attachment_message(kind_label: &str, content: &str, width: u16) -> Vec<Line<'static>> {
     // Reserve space for the "  [label] " prefix and a small margin.
     let prefix_len = kind_label.len() + 6; // "  [label] "
-    let preview_max = (width as usize).saturating_sub(prefix_len).max(20).min(120);
+    let preview_max = (width as usize).saturating_sub(prefix_len).clamp(20, 120);
     let preview: String = content.chars().take(preview_max).collect();
     let preview = if content.chars().count() > preview_max {
         format!("{preview}\u{2026}")
@@ -1452,9 +1464,14 @@ fn truncate_user_prompt_text(text: &str) -> String {
         return text.to_string();
     }
 
-    let head = &text[..TRUNCATE_USER_PROMPT_HEAD_CHARS.min(text.len())];
-    let tail_start = text.len().saturating_sub(TRUNCATE_USER_PROMPT_TAIL_CHARS);
-    let tail = &text[tail_start..];
+    // The *_CHARS constants count characters, not bytes. Slice by chars so a
+    // multibyte codepoint straddling the cut never panics (#221).
+    let head: String = text.chars().take(TRUNCATE_USER_PROMPT_HEAD_CHARS).collect();
+    let tail: String = {
+        let total_chars = text.chars().count();
+        let skip = total_chars.saturating_sub(TRUNCATE_USER_PROMPT_TAIL_CHARS);
+        text.chars().skip(skip).collect()
+    };
     let hidden_lines = text
         .chars()
         .take(TRUNCATE_USER_PROMPT_HEAD_CHARS)
@@ -1800,9 +1817,7 @@ fn extract_goal_objective_from_args(args: &str) -> Option<String> {
     // doesn't include the budget flag.
     let rest = if let Some(after_flag) = trimmed.strip_prefix("--tokens") {
         let after_flag = after_flag.trim_start();
-        after_flag
-            .splitn(2, char::is_whitespace)
-            .nth(1)
+        after_flag.split_once(char::is_whitespace).map(|x| x.1)
             .unwrap_or("")
             .trim()
     } else {
@@ -2325,7 +2340,7 @@ mod tests {
     fn bash_tool_result_renders_as_bash_output_with_tool_names_context() {
         let mut tool_names = HashMap::new();
         tool_names.insert("tu-bash-1".to_string(), "Bash".to_string());
-        let ctx = RenderContext { tool_names, ..Default::default() };
+        let ctx = RenderContext { tool_names: &tool_names, ..Default::default() };
 
         let msg = Message::user_blocks(vec![ContentBlock::ToolResult {
             tool_use_id: "tu-bash-1".to_string(),
@@ -2637,5 +2652,20 @@ mod tests {
         let a_text: Vec<_> = a.iter().map(|l| line_text(l)).collect();
         let b_text: Vec<_> = b.iter().map(|l| line_text(l)).collect();
         assert_eq!(a_text, b_text);
+    }
+
+    #[test]
+    fn truncate_user_prompt_text_handles_multibyte_over_limit() {
+        // >10K chars of a 3-byte codepoint. Pre-fix, the *_CHARS constants were
+        // used as BYTE offsets, slicing mid-codepoint (2500 % 3 == 1) (#221).
+        let text = "\u{2705}".repeat(11_000); // ✅ (3 bytes), 11K chars > 10K limit
+        let out = truncate_user_prompt_text(&text);
+        assert!(out.starts_with('\u{2705}'));
+        assert!(out.contains("lines"));
+        assert!(out.chars().count() < text.chars().count());
+
+        // Mixed multibyte content around both cut points must also be safe.
+        let mixed = "😀é✅ん".repeat(3_000);
+        let _ = truncate_user_prompt_text(&mixed); // no panic == pass
     }
 }

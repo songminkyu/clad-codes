@@ -21,15 +21,14 @@ use crate::overlays::{
 
 /// The role of an agent in the manager-executor architecture.
 #[derive(Debug, Clone, PartialEq)]
+#[derive(Default)]
 pub enum AgentRole {
+    #[default]
     Normal,
     Manager,
     Executor { parent_id: String },
 }
 
-impl Default for AgentRole {
-    fn default() -> Self { AgentRole::Normal }
-}
 
 /// The current status of a sub-agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +157,12 @@ pub struct AgentEditorState {
     pub selected_field: AgentEditorField,
     pub error: Option<String>,
     pub saved_message: Option<String>,
+}
+
+impl Default for AgentEditorState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AgentEditorState {
@@ -394,7 +399,7 @@ impl Default for AgentsMenuState {
 pub fn load_agent_definitions(project_root: &std::path::Path) -> Vec<AgentDefinition> {
     let mut defs = Vec::new();
     let dirs = [
-        dirs::home_dir().map(|h| h.join(".claurst").join("agents")),
+        Some(claurst_core::config::Settings::config_dir().join("agents")),
         Some(project_root.join(".claurst").join("agents")),
     ];
 
@@ -403,7 +408,7 @@ pub fn load_agent_definitions(project_root: &std::path::Path) -> Vec<AgentDefini
         let Ok(entries) = std::fs::read_dir(dir) else { continue };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "md") {
+            if path.extension().is_some_and(|e| e == "md") {
                 if let Some(def) = parse_agent_def(&path) {
                     defs.push(def);
                 }
@@ -418,10 +423,10 @@ fn parse_agent_def(path: &std::path::Path) -> Option<AgentDefinition> {
     let content = std::fs::read_to_string(path).ok()?;
     let stem = path.file_stem()?.to_string_lossy().to_string();
 
-    let (name, model, memory, description, tools, instructions) = if content.starts_with("---") {
-        let end = content[3..].find("\n---")? + 3;
-        let front = &content[3..end];
-        let body = content[end + 4..].trim().to_string();
+    let (name, model, memory, description, tools, instructions) = if let Some(after) = content.strip_prefix("---") {
+        let end = after.find("\n---")?;
+        let front = &after[..end];
+        let body = after[end + 4..].trim().to_string();
         let name = extract_yaml_str(front, "name").unwrap_or_else(|| stem.clone());
         let model = extract_yaml_str(front, "model");
         let memory = extract_yaml_str(front, "memory_scope")

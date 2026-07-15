@@ -13,7 +13,7 @@ If you need the most polished daily-driver experience for a specific non-Claude 
 
 ## OpenAI-compatible routing basics
 
-Set `OPENAI_BASE_URL` to the server’s `/v1` endpoint and set `OPENAI_API_KEY` to either the required token or a harmless placeholder for local servers that expect an Authorization header. The model name must match what the server exposes.
+Set `OPENAI_BASE_URL` to the server’s `/v1` endpoint and set `OPENAI_API_KEY` to either the required token or a harmless placeholder for local servers that expect an Authorization header. Authless local/private OpenAI-compatible servers can leave `OPENAI_API_KEY` unset. The model name must match what the server exposes.
 
 ```bash
 export OPENAI_BASE_URL="http://127.0.0.1:11434/v1"
@@ -24,8 +24,8 @@ claw --model "qwen3:latest" prompt "Reply exactly HELLO_WORLD_123"
 Routing notes:
 
 - Use the `openai/` prefix for OpenAI-compatible gateways when you need prefix routing to win over ambient Anthropic credentials, for example `--model "openai/gpt-4.1-mini"` with OpenRouter.
-- For local servers, prefer the exact model ID reported by the server (`qwen3:latest`, `llama3.2`, `Qwen/Qwen2.5-Coder-7B-Instruct`, etc.). If your local gateway exposes slash-containing IDs, use that exact slug.
-- If you have multiple provider keys in your environment, remove unrelated keys while smoke-testing a local route or choose a model prefix that unambiguously selects the intended provider.
+- For local servers, prefer the exact model ID reported by the server (`qwen3:latest`, `llama3.2`, etc.). If your local gateway exposes slash-containing IDs, prefix the exact slug with `local/` so Claw routes through OpenAI-compatible transport while sending the rest verbatim, for example `--model "local/Qwen/Qwen2.5-Coder-7B-Instruct"`.
+- If you have multiple provider keys in your environment, `OPENAI_BASE_URL` plus local-looking tags such as `llama3.2` or `qwen2.5-coder:7b` selects the local OpenAI-compatible route; use `local/` for slash-containing local IDs.
 - Tool workflows need model/server support for OpenAI-compatible tool calls. Plain prompt smoke tests can pass even when slash/tool workflows still fail because the server returns an incompatible tool-call shape.
 
 ## Raw `/v1/chat/completions` smoke test
@@ -57,12 +57,13 @@ ollama serve
 In another shell:
 
 ```bash
-export OPENAI_BASE_URL="http://127.0.0.1:11434/v1"
-export OPENAI_API_KEY="local-dev-token"
+export OLLAMA_HOST="http://127.0.0.1:11434"
 claw --model "qwen3:latest" prompt "Reply exactly HELLO_WORLD_123"
 ```
 
-If Ollama is running without auth and your build accepts authless local OpenAI-compatible servers, `unset OPENAI_API_KEY` is also acceptable. Use a placeholder token rather than a real cloud API key for local testing.
+`OLLAMA_HOST` is the preferred env var for Ollama. Claw routes all models to the local OpenAI-compatible endpoint automatically when this is set, and no API key is needed. The older `OPENAI_BASE_URL` + `OPENAI_API_KEY` workaround is also supported for existing setups.
+
+If Ollama is running without auth, `unset OPENAI_API_KEY` is acceptable. Use a placeholder token rather than a real cloud API key if your local server requires an Authorization header.
 
 ## llama.cpp server
 
@@ -95,6 +96,27 @@ export OPENAI_BASE_URL="http://127.0.0.1:8000/v1"
 export OPENAI_API_KEY="local-dev-token"
 claw --model "Qwen/Qwen2.5-Coder-7B-Instruct" prompt "Reply exactly HELLO_WORLD_123"
 ```
+
+## mlx-lm (Apple Silicon)
+
+On Apple Silicon, [mlx-lm](https://github.com/ml-explore/mlx-lm) gives meaningfully faster inference than llama.cpp-based backends for models under roughly 14B parameters.
+
+Install and start the server:
+
+```bash
+pipx install mlx-lm
+mlx_lm.server --model mlx-community/Qwen2.5-Coder-7B-Instruct-4bit --port 8080
+```
+
+Then route Claw to it:
+
+```bash
+export OPENAI_BASE_URL="http://127.0.0.1:8080/v1"
+export OPENAI_API_KEY="local-dev-token"
+claw --model "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+mlx-lm serves models under their full Hugging Face repo ID. Use the exact `id` field from `curl $OPENAI_BASE_URL/models` for `--model`. A bare name like `qwen2.5-coder-7b-instruct` will fail model resolution before the request ever reaches the server.
 
 ## Local skills install from disk
 
@@ -148,3 +170,5 @@ Offline install checklist:
 | Plain prompt works but tools fail | Confirm the model/server supports OpenAI-compatible tool calls and response shapes. |
 | Skill says installed but `/skills <name>` fails | Check `/skills list` for the discovered name and source; verify provider credentials separately with `claw doctor`. |
 | A local docs/log file contains secrets | Redact it before using `@path` file context or attaching it to an issue. |
+| `404 Repository Not Found` from huggingface.co when running `claw` | The `--model` value isn't a full Hugging Face repo ID. Use the exact `id` field from `curl $OPENAI_BASE_URL/models`, not a bare model name. |
+| mlx-lm output includes a trailing `<|im_end|>`, or generation runs long | Unfixed mlx-lm bug ([#973](https://github.com/ml-explore/mlx-lm/issues/973), closed without a merge). Set `eos_token_id` in the cached `generation_config.json` (or `config.json`) to the real end-of-turn token. |

@@ -157,9 +157,20 @@ pub fn provider_from_config(
             Some(Arc::new(provider))
         }
         "google" => api_key.map(|key| Arc::new(GoogleProvider::new(key)) as Arc<dyn LlmProvider>),
-        "minimax" => {
-            api_key.map(|key| Arc::new(MinimaxProvider::new(key)) as Arc<dyn LlmProvider>)
-        }
+        "minimax" => api_key.map(|key| {
+            let mut provider = MinimaxProvider::new(key);
+            if let Some(base) = api_base {
+                provider = provider.with_base_url(base);
+            }
+            if let Some(service_tier) = provider_cfg
+                .and_then(|config| config.options.get("service_tier"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+            {
+                provider = provider.with_service_tier(service_tier);
+            }
+            Arc::new(provider) as Arc<dyn LlmProvider>
+        }),
         "azure" => {
             let resource_name = provider_cfg
                 .and_then(|provider| provider.options.get("resource_name"))
@@ -364,6 +375,12 @@ impl ProviderRegistry {
         config: &claurst_core::config::Config,
         anthropic_config: ClientConfig,
     ) -> Self {
+        // Apply the user-configured request timeout (issue #175) before any
+        // provider HTTP clients are built, so they all honour it. Uses the
+        // active provider's resolved value (per-provider override or global).
+        crate::set_request_timeout_secs(
+            config.resolve_request_timeout_secs(config.selected_provider_id()),
+        );
         let mut registry = Self::from_environment_with_auth_store(anthropic_config);
         let active_provider = config.selected_provider_id();
 
@@ -494,7 +511,7 @@ impl ProviderRegistry {
         // env vars.
         let auth_store = claurst_core::AuthStore::load();
 
-        for (provider_id, _cred) in &auth_store.credentials {
+        for provider_id in auth_store.credentials.keys() {
             let pid = claurst_core::ProviderId::new(provider_id.as_str());
             // Skip if already registered from env vars.
             if registry.get(&pid).is_some() {

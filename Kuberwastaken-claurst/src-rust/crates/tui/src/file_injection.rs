@@ -55,9 +55,9 @@ pub fn parse_at_refs(text: &str, cwd: &Path, max_size_kb: usize) -> (Vec<AtFileR
         }
 
         // Expand ~ to home directory
-        let expanded_path = if path_part.starts_with("~/") {
+        let expanded_path = if let Some(rest) = path_part.strip_prefix("~/") {
             if let Some(home) = dirs::home_dir() {
-                home.join(&path_part[2..])
+                home.join(rest)
             } else {
                 cwd.join(path_part)
             }
@@ -84,7 +84,7 @@ pub fn parse_at_refs(text: &str, cwd: &Path, max_size_kb: usize) -> (Vec<AtFileR
         }
 
         let size_kb = match fs::metadata(&expanded_path) {
-            Ok(meta) => (meta.len() as usize + 1023) / 1024, // Round up to KB
+            Ok(meta) => (meta.len() as usize).div_ceil(1024), // Round up to KB
             Err(e) => {
                 oversized.push(AtFileRef {
                     token: token.clone(),
@@ -137,7 +137,7 @@ pub fn parse_at_refs(text: &str, cwd: &Path, max_size_kb: usize) -> (Vec<AtFileR
 
 /// Build XML file blocks from a slice of resolved refs.
 /// Returns a string like:
-/// ```
+/// ```text
 /// <file path="src/main.rs">
 /// ...contents...
 /// </file>

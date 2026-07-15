@@ -61,6 +61,7 @@ pub struct SettingsScreen {
     pub verbose: bool,
     pub cursor_blink_enabled: bool,
     pub auto_copy_enabled: bool,
+    pub mouse_capture: bool,
     pub show_cwd: bool,
     pub show_git_branch: bool,
     pub compact_threshold: String,
@@ -94,6 +95,7 @@ impl SettingsScreen {
             verbose: false,
             cursor_blink_enabled: false,
             auto_copy_enabled: false,
+            mouse_capture: true,
             show_cwd: false,
             show_git_branch: false,
             compact_threshold: "95".to_string(),
@@ -122,6 +124,7 @@ impl SettingsScreen {
         self.verbose = self.settings_snapshot.config.verbose;
         self.cursor_blink_enabled = self.settings_snapshot.config.cursor_blink_enabled;
         self.auto_copy_enabled = self.settings_snapshot.auto_copy_on_highlight;
+        self.mouse_capture = self.settings_snapshot.config.mouse_capture_enabled();
         self.show_cwd = self.settings_snapshot.show_cwd;
         self.show_git_branch = self.settings_snapshot.show_git_branch;
         self.compact_threshold = self.settings_snapshot.config.compact_threshold.to_string();
@@ -328,6 +331,13 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
             description: "Automatically copy highlighted text to clipboard.",
             kind: SettingKind::Bool,
             value: if screen.auto_copy_enabled { "true" } else { "false" }.to_string(),
+        },
+        SettingsEntry {
+            key: "mouse_capture",
+            label: "Mouse capture",
+            description: "Capture the mouse for scroll/right-click/drag-select. Turn off for native terminal text selection. Takes effect on next session.",
+            kind: SettingKind::Bool,
+            value: if screen.mouse_capture { "true" } else { "false" }.to_string(),
         },
         SettingsEntry {
             key: "show_cwd",
@@ -733,6 +743,13 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen) {
                         screen.settings_snapshot.auto_copy_on_highlight = new_value;
                         let _ = screen.settings_snapshot.save_sync();
                     }
+                    "mouse_capture" => {
+                        screen.mouse_capture = new_value;
+                        // Persist only the off state; on is the default, so clear the key.
+                        screen.settings_snapshot.config.mouse_capture =
+                            if new_value { None } else { Some(false) };
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
                     "show_cwd" => {
                         screen.show_cwd = new_value;
                         screen.settings_snapshot.show_cwd = new_value;
@@ -825,7 +842,7 @@ mod tests {
 
     #[test]
     fn search_filters_entries_correctly() {
-        let mut screen = SettingsScreen::new();
+        let screen = SettingsScreen::new();
         let all = all_entries(&screen);
         let filtered: Vec<_> = all
             .iter()
@@ -857,7 +874,7 @@ mod tests {
         screen.output_style = "default".to_string();
 
         // Simulate cycling through all options
-        let options = vec!["default", "concise", "explanatory", "learning"];
+        let options = ["default", "concise", "explanatory", "learning"];
         let mut idx = options.iter().position(|&o| o == "default").unwrap();
 
         idx = (idx + 1) % options.len();

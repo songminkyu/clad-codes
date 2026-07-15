@@ -242,6 +242,85 @@ Native Cohere API adapter.
 
 ---
 
+### MiniMax
+
+The built-in provider uses the Anthropic-compatible Messages API.
+
+**Authentication:** `MINIMAX_API_KEY` environment variable, or set `api_key` in `settings.json`.
+
+**Default model:** `MiniMax-M3`
+
+| Model | Context window | Input modalities | Thinking |
+|---|---:|---|---|
+| `MiniMax-M3` | 1,000,000 | Text, image, video | Off by default; supports `adaptive` and `disabled` |
+| `MiniMax-M2.7` | 204,800 | Text | Always on |
+
+The catalog retains the model's complete input-modality metadata. Claurst's built-in attachment flow currently sends text and image blocks.
+
+Pricing is in USD per million tokens:
+
+| Model | Service tier | Input range | Input | Output | Cache read | Cache write |
+|---|---|---:|---:|---:|---:|---:|
+| `MiniMax-M3` | Standard | Up to 512k | $0.30 | $1.20 | $0.06 | Not published |
+| `MiniMax-M3` | Standard | Over 512k | $0.60 | $2.40 | $0.12 | Not published |
+| `MiniMax-M3` | Priority | Up to 512k | $0.45 | $1.80 | $0.09 | Not published |
+| `MiniMax-M3` | Priority | Over 512k | $0.90 | $3.60 | $0.18 | Not published |
+| `MiniMax-M2.7` | Standard | All requests | $0.30 | $1.20 | $0.06 | $0.375 |
+
+| Protocol | Global base URL | China base URL | Path added by Claurst |
+|---|---|---|---|
+| Anthropic | `https://api.minimax.io/anthropic` | `https://api.minimaxi.com/anthropic` | `/v1/messages` |
+| OpenAI-compatible | `https://api.minimax.io/v1` | `https://api.minimaxi.com/v1` | `/chat/completions` |
+
+The built-in `minimax` provider uses the Anthropic row. To use the China endpoint, set `MINIMAX_BASE_URL` or configure `api_base`:
+
+```json
+{
+  "provider": "minimax",
+  "model": "MiniMax-M3",
+  "providers": {
+    "minimax": {
+      "api_key": "...",
+      "api_base": "https://api.minimaxi.com/anthropic"
+    }
+  }
+}
+```
+
+MiniMax-M3 uses the standard service tier by default. To request priority admission, set `service_tier` in the provider options:
+
+```json
+{
+  "provider": "minimax",
+  "model": "MiniMax-M3",
+  "providers": {
+    "minimax": {
+      "api_key": "...",
+      "options": {
+        "service_tier": "priority"
+      }
+    }
+  }
+}
+```
+
+For the OpenAI-compatible protocol, use the custom provider with the corresponding `/v1` base URL:
+
+```json
+{
+  "provider": "custom-openai",
+  "model": "MiniMax-M3",
+  "providers": {
+    "custom-openai": {
+      "api_key": "...",
+      "api_base": "https://api.minimax.io/v1"
+    }
+  }
+}
+```
+
+---
+
 ### Ollama
 
 Connects to a locally running Ollama instance. No API key required.

@@ -489,10 +489,10 @@ pub fn parse_unified_diff(text: &str) -> Vec<FileDiffStats> {
                 if let Some(f) = current_file.as_mut() {
                     f.removed += 1;
                 }
-            } else if raw_line.starts_with(' ') {
+            } else if let Some(rest) = raw_line.strip_prefix(' ') {
                 hunk.lines.push(DiffLine {
                     kind: DiffLineKind::Context,
-                    content: raw_line[1..].to_string(),
+                    content: rest.to_string(),
                     old_line_no: Some(old_line),
                     new_line_no: Some(new_line),
                 });
@@ -772,11 +772,9 @@ fn render_diff_detail(state: &DiffViewerState, area: Rect, buf: &mut Buffer) {
         let thumb_size = ((bar_h * bar_h) / total_lines).max(1).min(bar_h);
         // Thumb position
         let scroll_range = total_lines.saturating_sub(bar_h);
-        let thumb_top = if scroll_range > 0 {
-            (scroll * (bar_h.saturating_sub(thumb_size))) / scroll_range
-        } else {
-            0
-        };
+        let thumb_top = (scroll * (bar_h.saturating_sub(thumb_size)))
+            .checked_div(scroll_range)
+            .unwrap_or(0);
 
         for row in 0..bar_h {
             let y = inner.y + row as u16;
@@ -784,7 +782,7 @@ fn render_diff_detail(state: &DiffViewerState, area: Rect, buf: &mut Buffer) {
                 '\u{25b2}'  // ▲
             } else if row == bar_h - 1 {
                 '\u{25bc}'  // ▼
-            } else if row >= thumb_top + 1 && row < thumb_top + thumb_size + 1 {
+            } else if row > thumb_top && row < thumb_top + thumb_size + 1 {
                 '\u{2588}'  // █ (thumb)
             } else {
                 '\u{2502}'  // │ (track)

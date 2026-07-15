@@ -184,6 +184,10 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // fallback is not needed there. Keep it as a compatibility belt-and-braces
         // for terminals that do not support the protocol.
         ("ctrl+j", "newline", KeyContext::Chat),
+        // Alt+Enter is the other conventional newline escape (many terminals,
+        // e.g. legacy iTerm2 / xterm modifyOtherKeys, send Alt+Enter as
+        // \x1b\r). Kept as an additional fallback alongside Shift+Enter/Ctrl+J.
+        ("alt+enter", "newline", KeyContext::Chat),
 
         // Line start/end navigation
         ("home", "goLineStart", KeyContext::Chat),
@@ -233,6 +237,10 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // Indentation
         ("tab", "indent", KeyContext::Chat),
         ("shift+tab", "reverseIndent", KeyContext::Chat),
+
+        // Paste placeholders — expand `[Pasted text #N ...]` back into the
+        // full pasted body (clicking the placeholder does the same).
+        ("alt+e", "expandPaste", KeyContext::Chat),
 
         // Scrolling
         ("pageup", "scrollUp", KeyContext::Chat),
@@ -715,16 +723,22 @@ mod tests {
     }
 
     #[test]
-    fn test_default_bindings_contains_ctrl_c() {
+    fn test_default_bindings_omit_ctrl_c_and_ctrl_d() {
+        // Ctrl+C and Ctrl+D are intentionally NOT in the resolver table: since
+        // commit 270947d they are handled directly in handle_key_event for the
+        // alternating two-press exit/interrupt confirmation. The resolver must
+        // not shadow that special handling, so the table must omit them.
         let bindings = default_bindings();
-        let ctrl_c = bindings.iter().find(|b| {
-            b.chord.len() == 1
-                && b.chord[0].ctrl
-                && b.chord[0].key == "c"
-                && b.context == KeyContext::Global
-        });
-        assert!(ctrl_c.is_some());
-        assert_eq!(ctrl_c.unwrap().action.as_deref(), Some("interrupt"));
+        let has = |key: &str| {
+            bindings.iter().any(|b| {
+                b.chord.len() == 1
+                    && b.chord[0].ctrl
+                    && b.chord[0].key == key
+                    && b.context == KeyContext::Global
+            })
+        };
+        assert!(!has("c"), "ctrl+c must be handled directly, not via the resolver");
+        assert!(!has("d"), "ctrl+d must be handled directly, not via the resolver");
     }
 
     #[test]
@@ -756,9 +770,11 @@ mod tests {
     fn test_resolver_simple_action() {
         let user = UserKeybindings::default();
         let mut resolver = KeybindingResolver::new(&user);
-        let ks = parse_keystroke("ctrl+c").unwrap();
+        // ctrl+l is a single-chord Global binding ("redraw"); ctrl+c is no
+        // longer resolver-routed (see test_default_bindings_omit_ctrl_c_and_ctrl_d).
+        let ks = parse_keystroke("ctrl+l").unwrap();
         let result = resolver.process(ks, &KeyContext::Global);
-        assert!(matches!(result, KeybindingResult::Action(ref a) if a == "interrupt"));
+        assert!(matches!(result, KeybindingResult::Action(ref a) if a == "redraw"));
     }
 
     #[test]
@@ -832,6 +848,31 @@ mod tests {
         });
         assert!(ctrl_j.is_some(), "ctrl+j binding not found");
         assert_eq!(ctrl_j.unwrap().action.as_deref(), Some("newline"));
+    }
+
+    #[test]
+    fn test_shift_enter_and_alt_enter_map_to_newline() {
+        // The multi-line composing fallbacks (#224): Shift+Enter (kitty),
+        // plus Alt+Enter and Ctrl+J for terminals that can't distinguish
+        // Shift+Enter from a bare Enter.
+        let bindings = default_bindings();
+        let find = |ctrl: bool, alt: bool, shift: bool, key: &str| {
+            bindings
+                .iter()
+                .find(|b| {
+                    b.chord.len() == 1
+                        && b.chord[0].ctrl == ctrl
+                        && b.chord[0].alt == alt
+                        && b.chord[0].shift == shift
+                        && b.chord[0].key == key
+                        && b.context == KeyContext::Chat
+                })
+                .and_then(|b| b.action.as_deref())
+        };
+        assert_eq!(find(false, false, true, "enter"), Some("newline"), "shift+enter");
+        assert_eq!(find(false, true, false, "enter"), Some("newline"), "alt+enter");
+        // And a bare Enter still submits.
+        assert_eq!(find(false, false, false, "enter"), Some("submit"), "enter");
     }
 
     #[test]
