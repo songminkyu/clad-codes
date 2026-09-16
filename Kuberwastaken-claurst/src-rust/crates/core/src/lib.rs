@@ -219,6 +219,13 @@ pub mod types {
             id: String,
             name: String,
             input: Value,
+            /// Opaque, provider-supplied metadata that must be echoed back
+            /// verbatim on subsequent turns for the tool call to be accepted.
+            /// Currently carries Google Gemini's `thoughtSignature` for thinking
+            /// models (issue #311); `None` for every other provider. Persisted
+            /// with the session so it survives save/load.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            thought_signature: Option<String>,
         },
         ToolResult {
             tool_use_id: String,
@@ -606,7 +613,7 @@ pub mod types {
 pub mod config {
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     // ---- Hook configuration ----------------------------------------------
 
@@ -941,6 +948,67 @@ pub mod config {
         }
     }
 
+    // ---- ModelOverride ---------------------------------------------------
+
+    /// User-supplied metadata override for a single model, keyed by the
+    /// `"provider/model"` string in [`Config::model_overrides`].
+    ///
+    /// Every field is optional: a `Some` value takes precedence over the
+    /// models.dev catalog entry (and over any built-in default), while a `None`
+    /// leaves the catalog value untouched. When the keyed model is absent from
+    /// the catalog entirely (a self-hosted alias, or an id models.dev does not
+    /// know), the override is materialised into a synthetic registry entry so
+    /// the model picker, token warnings, and auto-compact thresholds size it
+    /// correctly instead of mismatching it to an unrelated catalog model.
+    ///
+    /// Field names accept both camelCase (`contextWindow`) and snake_case
+    /// (`context_window`) so the override reads naturally whether it lives at the
+    /// top level of `settings.json` or under the nested `config` block.
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    pub struct ModelOverride {
+        /// Total context window size in tokens.
+        #[serde(
+            default,
+            rename = "contextWindow",
+            alias = "context_window",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub context_window: Option<u32>,
+        /// Maximum tokens the model can emit in a single response.
+        #[serde(
+            default,
+            rename = "maxOutputTokens",
+            alias = "max_output_tokens",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub max_output_tokens: Option<u32>,
+        /// Human-readable display name shown in the model picker.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        /// First public availability (ISO 8601 date), drives date-DESC listing.
+        #[serde(
+            default,
+            rename = "releaseDate",
+            alias = "release_date",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub release_date: Option<String>,
+        /// Lifecycle status string (`"active"`, `"beta"`, …).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    impl ModelOverride {
+        /// Whether this override carries no data (every field is `None`).
+        pub fn is_empty(&self) -> bool {
+            self.context_window.is_none()
+                && self.max_output_tokens.is_none()
+                && self.name.is_none()
+                && self.release_date.is_none()
+                && self.status.is_none()
+        }
+    }
+
     // ---- Config ----------------------------------------------------------
 
     /// Top-level configuration values, merged from CLI args + settings file + env.
@@ -982,6 +1050,11 @@ pub mod config {
         /// Per-provider configurations
         #[serde(default)]
         pub provider_configs: HashMap<String, ProviderConfig>,
+        /// User-supplied model metadata overrides, keyed by `"provider/model"`.
+        /// Take precedence over the models.dev catalog (copied from Settings on
+        /// load; see [`ModelOverride`]).
+        #[serde(default, rename = "modelOverrides", alias = "model_overrides")]
+        pub model_overrides: HashMap<String, ModelOverride>,
         /// Formatter configurations (copied from Settings on load).
         #[serde(default)]
         pub formatter: HashMap<String, FormatterConfig>,
@@ -1179,6 +1252,12 @@ pub mod config {
         /// Per-provider configurations stored in settings.json.
         #[serde(default)]
         pub providers: HashMap<String, ProviderConfig>,
+        /// User-supplied model metadata overrides stored in settings.json,
+        /// keyed by `"provider/model"`. Merged into
+        /// [`Config::model_overrides`] by [`Settings::effective_config`] and
+        /// take precedence over the models.dev catalog.
+        #[serde(default, rename = "modelOverrides", alias = "model_overrides")]
+        pub model_overrides: HashMap<String, ModelOverride>,
         /// User-defined slash command templates.
         #[serde(default)]
         pub commands: HashMap<String, CommandTemplate>,
@@ -1631,48 +1710,98 @@ pub mod config {
             Self::config_dir().join("settings.json")
         }
 
-        /// Load settings from disk, returning defaults when the file is missing.
-        pub async fn load() -> anyhow::Result<Self> {
-            let path = Self::global_settings_path();
+        fn parse_file(content: &str, path: &Path) -> anyhow::Result<Self> {
+            serde_json::from_str(content).map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to parse settings file {}: {}. The file was not modified; fix the JSON and restart Claurst.",
+                    path.display(),
+                    error
+                )
+            })
+        }
+
+        async fn load_from_path(path: &Path) -> anyhow::Result<Self> {
             if path.exists() {
-                let content = tokio::fs::read_to_string(&path).await?;
-                Ok(serde_json::from_str(&content).unwrap_or_default())
+                let content = tokio::fs::read_to_string(path).await?;
+                Self::parse_file(&content, path)
             } else {
                 Ok(Self::default())
             }
         }
 
-        /// Persist settings to disk.
-        pub async fn save(&self) -> anyhow::Result<()> {
-            let path = Self::global_settings_path();
+        fn load_from_path_sync(path: &Path) -> anyhow::Result<Self> {
+            if path.exists() {
+                let content = std::fs::read_to_string(path)?;
+                Self::parse_file(&content, path)
+            } else {
+                Ok(Self::default())
+            }
+        }
+
+        async fn save_to_path(&self, path: &Path) -> anyhow::Result<()> {
+            if path.exists() {
+                let content = tokio::fs::read_to_string(path).await?;
+                Self::parse_file(&content, path).map_err(|error| {
+                    anyhow::anyhow!(
+                        "Refusing to overwrite malformed settings file {}: {}",
+                        path.display(),
+                        error
+                    )
+                })?;
+            }
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
             let content = serde_json::to_string_pretty(self)?;
-            tokio::fs::write(&path, content).await?;
+            tokio::fs::write(path, content).await?;
             Ok(())
+        }
+
+        fn save_to_path_sync(&self, path: &Path) -> anyhow::Result<()> {
+            if path.exists() {
+                let content = std::fs::read_to_string(path)?;
+                Self::parse_file(&content, path).map_err(|error| {
+                    anyhow::anyhow!(
+                        "Refusing to overwrite malformed settings file {}: {}",
+                        path.display(),
+                        error
+                    )
+                })?;
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let content = serde_json::to_string_pretty(self)?;
+            std::fs::write(path, content)?;
+            Ok(())
+        }
+
+        /// Load settings from disk, returning defaults when the file is missing.
+        ///
+        /// A malformed file is returned as an error and is never replaced with
+        /// defaults.
+        pub async fn load() -> anyhow::Result<Self> {
+            let path = Self::global_settings_path();
+            Self::load_from_path(&path).await
+        }
+
+        /// Persist settings to disk without overwriting a malformed file.
+        pub async fn save(&self) -> anyhow::Result<()> {
+            let path = Self::global_settings_path();
+            self.save_to_path(&path).await
         }
 
         /// Synchronous variant used by pre-session commands.
         pub fn load_sync() -> anyhow::Result<Self> {
             let path = Self::global_settings_path();
-            if path.exists() {
-                let content = std::fs::read_to_string(&path)?;
-                Ok(serde_json::from_str(&content).unwrap_or_default())
-            } else {
-                Ok(Self::default())
-            }
+            Self::load_from_path_sync(&path)
         }
 
-        /// Synchronous variant used by pre-session commands.
+        /// Synchronous variant used by pre-session commands. Refuses to
+        /// overwrite a malformed file.
         pub fn save_sync(&self) -> anyhow::Result<()> {
             let path = Self::global_settings_path();
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let content = serde_json::to_string_pretty(self)?;
-            std::fs::write(&path, content)?;
-            Ok(())
+            self.save_to_path_sync(&path)
         }
 
         /// Return the effective `Config`, merging top-level provider settings
@@ -1690,6 +1819,11 @@ pub mod config {
             // Merge top-level `providers` map into config.provider_configs.
             for (id, pc) in &self.providers {
                 config.provider_configs.entry(id.clone()).or_insert_with(|| pc.clone());
+            }
+            // Merge top-level `modelOverrides` into config.model_overrides
+            // (nested `config` block wins for keys present in both).
+            for (id, ov) in &self.model_overrides {
+                config.model_overrides.entry(id.clone()).or_insert_with(|| ov.clone());
             }
             // Copy top-level formatters and commands into config.
             for (k, v) in &self.formatter {
@@ -1734,14 +1868,14 @@ pub mod config {
 
         /// Load settings from all config levels and merge them.
         /// Priority: project > global.
-        pub async fn load_hierarchical(cwd: &std::path::Path) -> Self {
+        pub async fn load_hierarchical(cwd: &std::path::Path) -> anyhow::Result<Self> {
             // 1. Load global settings.
-            let mut merged = Self::load().await.unwrap_or_default();
+            let mut merged = Self::load().await?;
             // 2. Find and merge project settings (project wins).
             if let Some(project_settings) = Self::find_project_settings(cwd).await {
                 merged = Self::merge(merged, project_settings);
             }
-            merged
+            Ok(merged)
         }
 
         /// Walk up from `cwd` looking for `.claurst/settings.json` or
@@ -1828,6 +1962,7 @@ pub mod config {
                 hooks: merge_map(base.config.hooks, over.config.hooks),
                 provider: over.config.provider.or(base.config.provider),
                 provider_configs: merge_map(base.config.provider_configs, over.config.provider_configs),
+                model_overrides: merge_map(base.config.model_overrides, over.config.model_overrides),
                 formatter: merge_map(base.config.formatter, over.config.formatter),
                 commands: merge_map(base.config.commands, over.config.commands),
                 agents: merge_map(base.config.agents, over.config.agents),
@@ -1872,6 +2007,7 @@ pub mod config {
                 last_seen_version: over.last_seen_version.or(base.last_seen_version),
                 provider: over.provider.or(base.provider),
                 providers: merge_map(base.providers, over.providers),
+                model_overrides: merge_map(base.model_overrides, over.model_overrides),
                 commands: merge_map(base.commands, over.commands),
                 formatter: merge_map(base.formatter, over.formatter),
                 agents: merge_map(base.agents, over.agents),
@@ -1970,6 +2106,66 @@ pub mod config {
     }
 
     #[cfg(test)]
+    mod settings_io_tests {
+        use super::*;
+
+        const MALFORMED_SETTINGS: &str = r#"{"config":{"model":"test-model",}}"#;
+
+        #[test]
+        fn sync_load_reports_malformed_settings_without_modifying_them() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            std::fs::write(&path, MALFORMED_SETTINGS).unwrap();
+
+            let error = Settings::load_from_path_sync(&path).unwrap_err();
+
+            assert!(error.to_string().contains("Failed to parse settings file"));
+            assert!(error.to_string().contains(&path.display().to_string()));
+            assert!(error.to_string().contains("The file was not modified"));
+            assert_eq!(std::fs::read_to_string(path).unwrap(), MALFORMED_SETTINGS);
+        }
+
+        #[test]
+        fn sync_save_refuses_to_overwrite_malformed_settings() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            std::fs::write(&path, MALFORMED_SETTINGS).unwrap();
+            let mut replacement = Settings::default();
+            replacement.config.model = Some("replacement".to_string());
+
+            let error = replacement.save_to_path_sync(&path).unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("Refusing to overwrite malformed settings file")
+            );
+            assert_eq!(std::fs::read_to_string(path).unwrap(), MALFORMED_SETTINGS);
+        }
+
+        #[tokio::test]
+        async fn async_load_and_save_preserve_malformed_settings() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            tokio::fs::write(&path, MALFORMED_SETTINGS).await.unwrap();
+
+            let load_error = Settings::load_from_path(&path).await.unwrap_err();
+            assert!(load_error.to_string().contains("Failed to parse settings file"));
+
+            let save_error = Settings::default().save_to_path(&path).await.unwrap_err();
+            assert!(
+                save_error
+                    .to_string()
+                    .contains("Refusing to overwrite malformed settings file")
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(path).await.unwrap(),
+                MALFORMED_SETTINGS
+            );
+        }
+    }
+
+    #[cfg(test)]
     mod request_timeout_tests {
         use super::*;
 
@@ -2038,6 +2234,54 @@ pub mod config {
             let config = settings.effective_config();
             assert_eq!(config.resolve_request_timeout_secs("ollama"), 3600);
             assert_eq!(config.resolve_request_timeout_secs("openai"), 1200);
+        }
+
+        #[test]
+        fn effective_config_merges_top_level_model_overrides() {
+            let mut settings = Settings::default();
+            // Nested `config` block wins for a key present in both.
+            settings.config.model_overrides.insert(
+                "custom-openai/a".to_string(),
+                ModelOverride { context_window: Some(111), ..Default::default() },
+            );
+            settings.model_overrides.insert(
+                "custom-openai/a".to_string(),
+                ModelOverride { context_window: Some(999), ..Default::default() },
+            );
+            // Top-level-only key is folded in.
+            settings.model_overrides.insert(
+                "custom-openai/b".to_string(),
+                ModelOverride { context_window: Some(222), ..Default::default() },
+            );
+            let config = settings.effective_config();
+            assert_eq!(config.model_overrides["custom-openai/a"].context_window, Some(111));
+            assert_eq!(config.model_overrides["custom-openai/b"].context_window, Some(222));
+        }
+
+        #[test]
+        fn model_override_accepts_camel_and_snake_case() {
+            // Top-level camelCase key `modelOverrides`, camelCase fields.
+            let camel = r#"{
+                "modelOverrides": {
+                    "custom-openai/x": { "contextWindow": 32768, "maxOutputTokens": 4096, "name": "X" }
+                }
+            }"#;
+            let s: Settings = serde_json::from_str(camel).unwrap();
+            let ov = &s.model_overrides["custom-openai/x"];
+            assert_eq!(ov.context_window, Some(32768));
+            assert_eq!(ov.max_output_tokens, Some(4096));
+            assert_eq!(ov.name.as_deref(), Some("X"));
+
+            // snake_case top-level alias `model_overrides` and snake_case fields.
+            let snake = r#"{
+                "model_overrides": {
+                    "ollama/y": { "context_window": 262144, "status": "beta" }
+                }
+            }"#;
+            let s: Settings = serde_json::from_str(snake).unwrap();
+            let ov = &s.model_overrides["ollama/y"];
+            assert_eq!(ov.context_window, Some(262144));
+            assert_eq!(ov.status.as_deref(), Some("beta"));
         }
 
         #[test]
@@ -4433,7 +4677,7 @@ mod tests {
         );
         std::fs::write(claurst.join("settings.json"), json).unwrap();
 
-        let merged = Settings::load_hierarchical(dir.path()).await;
+        let merged = Settings::load_hierarchical(dir.path()).await.unwrap();
         let server = merged
             .config
             .mcp_servers

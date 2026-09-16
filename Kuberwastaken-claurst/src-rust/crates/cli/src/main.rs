@@ -486,8 +486,23 @@ async fn main() -> anyhow::Result<()> {
 
     debug!(cwd = %cwd.display(), "Starting Claurst");
 
-    // Load settings from disk (hierarchical: global < project)
-    let mut settings = Settings::load_hierarchical(&cwd).await;
+    // Determine mode early (needed for settings error reporting, auth error
+    // handling, and permission handler selection).
+    let is_headless = cli.print || cli.prompt.is_some();
+
+    // Load settings from disk (hierarchical: global < project). A malformed
+    // global file is kept intact; interactive mode displays the error in the
+    // startup dialog, while headless mode reports it on stderr.
+    let (mut settings, settings_load_error) = match Settings::load_hierarchical(&cwd).await {
+        Ok(settings) => (settings, None),
+        Err(error) => {
+            let message = error.to_string();
+            if is_headless {
+                eprintln!("Warning: {}", message);
+            }
+            (Settings::default(), Some(message))
+        }
+    };
     // `--trust-project-mcp` (and automation use cases) flip on the same global
     // trust the user could set via `trustProjectMcpServers`. Folding it into
     // `settings` here keeps a single source of truth for the gate, including
@@ -586,9 +601,6 @@ async fn main() -> anyhow::Result<()> {
         system_parts.push(append.clone());
     }
     let system_prompt = system_parts.join("\n\n");
-
-    // Determine mode early (needed for auth error handling and permission handler selection).
-    let is_headless = cli.print || cli.prompt.is_some();
 
     // Initialize API client.
     // Try config/env first; fall back to saved OAuth tokens.
@@ -809,7 +821,7 @@ async fn main() -> anyhow::Result<()> {
     // Build model registry for dynamic model/provider resolution.
     // The registry is pre-populated with a hardcoded snapshot and enriched
     // from the models.dev cache if available.
-    let model_registry = load_cached_model_registry();
+    let model_registry = load_cached_model_registry(&config);
 
     // Build query config
     let mut query_config = claurst_query::QueryConfig::from_config_with_registry(&config, &model_registry);
@@ -892,6 +904,7 @@ async fn main() -> anyhow::Result<()> {
         run_interactive(
             config,
             settings,
+            settings_load_error,
             client,
             tools,
             tool_ctx,
@@ -1030,6 +1043,13 @@ async fn run_models_command(args: &[String]) -> anyhow::Result<()> {
         registry.load_cache(&models_cache_path());
     }
 
+    // Layer user metadata overrides on top of the catalog (issue #309) so the
+    // listing matches what the TUI picker and context logic use.
+    let overrides = claurst_core::config::Settings::load_sync()
+        .map(|s| s.effective_config().model_overrides)
+        .unwrap_or_default();
+    registry.apply_model_overrides(&overrides);
+
     let mut entries: Vec<&claurst_api::ModelEntry> = match &provider_filter {
         Some(pid) => registry.list_by_provider(pid),
         None => registry.list_all(),
@@ -1154,7 +1174,7 @@ async fn run_models_command(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_cached_model_registry() -> Arc<claurst_api::ModelRegistry> {
+fn load_cached_model_registry(config: &Config) -> Arc<claurst_api::ModelRegistry> {
     let mut reg = claurst_api::ModelRegistry::new();
     // CLAURST_MODELS_PATH wins outright — useful for offline dev where you
     // pin a known-good api.json on disk.
@@ -1168,6 +1188,9 @@ fn load_cached_model_registry() -> Arc<claurst_api::ModelRegistry> {
             reg.load_cache(&models_dev_cache_path());
         }
     }
+    // Layer user metadata overrides on top of the catalog (issue #309). Stored
+    // in the registry, so any later cache reload re-asserts them automatically.
+    reg.apply_model_overrides(&config.model_overrides);
     Arc::new(reg)
 }
 
@@ -1340,7 +1363,7 @@ async fn refresh_provider_runtime_state(
     );
     let provider_registry =
         Arc::new(claurst_api::ProviderRegistry::from_config(&config, client_config));
-    let model_registry = load_cached_model_registry();
+    let model_registry = load_cached_model_registry(&config);
 
     spawn_models_cache_refresh();
 
@@ -1385,7 +1408,7 @@ async fn reload_provider_runtime_state(
     );
     let provider_registry =
         Arc::new(claurst_api::ProviderRegistry::from_config(&config, client_config));
-    let model_registry = load_cached_model_registry();
+    let model_registry = load_cached_model_registry(&config);
 
     Ok(RefreshedProviderRuntime {
         config,
@@ -1748,6 +1771,7 @@ fn permission_request_from_core(
 async fn run_interactive(
     config: Config,
     settings: claurst_core::config::Settings,
+    settings_load_error: Option<String>,
     client: Arc<claurst_api::AnthropicClient>,
     tools: Arc<Vec<Box<dyn claurst_tools::Tool>>>,
     tool_ctx: ToolContext,
@@ -1850,6 +1874,10 @@ async fn run_interactive(
     // Set up terminal
     let mut terminal = setup_terminal(live_config.mouse_capture_enabled())?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    if let Some(error) = settings_load_error {
+        app.invalid_config_dialog =
+            claurst_tui::InvalidConfigDialogState::show_settings_error(&error);
+    }
     // Gate input shift-normalization on whether the terminal speaks the kitty
     // keyboard protocol (detected in setup_terminal). On terminals that don't —
     // Windows conhost / CMD / legacy PowerShell, etc. — printable keys already
@@ -2187,7 +2215,11 @@ async fn run_interactive(
         // Poll for crossterm events (keyboard/mouse) with short timeout
         // unless an auto-submit (queued message) is pending — in which case
         // synthesize an Enter event to dequeue and submit it.
-        let synthetic_event: Option<Event> = if app.pending_auto_submit && !app.is_streaming {
+        let synthetic_event: Option<Event> = if let Some(k) = app.pending_key.take() {
+            // A non-character key swallowed by the paste-burst drain — replay
+            // it so the keystroke that ended a raw-key paste is not lost.
+            Some(Event::Key(k))
+        } else if app.pending_auto_submit && !app.is_streaming {
             app.pending_auto_submit = false;
             Some(Event::Key(crossterm::event::KeyEvent::new(
                 KeyCode::Enter,
@@ -2233,6 +2265,29 @@ async fn run_interactive(
                         continue;
                     }
 
+                    // ── Paste-burst detection ─────────────────────────────
+                    // Terminals without bracketed paste (notably Windows
+                    // Ctrl+V, some tmux configs) dump the clipboard as raw
+                    // key events: every pasted newline arrives as Enter and
+                    // would submit a truncated prompt. A zero-timeout drain
+                    // right after the first character captures the whole
+                    // flood as one paste (human typing never queues 2+ chars
+                    // in the same instant). Must run BEFORE the Enter/submit
+                    // handling below so pasted newlines can't submit.
+                    if key.modifiers == KeyModifiers::NONE
+                        || key.modifiers == KeyModifiers::SHIFT
+                    {
+                        if let KeyCode::Char(c) = key.code {
+                            if app.paste_burst_allowed() {
+                                if let Some(burst) = app.try_detect_paste_burst(c) {
+                                    app.handle_paste_data(burst);
+                                    app.refresh_prompt_input();
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
                     // Enter => submit input (but NOT when ANY dialog/overlay is open —
                     // dialogs handle their own Enter in handle_key_event).
                     let any_dialog_open = app.any_modal_open();
@@ -2265,10 +2320,12 @@ async fn run_interactive(
                     if plain_enter && !app.is_streaming && !any_dialog_open {
                         // If a file-ref suggestion is active, accept it instead of submitting.
                         if !app.prompt_input.suggestions.is_empty()
-                            && app.prompt_input.suggestion_index.is_some()
-                            && app.prompt_input.suggestions.get(app.prompt_input.suggestion_index.unwrap())
-                                .map(|s| s.source == claurst_tui::prompt_input::TypeaheadSource::FileRef)
-                                .unwrap_or(false)
+                            && app.prompt_input.suggestion_index.is_some_and(|index| {
+                                app.prompt_input
+                                    .suggestions
+                                    .get(index)
+                                    .is_some_and(|s| s.source == claurst_tui::prompt_input::TypeaheadSource::FileRef)
+                            })
                         {
                             app.prompt_input.accept_suggestion();
                             app.prompt_input.insert_char(' ');
@@ -3096,9 +3153,12 @@ async fn run_interactive(
                     }
                 }
                 Event::Paste(data) => {
-                    // Cmd+V paste on macOS / Ctrl+Shift+V on Linux (via bracketed paste)
-                    if !app.is_streaming
-                        && app.permission_request.is_none()
+                    // Bracketed paste (Cmd+V on macOS, Ctrl+Shift+V on Linux, any
+                    // terminal with bracketed paste). Deliberately NOT gated on
+                    // is_streaming: the prompt stays editable during a turn so a
+                    // follow-up can be composed/queued — dropping the event here
+                    // silently loses the pasted content.
+                    if app.permission_request.is_none()
                         && !app.history_search_overlay.visible
                         && app.history_search.is_none()
                     {
@@ -3108,8 +3168,11 @@ async fn run_interactive(
                                 app.key_input_dialog.insert_char(ch);
                             }
                         } else {
-                            // Paste into main prompt input
-                            app.prompt_input.paste(&data);
+                            // Paste into the main prompt through the shared path
+                            // so file-path/image pastes and the large-paste
+                            // placeholder are handled uniformly.
+                            app.handle_paste_data(data);
+                            app.refresh_prompt_input();
                         }
                     }
                 }
@@ -3613,15 +3676,19 @@ async fn run_interactive(
                     // no-op and never wipes the projection. For copilot the id
                     // IS the api.id, so this is the by-api.id merge.
                     //
-                    // Anthropic is the exception: its discovery result is the
-                    // subscription/key set already intersected with the catalog,
-                    // so we REPLACE (dropping legacy claude-3.x the credential
-                    // can't serve). An empty result (discovery failed / offline)
-                    // is a no-op that keeps the full catalog projection.
+                    // Anthropic and local runtimes return authoritative lists.
+                    // Anthropic keeps the catalog projection when discovery is
+                    // empty because that can mean authentication failed. Local
+                    // discovery reports failures separately, so empty means no
+                    // models are loaded.
                     if provider == "anthropic" {
                         if !entries.is_empty() {
                             app.model_picker.set_models(entries);
                         }
+                    } else if claurst_tui::model_picker::provider_has_authoritative_live_models(
+                        &provider,
+                    ) {
+                        app.model_picker.set_models(entries);
                     } else {
                         app.model_picker.merge_models(entries);
                     }
@@ -3685,10 +3752,29 @@ async fn run_interactive(
                 let pid = claurst_core::ProviderId::new(&provider_id_str);
                 if let Some(provider) = registry.get(&pid) {
                     let provider = provider.clone();
+                    // Layer user metadata overrides (issue #309) onto the
+                    // live-discovered list too, so self-hosted / openai-compatible
+                    // endpoints show the corrected context window in the picker.
+                    let overrides = app.config.model_overrides.clone();
+                    let provider_key = provider_id_str.clone();
                     let (tx, rx) = tokio::sync::mpsc::channel(1);
                     app.model_fetch_rx = Some(rx);
                     app.model_picker.loading_models = true;
                     tokio::spawn(async move {
+                        // Effective context window for a discovered model:
+                        // the user override wins, else the discovered value.
+                        let ctx_for = |id: &str, discovered: u32| -> u32 {
+                            overrides
+                                .get(&format!("{}/{}", provider_key, id))
+                                .and_then(|o| o.context_window)
+                                .unwrap_or(discovered)
+                        };
+                        let name_for = |id: &str, discovered: &str| -> String {
+                            overrides
+                                .get(&format!("{}/{}", provider_key, id))
+                                .and_then(|o| o.name.clone())
+                                .unwrap_or_else(|| discovered.to_string())
+                        };
                         match provider.discover_models().await {
                             Ok(models) => {
                                 let entries: Vec<claurst_tui::model_picker::ModelEntry> =
@@ -3707,10 +3793,10 @@ async fn run_interactive(
                                                 by_id.get(&id).cloned().unwrap_or_else(|| {
                                                     claurst_tui::model_picker::ModelEntry {
                                                         id: id.clone(),
-                                                        display_name: m.name.clone(),
+                                                        display_name: name_for(&id, &m.name),
                                                         description:
                                                             claurst_tui::model_picker::format_context_window(
-                                                                m.context_window,
+                                                                ctx_for(&id, m.context_window),
                                                             ),
                                                         is_current: false,
                                                     }
@@ -3720,14 +3806,17 @@ async fn run_interactive(
                                     } else {
                                         models
                                             .into_iter()
-                                            .map(|m| claurst_tui::model_picker::ModelEntry {
-                                                id: m.id.to_string(),
-                                                display_name: m.name.clone(),
-                                                description:
-                                                    claurst_tui::model_picker::format_context_window(
-                                                        m.context_window,
-                                                    ),
-                                                is_current: false,
+                                            .map(|m| {
+                                                let id = m.id.to_string();
+                                                claurst_tui::model_picker::ModelEntry {
+                                                    display_name: name_for(&id, &m.name),
+                                                    description:
+                                                        claurst_tui::model_picker::format_context_window(
+                                                            ctx_for(&id, m.context_window),
+                                                        ),
+                                                    id,
+                                                    is_current: false,
+                                                }
                                             })
                                             .collect()
                                     };

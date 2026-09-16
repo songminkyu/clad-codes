@@ -292,6 +292,17 @@ const MAX_STEPS_DEGRADATION_MSG: &str =
 /// text so the message history stays well-formed.
 const TOOL_CANCELLED_MSG: &str = "Tool execution was cancelled by the user before it completed.";
 
+fn merge_provider_stream_usage(current: &mut UsageInfo, update: &UsageInfo) {
+    if update.total_input() > 0 {
+        current.input_tokens = update.input_tokens;
+        current.cache_read_input_tokens = update.cache_read_input_tokens;
+        current.cache_creation_input_tokens = update.cache_creation_input_tokens;
+    }
+    if update.output_tokens > 0 {
+        current.output_tokens = update.output_tokens;
+    }
+}
+
 // Spinner verbs are imported from claurst_core::spinner
 
 /// Resolve the effective effort level for a turn.
@@ -1001,8 +1012,11 @@ pub async fn run_query_loop(
                     // Accumulate reasoning/thinking content for providers like
                     // DeepSeek that require reasoning_content to be sent back.
                     let mut thinking_chunks: Vec<String> = Vec::new();
-                    // tool_call_blocks: index → (id, name, accumulated_json)
-                    let mut tool_call_blocks: std::collections::HashMap<usize, (String, String, String)> =
+                    // tool_call_blocks: index → (id, name, accumulated_json, thought_signature)
+                    // thought_signature carries Gemini's opaque per-call signature
+                    // through stream assembly so it survives into the persisted
+                    // ToolUse block and is echoed back next turn (#311).
+                    let mut tool_call_blocks: std::collections::HashMap<usize, (String, String, String, Option<String>)> =
                         std::collections::HashMap::new();
                     let mut usage = UsageInfo::default();
                     let mut stop_str = "end_turn".to_string();
@@ -1048,15 +1062,13 @@ pub async fn run_query_loop(
                                         match &evt {
                                             claurst_api::StreamEvent::MessageStart { id, usage: u, .. } => {
                                                 msg_id = id.clone();
-                                                usage.input_tokens = u.input_tokens;
-                                                usage.cache_read_input_tokens = u.cache_read_input_tokens;
-                                                usage.cache_creation_input_tokens = u.cache_creation_input_tokens;
+                                                merge_provider_stream_usage(&mut usage, u);
                                             }
                                             claurst_api::StreamEvent::ContentBlockStart {
                                                 index,
-                                                content_block: ContentBlock::ToolUse { id, name, .. },
+                                                content_block: ContentBlock::ToolUse { id, name, thought_signature, .. },
                                             } => {
-                                                tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new()));
+                                                tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new(), thought_signature.clone()));
                                             }
                                             claurst_api::StreamEvent::TextDelta { text, .. } => {
                                                 text_chunks.push(text.clone());
@@ -1068,7 +1080,7 @@ pub async fn run_query_loop(
                                                 thinking_chunks.push(reasoning.clone());
                                             }
                                             claurst_api::StreamEvent::InputJsonDelta { index, partial_json } => {
-                                                if let Some((_, _, buf)) = tool_call_blocks.get_mut(index) {
+                                                if let Some((_, _, buf, _)) = tool_call_blocks.get_mut(index) {
                                                     buf.push_str(partial_json);
                                                 }
                                             }
@@ -1083,7 +1095,7 @@ pub async fn run_query_loop(
                                                     None => "end_turn".to_string(),
                                                 };
                                                 if let Some(u) = u {
-                                                    usage.output_tokens = u.output_tokens;
+                                                    merge_provider_stream_usage(&mut usage, u);
                                                 }
                                             }
                                             claurst_api::StreamEvent::MessageStop => break,
@@ -1177,7 +1189,7 @@ pub async fn run_query_loop(
                     let mut malformed_tool_calls: std::collections::HashSet<String> =
                         std::collections::HashSet::new();
                     for idx in tc_indices {
-                        if let Some((id, name, json_str)) = tool_call_blocks.remove(&idx) {
+                        if let Some((id, name, json_str, thought_signature)) = tool_call_blocks.remove(&idx) {
                             let input = match parse_tool_args(&json_str) {
                                 Ok(v) => v,
                                 Err(e) => {
@@ -1193,7 +1205,7 @@ pub async fn run_query_loop(
                                     serde_json::json!({})
                                 }
                             };
-                            content_blocks.push(ContentBlock::ToolUse { id, name, input });
+                            content_blocks.push(ContentBlock::ToolUse { id, name, input, thought_signature });
                         }
                     }
 
@@ -1216,7 +1228,7 @@ pub async fn run_query_loop(
 
                     // Handle tool-use turn: execute tools and loop.
                     let tool_use_blocks: Vec<_> = content_blocks.iter().filter_map(|b| {
-                        if let ContentBlock::ToolUse { id, name, input } = b {
+                        if let ContentBlock::ToolUse { id, name, input, .. } = b {
                             Some((id.clone(), name.clone(), input.clone()))
                         } else {
                             None
@@ -1857,7 +1869,7 @@ pub async fn run_query_loop(
                 // Phase 1: sequential pre-hook pass.
                 let mut prepared: Vec<PreparedTool> = Vec::with_capacity(tool_blocks.len());
                 for block in tool_blocks {
-                    if let ContentBlock::ToolUse { id, name, input } = block {
+                    if let ContentBlock::ToolUse { id, name, input, .. } = block {
                         // Clone from the references returned by get_tool_use_blocks()
                         let id = id.clone();
                         let name = name.clone();
@@ -2067,6 +2079,48 @@ impl StreamHandler for ChannelStreamHandler {
 mod tests {
     use super::*;
     use claurst_api::SystemPrompt;
+
+    #[test]
+    fn final_stream_usage_supplies_prompt_tokens_to_turn_usage() {
+        let mut turn_usage = UsageInfo::default();
+        let final_usage = UsageInfo {
+            input_tokens: 1_200,
+            output_tokens: 80,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 300,
+        };
+
+        merge_provider_stream_usage(&mut turn_usage, &final_usage);
+
+        assert_eq!(turn_usage.input_tokens, 1_200);
+        assert_eq!(turn_usage.cache_read_input_tokens, 300);
+        assert_eq!(turn_usage.output_tokens, 80);
+        let context_counter_increment = turn_usage.input_tokens
+            + turn_usage.output_tokens
+            + turn_usage.cache_creation_input_tokens
+            + turn_usage.cache_read_input_tokens;
+        assert_eq!(context_counter_increment, 1_580);
+    }
+
+    #[test]
+    fn output_only_final_usage_preserves_start_input_tokens() {
+        let mut turn_usage = UsageInfo {
+            input_tokens: 900,
+            output_tokens: 0,
+            cache_creation_input_tokens: 100,
+            cache_read_input_tokens: 0,
+        };
+        let final_usage = UsageInfo {
+            output_tokens: 75,
+            ..Default::default()
+        };
+
+        merge_provider_stream_usage(&mut turn_usage, &final_usage);
+
+        assert_eq!(turn_usage.input_tokens, 900);
+        assert_eq!(turn_usage.cache_creation_input_tokens, 100);
+        assert_eq!(turn_usage.output_tokens, 75);
+    }
 
     fn make_config(sys: Option<&str>, append: Option<&str>) -> QueryConfig {
         QueryConfig {
@@ -2770,6 +2824,7 @@ mod tests {
                             id: tool_id,
                             name: "noop_tool".to_string(),
                             input: serde_json::json!({}),
+                            thought_signature: None,
                         },
                     }),
                     Ok(StreamEvent::InputJsonDelta {
